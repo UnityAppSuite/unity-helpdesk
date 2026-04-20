@@ -6,10 +6,6 @@ no_cache = 1
 
 
 def get_context(context):
-	if frappe.db.get_single_value("HD Settings", "helpdesk_ui") == "Unity Helpdesk":
-		frappe.local.flags.redirect_location = "/unity-helpdesk"
-		raise frappe.Redirect
-
 	context.csrf_token = frappe.sessions.get_csrf_token()
 	context.frappe_version = frappe.__version__
 	context.helpdesk_version = __version__

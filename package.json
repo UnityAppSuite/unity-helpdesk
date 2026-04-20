@@ -3,7 +3,7 @@
 	"scripts": {
 		"postinstall": "husky install && cd desk && yarn install",
 		"dev": "cd desk && yarn dev",
-		"build": "cd desk && yarn build"
+		"build": "cd desk && yarn build && cd ../unity_desk && yarn build"
 	},
 	"dependencies": {
 		"@typescript-eslint/eslint-plugin": "^5.55.0",

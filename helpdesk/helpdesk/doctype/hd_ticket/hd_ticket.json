@@ -12,6 +12,11 @@
   "subject",
   "raised_by",
   "status",
+  "unity_hold_section",
+  "custom_is_on_hold",
+  "custom_hold_from",
+  "custom_hold_to",
+  "custom_hold_reason",
   "priority",
   "cb00",
   "ticket_type",
@@ -101,6 +106,36 @@
    "oldfieldtype": "Select",
    "options": "Open\nReplied\nResolved\nClosed",
    "search_index": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "unity_hold_section",
+   "fieldtype": "Section Break",
+   "label": "Unity Hold Details"
+  },
+  {
+   "default": "0",
+   "fieldname": "custom_is_on_hold",
+   "fieldtype": "Check",
+   "label": "On Hold"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_from",
+   "fieldtype": "Date",
+   "label": "Hold From"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_to",
+   "fieldtype": "Date",
+   "label": "Hold To"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_reason",
+   "fieldtype": "Small Text",
+   "label": "Hold Reason"
   },
   {
    "fieldname": "priority",
