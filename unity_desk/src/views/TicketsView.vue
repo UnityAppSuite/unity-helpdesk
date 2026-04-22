@@ -1,7 +1,7 @@
 <template>
   <section class="page">
     <div class="toolbar">
-      <select v-model="filters.status" @change="load">
+      <select v-model="filters.status" @change="reload">
         <option value="">Status: All</option>
         <option>Open</option>
         <option>Replied</option>
@@ -9,28 +9,34 @@
         <option>Resolved</option>
         <option>Closed</option>
       </select>
-      <select v-model="filters.priority" @change="load">
+      <select v-model="filters.priority" @change="reload">
         <option value="">Priority: All</option>
         <option>High</option>
         <option>Medium</option>
         <option>Low</option>
       </select>
-      <select v-model="filters.assigned_to" @change="load">
+      <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
+      <select
+        v-if="props.view === 'all'"
+        v-model="filters.assigned_to"
+        @change="reload"
+      >
         <option value="">Assigned: All</option>
         <option value="Unassigned">Unassigned</option>
-        <option v-for="user in users" :key="user.name" :value="user.name">
-          {{ user.full_name || user.name }}
+        <option v-for="agent in agents" :key="agent.name" :value="agent.name">
+          {{ agent.full_name || agent.name }}
         </option>
       </select>
-      <input v-model="filters.created_from" type="date" @change="load" />
+      <span v-else class="badge blue">Assigned to me</span>
+      <input v-model="filters.created_from" type="date" @change="reload" />
       <input
         v-model="search"
         class="search"
         type="search"
         placeholder="Search ticket ID, subject, email, student or fee details"
-        @keyup.enter="load"
+        @keyup.enter="reload"
       />
-      <button class="btn secondary" @click="load">Search</button>
+      <button class="btn secondary" @click="reload">Search</button>
     </div>
 
     <div class="metrics">
@@ -65,11 +71,12 @@
       <p v-else-if="loading" class="empty">Loading tickets...</p>
       <p v-else-if="!tickets.length" class="empty">No tickets found.</p>
       <div v-else class="scroll-x">
-        <table>
+        <table class="ticket-table">
           <thead>
             <tr>
               <th>Ticket ID</th>
               <th>Subject</th>
+              <th>Ticket Type</th>
               <th>Priority</th>
               <th>Status</th>
               <th>Assigned To</th>
@@ -91,37 +98,117 @@
                 <div class="subject">{{ ticket.subject || "No subject" }}</div>
                 <small class="muted">{{ ticket.raised_by }}</small>
               </td>
-              <td>
-                <span class="priority" :class="priorityClass(ticket.priority)">
-                  {{ ticket.priority || "Not set" }}
-                </span>
-                <small v-if="ticket.priority_target" class="muted">
-                  {{ ticket.priority_target }}</small
+              <td class="cell-edit" @click.stop>
+                <select
+                  v-model="editState[ticket.name].ticket_type"
+                  :class="[
+                    'select-chip',
+                    ticketTypeClass(editState[ticket.name].ticket_type),
+                  ]"
+                  :disabled="isSaving(ticket.name)"
+                  @change="
+                    quickUpdate(
+                      ticket,
+                      'ticket_type',
+                      editState[ticket.name].ticket_type
+                    )
+                  "
                 >
+                  <option value="">Not set</option>
+                  <option
+                    v-for="type in ticketTypes"
+                    :key="type.name"
+                    :value="type.name"
+                  >
+                    {{ type.name }}
+                  </option>
+                </select>
               </td>
-              <td>
-                <span class="badge" :class="ticket.status_indicator.color">
-                  {{ ticket.status_indicator.label }}
-                </span>
+              <td class="cell-edit" @click.stop>
+                <select
+                  v-model="editState[ticket.name].priority"
+                  :class="[
+                    'select-chip',
+                    priorityClass(editState[ticket.name].priority),
+                  ]"
+                  :disabled="isSaving(ticket.name)"
+                  @change="
+                    quickUpdate(
+                      ticket,
+                      'priority',
+                      editState[ticket.name].priority
+                    )
+                  "
+                >
+                  <option value="">Not set</option>
+                  <option>High</option>
+                  <option>Medium</option>
+                  <option>Low</option>
+                </select>
               </td>
-              <td>
-                <span v-if="ticket.assignee">
-                  <span class="avatar">{{
-                    initials(ticket.assignee.full_name || ticket.assignee.name)
-                  }}</span>
-                  {{ ticket.assignee.full_name || ticket.assignee.name }}
-                </span>
-                <span v-else class="muted">Unassigned</span>
+              <td class="cell-edit" @click.stop>
+                <select
+                  v-model="editState[ticket.name].status"
+                  :class="[
+                    'select-chip',
+                    statusClass(ticket, editState[ticket.name].status),
+                  ]"
+                  :disabled="isSaving(ticket.name)"
+                  @change="
+                    quickUpdate(ticket, 'status', editState[ticket.name].status)
+                  "
+                >
+                  <option>On Hold</option>
+                  <option>Open</option>
+                  <option>Replied</option>
+                  <option>Resolved</option>
+                  <option>Closed</option>
+                </select>
+              </td>
+              <td class="cell-edit" @click.stop>
+                <select
+                  v-model="editState[ticket.name].assignee"
+                  :class="[
+                    'select-chip',
+                    assignmentClass(editState[ticket.name].assignee),
+                  ]"
+                  :disabled="isSaving(ticket.name)"
+                  @change="
+                    quickUpdate(
+                      ticket,
+                      'assignee',
+                      editState[ticket.name].assignee
+                    )
+                  "
+                >
+                  <option value="">Unassigned</option>
+                  <option
+                    v-for="agent in agents"
+                    :key="agent.name"
+                    :value="agent.name"
+                  >
+                    {{ agent.full_name || agent.name }}
+                  </option>
+                </select>
               </td>
               <td>{{ formatDate(ticket.creation) }}</td>
               <td>
                 <span v-if="ticket.custom_is_on_hold">
-                  {{ formatDate(ticket.custom_hold_from) }} -
-                  {{ formatDate(ticket.custom_hold_to) }}
+                  {{ formatHoldWindow(ticket) }}
                 </span>
                 <span v-else class="muted">-</span>
               </td>
-              <td>{{ ticket.custom_hold_reason || "-" }}</td>
+              <td class="cell-edit" @click.stop>
+                <input
+                  v-model="editState[ticket.name].hold_reason"
+                  class="table-input"
+                  type="text"
+                  :disabled="isSaving(ticket.name)"
+                  placeholder="Add hold reason"
+                  @blur="saveHoldReason(ticket)"
+                  @keyup.enter="saveHoldReason(ticket)"
+                />
+              </td>
             </tr>
           </tbody>
         </table>
@@ -140,18 +227,22 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from "vue";
-import { useRouter } from "vue-router";
-import { call, formatDate, initials } from "../api";
+import { useRoute, useRouter } from "vue-router";
+import { call, formatDate, getAgents, getTicketTypes } from "../api";
 
 const props = defineProps({ view: { type: String, default: "my" } });
 const emit = defineEmits(["title"]);
+const route = useRoute();
 const router = useRouter();
 
 const search = ref("");
 const loading = ref(false);
 const error = ref("");
-const users = ref([]);
+const agents = ref([]);
+const ticketTypes = ref([]);
 const summary = ref({ cards: {} });
+const rowSaving = reactive({});
+const editState = reactive({});
 const result = reactive({
   data: [],
   total_count: 0,
@@ -175,28 +266,44 @@ const canLoadMore = computed(
 const cards = computed(() => summary.value.cards || {});
 
 watch(
-  () => props.view,
-  () => {
-    result.start = 0;
-    result.data = [];
-    load();
-    emit("title", title.value, "Search, filter, and open tickets");
-  }
+  () => [props.view, route.fullPath],
+  async () => {
+    emit("title", title.value, "Search, edit, and open tickets");
+    await reload();
+  },
+  { immediate: true }
 );
 
 onMounted(async () => {
-  emit("title", title.value, "Search, filter, and open tickets");
-  load();
   loadSummary();
-  try {
-    users.value = await call("helpdesk.api.unity.get_users");
-  } catch {
-    users.value = [];
-  }
+  await loadLookups();
 });
 
-function priorityClass(priority = "") {
-  return priority.toLowerCase();
+function syncEditState(rows) {
+  rows.forEach((ticket) => {
+    editState[ticket.name] = {
+      ticket_type: ticket.ticket_type || "",
+      priority: ticket.priority || "",
+      status: ticket.custom_is_on_hold ? "On Hold" : ticket.status || "Open",
+      assignee: ticket.assignee?.name || "",
+      hold_reason: ticket.custom_hold_reason || "",
+    };
+  });
+}
+
+async function loadLookups() {
+  const [agentResult, typeResult] = await Promise.allSettled([
+    getAgents(),
+    getTicketTypes(),
+  ]);
+  agents.value =
+    agentResult.status === "fulfilled" ? agentResult.value || [] : [];
+  ticketTypes.value =
+    typeResult.status === "fulfilled" ? typeResult.value || [] : [];
+}
+
+function isSaving(name) {
+  return !!rowSaving[name];
 }
 
 function cleanFilters() {
@@ -215,6 +322,12 @@ async function loadSummary() {
   }
 }
 
+async function reload() {
+  result.start = 0;
+  result.data = [];
+  await load();
+}
+
 async function load() {
   loading.value = true;
   error.value = "";
@@ -227,6 +340,7 @@ async function load() {
       start: 0,
     });
     Object.assign(result, data);
+    syncEditState(data.data || []);
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -244,9 +358,91 @@ async function loadMore() {
   });
   result.data = [...result.data, ...data.data];
   result.total_count = data.total_count;
+  syncEditState(data.data || []);
+}
+
+async function quickUpdate(ticket, field, value) {
+  rowSaving[ticket.name] = true;
+  error.value = "";
+  try {
+    const payload = {
+      name: ticket.name,
+      [field]: value,
+    };
+    if (field === "status") {
+      payload.is_on_hold = value === "On Hold" ? 1 : 0;
+      if (value === "On Hold") {
+        payload.hold_from = ticket.custom_hold_from || todayString();
+        payload.hold_reason = editState[ticket.name].hold_reason || "";
+      }
+    }
+    const updated = await call("helpdesk.api.unity_ext.update_ticket", payload);
+    const index = result.data.findIndex((row) => row.name === ticket.name);
+    if (index >= 0) {
+      result.data[index] = updated;
+      syncEditState([updated]);
+    }
+  } catch (err) {
+    error.value = err.message;
+    await load();
+  } finally {
+    rowSaving[ticket.name] = false;
+  }
+}
+
+async function saveHoldReason(ticket) {
+  const value = editState[ticket.name]?.hold_reason || "";
+  if ((ticket.custom_hold_reason || "") === value) {
+    return;
+  }
+  await quickUpdate(ticket, "hold_reason", value);
+}
+
+function todayString() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function formatHoldWindow(ticket) {
+  if (!ticket.custom_hold_from && !ticket.custom_hold_to) {
+    return "On hold";
+  }
+  if (ticket.custom_hold_from && ticket.custom_hold_to) {
+    return `${formatDate(ticket.custom_hold_from)} - ${formatDate(
+      ticket.custom_hold_to
+    )}`;
+  }
+  return formatDate(ticket.custom_hold_from || ticket.custom_hold_to);
 }
 
 function openTicket(name) {
   router.push(`/tickets/${name}`);
+}
+
+function assignmentClass(assignee) {
+  return assignee ? "blue" : "pink";
+}
+
+function statusClass(ticket, selectedStatus) {
+  if (selectedStatus === "On Hold") return "yellow";
+  if (selectedStatus === "Resolved") return "green";
+  if (selectedStatus === "Closed") return "grey";
+  return editState[ticket.name]?.assignee ? "blue" : "pink";
+}
+
+function priorityClass(priority) {
+  const value = (priority || "").toLowerCase();
+  if (value === "high") return "pink";
+  if (value === "medium") return "yellow";
+  if (value === "low") return "green";
+  return "grey";
+}
+
+function ticketTypeClass(ticketType) {
+  const value = (ticketType || "").toLowerCase();
+  if (!value) return "grey";
+  if (["app", "tech"].includes(value)) return "blue";
+  if (["calling", "result"].includes(value)) return "pink";
+  if (["walmiki"].includes(value)) return "yellow";
+  return "green";
 }
 </script>

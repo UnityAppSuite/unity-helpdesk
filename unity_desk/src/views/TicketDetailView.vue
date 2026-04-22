@@ -31,9 +31,6 @@
           <span class="priority" :class="priorityClass(ticket.priority)">
             {{ ticket.priority || "No priority" }}
           </span>
-          <span v-if="ticket.priority_target">
-            Target: {{ ticket.priority_target }}</span
-          >
         </div>
 
         <section
@@ -124,11 +121,11 @@
             type="button"
             @click="additionalOpen = !additionalOpen"
           >
-            <span>Additional Details</span>
-            <small
-              >{{ filteredPreviousTickets.length }} of
-              {{ previousTicketRows.length }} previous tickets</small
-            >
+            <span>Previous Ticket Details</span>
+            <small>
+              {{ filteredPreviousTickets.length }} of
+              {{ previousTicketRows.length }} previous tickets
+            </small>
             <strong>{{ additionalOpen ? "Hide" : "Show" }}</strong>
           </button>
           <div class="detail-body stack">
@@ -203,20 +200,94 @@
           </div>
         </section>
 
+        <section v-if="timeline.length" class="detail-section">
+          <h3>Email Thread</h3>
+          <div class="chat-thread">
+            <div
+              v-for="item in timeline"
+              :key="item.name"
+              class="chat-msg"
+              :class="{
+                'chat-msg--agent':
+                  item._type === 'comm' && item.sent_or_received === 'Sent',
+                'chat-msg--customer':
+                  item._type === 'comm' && item.sent_or_received === 'Received',
+                'chat-msg--comment': item._type === 'comment',
+              }"
+            >
+              <div class="chat-msg-meta">
+                <span class="chat-msg-label">
+                  <template v-if="item._type === 'comment'">Note</template>
+                  <template v-else-if="item.sent_or_received === 'Sent'"
+                    >Agent</template
+                  >
+                  <template v-else>Customer</template>
+                </span>
+                <span class="chat-msg-sender">{{ item.sender }}</span>
+                <span class="chat-msg-time">{{
+                  formatDateTime(item.creation)
+                }}</span>
+              </div>
+              <div
+                class="chat-msg-body safe-html"
+                v-html="threadContent(item)"
+              ></div>
+            </div>
+          </div>
+        </section>
+
         <section class="detail-section">
-          <h3>Compose Reply</h3>
+          <div class="compose-tabs">
+            <button
+              class="compose-tab"
+              :class="{ active: composeMode === 'reply' }"
+              type="button"
+              @click="
+                composeMode = 'reply';
+                actionError = '';
+              "
+            >
+              Reply
+            </button>
+            <button
+              class="compose-tab compose-tab-comment"
+              :class="{ active: composeMode === 'comment' }"
+              type="button"
+              @click="
+                composeMode = 'comment';
+                actionError = '';
+              "
+            >
+              Internal Note
+            </button>
+          </div>
           <div class="detail-body stack">
+            <p v-if="actionError" class="error">{{ actionError }}</p>
             <textarea
               v-model="replyText"
               rows="6"
-              placeholder="Type your reply here..."
+              :placeholder="
+                composeMode === 'reply'
+                  ? 'Type your reply to the customer...'
+                  : 'Add an internal note (not sent to customer)...'
+              "
             ></textarea>
             <button
+              v-if="composeMode === 'reply'"
               class="btn"
               :disabled="saving || !replyText.trim()"
               @click="sendReply"
             >
-              Send Reply
+              {{ saving ? "Sending..." : "Send Reply" }}
+            </button>
+            <button
+              v-else
+              class="btn"
+              style="background: #f59e0b; border-color: #f59e0b"
+              :disabled="saving || !replyText.trim()"
+              @click="sendComment"
+            >
+              {{ saving ? "Saving..." : "Add Note" }}
             </button>
           </div>
         </section>
@@ -242,10 +313,24 @@
             <label>
               Status
               <select v-model="form.status">
+                <option>On Hold</option>
                 <option>Open</option>
                 <option>Replied</option>
                 <option>Resolved</option>
                 <option>Closed</option>
+              </select>
+            </label>
+            <label>
+              Ticket Type
+              <select v-model="form.ticket_type">
+                <option value="">Not set</option>
+                <option
+                  v-for="ticketType in ticketTypes"
+                  :key="ticketType.name"
+                  :value="ticketType.name"
+                >
+                  {{ ticketType.name }}
+                </option>
               </select>
             </label>
             <label>
@@ -285,8 +370,11 @@
                 :disabled="!form.is_on_hold"
               ></textarea>
             </label>
+            <p v-if="actionError" class="error" style="font-size: 12px">
+              {{ actionError }}
+            </p>
             <button class="btn" :disabled="saving" @click="saveTicket">
-              Update Ticket
+              {{ saving ? "Saving..." : "Update Ticket" }}
             </button>
           </div>
         </section>
@@ -298,9 +386,9 @@
             <div v-for="item in history" :key="item.name" class="history-item">
               <strong>{{ item.action }}</strong>
               <br />
-              <small class="muted"
-                >{{ item.owner }} · {{ formatDateTime(item.creation) }}</small
-              >
+              <small class="muted">
+                {{ item.owner }} · {{ formatDateTime(item.creation) }}
+              </small>
             </div>
           </div>
         </section>
@@ -310,20 +398,37 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref } from "vue";
-import { call, formatDate, formatDateTime } from "../api";
+import { computed, reactive, ref, watch } from "vue";
+import {
+  call,
+  formatDate,
+  formatDateTime,
+  getAgents,
+  getTicketTypes,
+} from "../api";
 
 const props = defineProps({ ticketId: { type: String, required: true } });
 const emit = defineEmits(["title"]);
 
 const ticket = ref({});
-const users = ref([]);
+const agents = ref([]);
+const ticketTypes = ref([]);
+const communications = ref([]);
+const comments = ref([]);
 const loading = ref(false);
 const saving = ref(false);
-const error = ref("");
+const error = ref(""); // page-load errors only
+const actionError = ref(""); // reply / comment / save errors
 const replyText = ref("");
+const composeMode = ref("reply"); // 'reply' | 'comment'
 const additionalOpen = ref(false);
 const previousTicketRows = ref([]);
+const parsedDescription = ref({
+  students: [],
+  fees: [],
+  previousTicketsHtml: "",
+  remainingHtml: "",
+});
 const additionalFilters = reactive({
   from: "",
   to: "",
@@ -332,6 +437,7 @@ const form = reactive({
   assignee: "",
   status: "Open",
   priority: "",
+  ticket_type: "",
   is_on_hold: false,
   hold_from: "",
   hold_to: "",
@@ -339,15 +445,26 @@ const form = reactive({
 });
 
 const history = computed(() => ticket.value.history || []);
+const timeline = computed(() => {
+  const comms = communications.value.map((c) => ({
+    ...c,
+    _type: "comm",
+  }));
+  const notes = comments.value.map((c) => ({
+    ...c,
+    _type: "comment",
+    sender: c.commented_by,
+  }));
+  return [...comms, ...notes].sort(
+    (a, b) => new Date(a.creation) - new Date(b.creation)
+  );
+});
 const filteredPreviousTickets = computed(() =>
   previousTicketRows.value.filter((item) =>
     isInsideAdditionalRange(item.creation)
   )
 );
-const agentUsers = computed(() => users.value.filter((user) => user.is_agent));
-const parsedDescription = computed(() =>
-  parseTicketDescription(ticket.value.description || "")
-);
+const agentUsers = computed(() => agents.value);
 const studentRows = computed(() => parsedDescription.value.students);
 const feeRows = computed(() => parsedDescription.value.fees);
 const previousTicketsHtml = computed(
@@ -397,10 +514,14 @@ const hasAdditionalDetails = computed(
     ticket.value.custom_previous_ticket_details
 );
 
-onMounted(async () => {
-  emit("title", "Ticket Detail", `#${props.ticketId}`);
-  await Promise.all([loadTicket(), loadUsers()]);
-});
+watch(
+  () => props.ticketId,
+  async () => {
+    emit("title", "Ticket Detail", `#${props.ticketId}`);
+    await Promise.all([loadTicket(), loadLookups(), loadComments()]);
+  },
+  { immediate: true }
+);
 
 function priorityClass(priority = "") {
   return priority.toLowerCase();
@@ -544,34 +665,87 @@ function cleanText(value) {
   return value.replace(/\s+/g, " ").trim();
 }
 
+function normalizeHtml(value) {
+  return cleanText((value || "").replace(/<[^>]*>/g, " "));
+}
+
+function threadContent(item) {
+  if (item?._type !== "comm") {
+    return item?.content || "";
+  }
+
+  const parsedContent = parseTicketDescription(item.content || "");
+  const hasStructuredBlocks =
+    parsedContent.students.length ||
+    parsedContent.fees.length ||
+    parsedContent.previousTicketsHtml;
+  const trimmedThreadHtml = (parsedContent.remainingHtml || "").trim();
+
+  if (hasStructuredBlocks) {
+    return trimmedThreadHtml;
+  }
+
+  const matchesDescription =
+    normalizeHtml(item.content) &&
+    normalizeHtml(item.content) === normalizeHtml(ticket.value.description);
+  if (matchesDescription) {
+    return (parsedDescription.value.remainingHtml || "").trim();
+  }
+
+  return item.content || "";
+}
+
 function applyForm() {
   const current = ticket.value || {};
   form.assignee = current.assignee?.name || "";
-  form.status = current.status || "Open";
+  form.status = current.custom_is_on_hold
+    ? "On Hold"
+    : current.status || "Open";
   form.priority = current.priority || "";
+  form.ticket_type = current.ticket_type || "";
   form.is_on_hold = !!Number(current.custom_is_on_hold || 0);
   form.hold_from = current.custom_hold_from || "";
   form.hold_to = current.custom_hold_to || "";
   form.hold_reason = current.custom_hold_reason || "";
 }
 
+async function loadLookups() {
+  const [agentResult, typeResult] = await Promise.allSettled([
+    getAgents(),
+    getTicketTypes(),
+  ]);
+  agents.value =
+    agentResult.status === "fulfilled" ? agentResult.value || [] : [];
+  ticketTypes.value =
+    typeResult.status === "fulfilled" ? typeResult.value || [] : [];
+}
+
+async function loadComments() {
+  try {
+    const rows = await call("frappe.client.get_list", {
+      doctype: "HD Ticket Comment",
+      fields: ["name", "content", "commented_by", "creation", "is_pinned"],
+      filters: [["reference_ticket", "=", props.ticketId]],
+      order_by: "creation asc",
+      page_length: 500,
+    });
+    comments.value = rows || [];
+  } catch {
+    comments.value = [];
+  }
+}
+
 async function loadTicket() {
   loading.value = true;
   error.value = "";
   try {
-    const data = await call("helpdesk.helpdesk.doctype.hd_ticket.api.get_one", {
+    ticket.value = await call("helpdesk.api.unity_ext.get_ticket_detail", {
       name: props.ticketId,
     });
-    const indicator = await call("helpdesk.api.unity.get_tickets", {
-      filters: {},
-      search: props.ticketId,
-      page_length: 1,
-      start: 0,
-    });
-    ticket.value = {
-      ...data,
-      ...(indicator.data?.[0] || {}),
-    };
+    communications.value = ticket.value.communications || [];
+    parsedDescription.value = parseTicketDescription(
+      ticket.value.description || ""
+    );
     applyForm();
     await loadPreviousTicketDetails();
   } catch (err) {
@@ -582,8 +756,9 @@ async function loadTicket() {
 }
 
 async function loadPreviousTicketDetails() {
-  const parsed = parseTicketDescription(ticket.value.description || "");
-  const fallbackRows = parsePreviousTicketRows(parsed.previousTicketsHtml);
+  const fallbackRows = parsePreviousTicketRows(
+    parsedDescription.value.previousTicketsHtml
+  );
   const names = fallbackRows.map((row) => row.name).filter(Boolean);
   previousTicketRows.value = fallbackRows;
   if (!names.length) return;
@@ -628,31 +803,25 @@ function parsePreviousTicketRows(html) {
     .filter(Boolean);
 }
 
-async function loadUsers() {
-  try {
-    users.value = await call("helpdesk.api.unity.get_users");
-  } catch {
-    users.value = [];
-  }
-}
-
 async function saveTicket() {
   saving.value = true;
-  error.value = "";
+  actionError.value = "";
   try {
-    await call("helpdesk.api.unity.update_ticket", {
+    const isOnHold = form.status === "On Hold" ? 1 : form.is_on_hold ? 1 : 0;
+    await call("helpdesk.api.unity_ext.update_ticket", {
       name: props.ticketId,
       assignee: form.assignee,
       status: form.status,
       priority: form.priority,
-      is_on_hold: form.is_on_hold ? 1 : 0,
+      ticket_type: form.ticket_type,
+      is_on_hold: isOnHold,
       hold_from: form.hold_from,
       hold_to: form.hold_to,
       hold_reason: form.hold_reason,
     });
     await loadTicket();
   } catch (err) {
-    error.value = err.message;
+    actionError.value = err.message;
   } finally {
     saving.value = false;
   }
@@ -664,20 +833,95 @@ async function markResolved() {
   await saveTicket();
 }
 
+// Create a Communication record directly from the frontend (fallback when
+// unity_ext.reply fails — e.g. module cache stale or no email account).
+async function _createCommunicationDirect(message) {
+  const sender = await call("frappe.auth.get_logged_user");
+  await call("frappe.client.insert", {
+    doc: {
+      doctype: "Communication",
+      communication_type: "Communication",
+      communication_medium: "",
+      sent_or_received: "Sent",
+      email_status: "Open",
+      subject: `Re: ${ticket.value.subject || ""} (#${props.ticketId})`,
+      sender: sender || "",
+      recipients: ticket.value.raised_by || "",
+      content: message,
+      status: "Linked",
+      reference_doctype: "HD Ticket",
+      reference_name: props.ticketId,
+    },
+  });
+}
+
 async function sendReply() {
   saving.value = true;
-  error.value = "";
+  actionError.value = "";
   try {
-    await call("helpdesk.api.unity.reply", {
-      name: props.ticketId,
-      message: replyText.value,
-    });
+    try {
+      await call("helpdesk.api.unity_ext.reply", {
+        name: props.ticketId,
+        message: replyText.value,
+      });
+    } catch {
+      // unity_ext.reply unavailable (module cache stale) or no email account —
+      // fall back to creating the Communication record directly.
+      await _createCommunicationDirect(replyText.value);
+    }
     replyText.value = "";
     await loadTicket();
   } catch (err) {
-    error.value = err.message;
+    actionError.value = err.message;
   } finally {
     saving.value = false;
   }
 }
+
+async function sendComment() {
+  saving.value = true;
+  actionError.value = "";
+  try {
+    // Insert HD Ticket Comment directly — no backend function needed.
+    const user = await call("frappe.auth.get_logged_user");
+    await call("frappe.client.insert", {
+      doc: {
+        doctype: "HD Ticket Comment",
+        commented_by: user || "",
+        content: replyText.value,
+        is_pinned: 0,
+        reference_ticket: props.ticketId,
+      },
+    });
+    replyText.value = "";
+    await loadComments();
+  } catch (err) {
+    actionError.value = err.message;
+  } finally {
+    saving.value = false;
+  }
+}
+
+watch(
+  () => form.status,
+  (value) => {
+    if (value === "On Hold") {
+      form.is_on_hold = true;
+    } else if (form.is_on_hold) {
+      form.is_on_hold = false;
+    }
+  }
+);
+
+watch(
+  () => form.is_on_hold,
+  (value) => {
+    if (value && form.status !== "On Hold") {
+      form.status = "On Hold";
+    }
+    if (!value && form.status === "On Hold") {
+      form.status = "Open";
+    }
+  }
+);
 </script>

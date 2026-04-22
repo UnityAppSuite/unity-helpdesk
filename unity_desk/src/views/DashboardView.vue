@@ -1,51 +1,185 @@
 <template>
-  <section class="page">
-    <div class="toolbar">
-      <select v-model="range" @change="load">
-        <option value="day">Today</option>
-        <option value="week">This week</option>
-      </select>
-      <button class="btn secondary" @click="load">Refresh</button>
+  <section class="page dashboard-page">
+    <div class="dashboard-filterbar">
+      <div class="dashboard-presets">
+        <button
+          v-for="preset in presets"
+          :key="preset.value"
+          class="filter-chip"
+          :class="{ active: range === preset.value }"
+          type="button"
+          @click="setRange(preset.value)"
+        >
+          {{ preset.label }}
+        </button>
+      </div>
+
+      <div class="dashboard-actions">
+        <template v-if="range === 'custom'">
+          <label class="date-field">
+            <span>From</span>
+            <input v-model="customFrom" type="date" @change="load" />
+          </label>
+          <label class="date-field">
+            <span>To</span>
+            <input v-model="customTo" type="date" @change="load" />
+          </label>
+        </template>
+        <button class="btn secondary" type="button" @click="load">
+          Refresh
+        </button>
+      </div>
     </div>
 
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="loading" class="empty">Loading dashboard...</p>
+
     <template v-else>
-      <div class="metrics">
-        <div class="metric">
-          <b>{{ cards.created }}</b
-          ><span>Created</span>
+      <div class="dashboard-overview">
+        <div class="overview-copy">
+          <strong>{{ summary.range_label || "Dashboard" }}</strong>
+          <span>
+            {{ formattedWindow }}
+          </span>
         </div>
-        <div class="metric">
-          <b>{{ cards.pending }}</b
-          ><span>Pending</span>
-        </div>
-        <div class="metric">
-          <b>{{ cards.on_hold }}</b
-          ><span>On Hold</span>
-        </div>
-        <div class="metric">
-          <b>{{ cards.resolved }}</b
-          ><span>Resolved</span>
-        </div>
-        <div class="metric">
-          <b>{{ cards.closed }}</b
-          ><span>Closed</span>
+        <div class="overview-meta">
+          <span class="overview-pill">Bucket: {{ bucketLabel }}</span>
+          <span class="overview-pill"
+            >Types tracked: {{ ticketTypeBreakdown.length }}</span
+          >
         </div>
       </div>
 
-      <div class="panel">
-        <div class="table-header">
-          <strong>Created, Resolved and Closed</strong>
-          <span>{{ range === "week" ? "Last 7 days" : "Today" }}</span>
+      <div class="dashboard-metrics dashboard-metrics-six">
+        <div class="metric metric-strong">
+          <small>Total</small>
+          <b>{{ cards.total || 0 }}</b>
+          <span>Tickets in selected window</span>
         </div>
-        <div class="chart">
-          <div v-for="row in series" :key="row.date" class="bar">
-            <span :style="{ height: `${barHeight(row.created)}px` }"></span>
-            <b>{{ row.created }}</b>
-            <small>{{ shortDate(row.date) }}</small>
+        <div class="metric metric-accent">
+          <small>Created</small>
+          <b>{{ cards.created || 0 }}</b>
+          <span>New tickets added</span>
+        </div>
+        <div class="metric metric-warning">
+          <small>Open / Pending</small>
+          <b>{{ cards.pending || 0 }}</b>
+          <span>Active workload</span>
+        </div>
+        <div class="metric metric-hold">
+          <small>On Hold</small>
+          <b>{{ cards.on_hold || 0 }}</b>
+          <span>Waiting with blockers</span>
+        </div>
+        <div class="metric metric-success">
+          <small>Resolved</small>
+          <b>{{ cards.resolved || 0 }}</b>
+          <span>Marked resolved</span>
+        </div>
+        <div class="metric metric-muted">
+          <small>Closed</small>
+          <b>{{ cards.closed || 0 }}</b>
+          <span>Fully closed tickets</span>
+        </div>
+      </div>
+
+      <div class="dashboard-grid">
+        <section class="panel analytics-panel">
+          <div class="table-header">
+            <strong>Ticket Type Distribution</strong>
+            <span>{{ summary.range_label || "Selected range" }}</span>
           </div>
-        </div>
+          <div class="donut-layout">
+            <div class="donut-wrap">
+              <svg class="donut-chart" viewBox="0 0 120 120" aria-hidden="true">
+                <circle class="donut-bg" cx="60" cy="60" r="42"></circle>
+                <circle
+                  v-for="segment in donutSegments"
+                  :key="segment.name"
+                  class="donut-segment"
+                  cx="60"
+                  cy="60"
+                  r="42"
+                  :stroke="segment.color"
+                  :stroke-dasharray="segment.dasharray"
+                  :stroke-dashoffset="segment.dashoffset"
+                ></circle>
+              </svg>
+              <div class="donut-center">
+                <strong>{{ cards.total || 0 }}</strong>
+                <span>Total</span>
+              </div>
+            </div>
+
+            <div class="donut-legend">
+              <div
+                v-for="segment in donutLegend"
+                :key="segment.name"
+                class="legend-row"
+              >
+                <span
+                  class="legend-dot"
+                  :style="{ backgroundColor: segment.color }"
+                ></span>
+                <div class="legend-copy">
+                  <strong>{{ segment.name }}</strong>
+                  <small
+                    >{{ segment.value }} tickets · {{ segment.percent }}%</small
+                  >
+                </div>
+              </div>
+              <p v-if="!donutLegend.length" class="empty inline-empty">
+                No ticket type data for this range.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel analytics-panel">
+          <div class="table-header">
+            <strong>Status Trend</strong>
+            <span>{{ bucketDescription }}</span>
+          </div>
+          <div class="stacked-chart">
+            <div v-if="!statusTrend.length" class="empty">
+              No status trend data available.
+            </div>
+            <template v-else>
+              <div class="stacked-bars">
+                <div
+                  v-for="row in statusTrend"
+                  :key="row.key"
+                  class="stacked-bar-card"
+                >
+                  <div class="stacked-bar-track">
+                    <div
+                      v-for="segment in statusSegments(row)"
+                      :key="`${row.key}-${segment.key}`"
+                      class="stacked-bar-segment"
+                      :style="{
+                        height: `${segment.height}%`,
+                        background: segment.color,
+                      }"
+                      :title="`${segment.label}: ${segment.value}`"
+                    ></div>
+                  </div>
+                  <strong>{{ row.total }}</strong>
+                  <small>{{ row.label }}</small>
+                </div>
+              </div>
+              <div class="stacked-legend">
+                <span
+                  v-for="item in statusPalette"
+                  :key="item.key"
+                  class="legend-inline"
+                >
+                  <i :style="{ backgroundColor: item.color }"></i
+                  >{{ item.label }}
+                </span>
+              </div>
+            </template>
+          </div>
+        </section>
       </div>
     </template>
   </section>
@@ -53,24 +187,128 @@
 
 <script setup>
 import { computed, onMounted, ref } from "vue";
-import { call } from "../api";
+import { call, formatDate } from "../api";
 
 const emit = defineEmits(["title"]);
 const range = ref("week");
+const customFrom = ref("");
+const customTo = ref("");
 const loading = ref(false);
 const error = ref("");
-const summary = ref({ cards: {}, series: [] });
+const summary = ref({
+  cards: {},
+  ticket_type_breakdown: [],
+  status_trend: [],
+  range_label: "",
+  from_date: "",
+  to_date: "",
+  bucket: "day",
+});
+
+const presets = [
+  { value: "today", label: "Today" },
+  { value: "week", label: "This week" },
+  { value: "month", label: "This month" },
+  { value: "quarter", label: "This quarter" },
+  { value: "year", label: "This year" },
+  { value: "custom", label: "Custom date" },
+];
+
+const statusPalette = [
+  { key: "open", label: "Open", color: "#4f46e5" },
+  { key: "replied", label: "Replied", color: "#7c3aed" },
+  { key: "on_hold", label: "On Hold", color: "#f59e0b" },
+  { key: "resolved", label: "Resolved", color: "#10b981" },
+  { key: "closed", label: "Closed", color: "#64748b" },
+];
+const donutPalette = [
+  "#4f46e5",
+  "#0ea5e9",
+  "#f59e0b",
+  "#10b981",
+  "#ec4899",
+  "#64748b",
+  "#8b5cf6",
+];
 
 const cards = computed(() => summary.value.cards || {});
-const series = computed(() => summary.value.series || []);
-const maxCreated = computed(() =>
-  Math.max(...series.value.map((row) => row.created || 0), 1)
+const ticketTypeBreakdown = computed(
+  () => summary.value.ticket_type_breakdown || []
 );
+const statusTrend = computed(() =>
+  (summary.value.status_trend || []).map((row) => ({
+    ...row,
+    total:
+      (row.open || 0) +
+      (row.replied || 0) +
+      (row.on_hold || 0) +
+      (row.resolved || 0) +
+      (row.closed || 0),
+  }))
+);
+const bucketLabel = computed(
+  () =>
+    ({ day: "Daily", week: "Weekly", month: "Monthly" }[summary.value.bucket] ||
+    "Daily")
+);
+const bucketDescription = computed(
+  () =>
+    `${bucketLabel.value} view for ${
+      summary.value.range_label || "selected range"
+    }`
+);
+const formattedWindow = computed(() => {
+  if (!summary.value.from_date || !summary.value.to_date)
+    return "Live ticket analytics";
+  return `${formatDate(summary.value.from_date)} to ${formatDate(
+    summary.value.to_date
+  )}`;
+});
+
+const donutLegend = computed(() => {
+  const total = cards.value.total || 0;
+  return ticketTypeBreakdown.value.map((row, index) => ({
+    ...row,
+    color: donutPalette[index % donutPalette.length],
+    percent: total ? Math.round((row.value / total) * 100) : 0,
+  }));
+});
+
+const donutSegments = computed(() => {
+  const total = ticketTypeBreakdown.value.reduce(
+    (sum, row) => sum + (row.value || 0),
+    0
+  );
+  const circumference = 2 * Math.PI * 42;
+  let offset = 0;
+  return ticketTypeBreakdown.value.map((row, index) => {
+    const value = row.value || 0;
+    const fraction = total ? value / total : 0;
+    const dash = fraction * circumference;
+    const segment = {
+      name: row.name,
+      color: donutPalette[index % donutPalette.length],
+      dasharray: `${dash} ${circumference - dash}`,
+      dashoffset: `${-offset}`,
+    };
+    offset += dash;
+    return segment;
+  });
+});
 
 onMounted(() => {
-  emit("title", "Dashboard", "Daily and weekly ticket summary");
+  emit("title", "Dashboard", "Advanced ticket analytics and trends");
   load();
 });
+
+function setRange(nextRange) {
+  range.value = nextRange;
+  if (nextRange !== "custom") {
+    customFrom.value = "";
+    customTo.value = "";
+  }
+  load();
+}
 
 async function load() {
   loading.value = true;
@@ -78,7 +316,13 @@ async function load() {
   try {
     summary.value = await call("helpdesk.api.unity.get_dashboard_summary", {
       range: range.value,
+      from_date: customFrom.value || undefined,
+      to_date: customTo.value || undefined,
     });
+    if (range.value === "custom") {
+      customFrom.value = summary.value.from_date || customFrom.value;
+      customTo.value = summary.value.to_date || customTo.value;
+    }
   } catch (err) {
     error.value = err.message;
   } finally {
@@ -86,14 +330,13 @@ async function load() {
   }
 }
 
-function barHeight(value) {
-  return Math.max(12, Math.round((value / maxCreated.value) * 160));
-}
-
-function shortDate(value) {
-  return new Intl.DateTimeFormat("en-IN", {
-    day: "2-digit",
-    month: "short",
-  }).format(new Date(value));
+function statusSegments(row) {
+  return statusPalette
+    .map((item) => ({
+      ...item,
+      value: row[item.key] || 0,
+      height: row.total ? ((row[item.key] || 0) / row.total) * 100 : 0,
+    }))
+    .filter((item) => item.value > 0);
 }
 </script>
