@@ -111,7 +111,12 @@
 
 <script setup>
 import { computed, onMounted, ref } from "vue";
-import { call, initials, getAgents } from "../api";
+import {
+  createAgent as createHelpdeskAgent,
+  getAgentCandidates,
+  getAgents,
+  initials,
+} from "../api";
 
 const emit = defineEmits(["title"]);
 const agents = ref([]);
@@ -155,18 +160,7 @@ async function load() {
 async function loadCandidates() {
   candidatesLoading.value = true;
   try {
-    // Get all system users — let backend handle duplicates on insert
-    const rows = await call("frappe.client.get_list", {
-      doctype: "User",
-      fields: ["name", "full_name", "email"],
-      filters: [
-        ["enabled", "=", 1],
-        ["user_type", "=", "System User"],
-      ],
-      order_by: "full_name asc",
-      page_length: 500,
-    });
-    candidates.value = rows || [];
+    candidates.value = await getAgentCandidates();
   } catch {
     candidates.value = [];
   } finally {
@@ -193,13 +187,7 @@ async function createAgent() {
   creating.value = true;
   createError.value = "";
   try {
-    await call("frappe.client.insert", {
-      doc: {
-        doctype: "HD Agent",
-        user: selectedUser.value,
-        is_active: 1,
-      },
-    });
+    await createHelpdeskAgent(selectedUser.value);
     closeCreate();
     await load();
   } catch (err) {

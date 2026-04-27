@@ -492,12 +492,6 @@ class HDTicket(Document):
 		communication.insert(ignore_permissions=True)
 		capture_event("agent_replied")
 
-		if skip_email_workflow:
-			return
-
-		if not sender_email:
-			frappe.throw(_("Can not send email. No sender email set up!"))
-
 		_attachments = []
 
 		for attachment in attachments:
@@ -506,6 +500,12 @@ class HDTicket(Document):
 			file_doc.attached_to_doctype = "Communication"
 			file_doc.save(ignore_permissions=True)
 			_attachments.append({"file_url": file_doc.file_url})
+
+		if skip_email_workflow:
+			return
+
+		if not sender_email:
+			frappe.throw(_("Can not send email. No sender email set up!"))
 
 		reply_to_email = sender_email.email_id
 		template = (

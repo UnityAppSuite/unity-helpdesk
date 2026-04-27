@@ -22,7 +22,8 @@ const routes = [
     component: () => import("./views/TicketDetailView.vue"),
     props: true,
   },
-  { path: "/agents", component: () => import("./views/UsersView.vue") },
+  { path: "/agents", redirect: "/settings" },
+  { path: "/settings", component: () => import("./views/ProfileView.vue") },
 ];
 
 const router = createRouter({

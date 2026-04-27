@@ -1,7 +1,7 @@
 <template>
   <section class="page">
     <div class="toolbar">
-      <select v-model="filters.status" @change="reload">
+      <select v-model="filters.status" @change="applyFiltersAndReload">
         <option value="">Status: All</option>
         <option>Open</option>
         <option>Replied</option>
@@ -9,17 +9,23 @@
         <option>Resolved</option>
         <option>Closed</option>
       </select>
-      <select v-model="filters.priority" @change="reload">
+      <select v-model="filters.priority" @change="applyFiltersAndReload">
         <option value="">Priority: All</option>
         <option>High</option>
         <option>Medium</option>
         <option>Low</option>
       </select>
+      <select v-model="filters.ticket_type" @change="applyFiltersAndReload">
+        <option value="">Ticket Type: All</option>
+        <option v-for="type in ticketTypes" :key="type.name" :value="type.name">
+          {{ type.name }}
+        </option>
+      </select>
       <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
       <select
         v-if="props.view === 'all'"
         v-model="filters.assigned_to"
-        @change="reload"
+        @change="applyFiltersAndReload"
       >
         <option value="">Assigned: All</option>
         <option value="Unassigned">Unassigned</option>
@@ -28,15 +34,40 @@
         </option>
       </select>
       <span v-else class="badge blue">Assigned to me</span>
-      <input v-model="filters.created_from" type="date" @change="reload" />
       <input
-        v-model="search"
-        class="search"
-        type="search"
-        placeholder="Search ticket ID, subject, email, student or fee details"
-        @keyup.enter="reload"
+        v-model="filters.created_from"
+        type="date"
+        @change="applyFiltersAndReload"
       />
-      <button class="btn secondary" @click="reload">Search</button>
+      <div class="search-wrapper">
+        <span class="search-icon">🔍</span>
+        <input
+          v-model="search"
+          class="search"
+          type="text"
+          placeholder="Ticket ID, student name, reference no., guardian email or message…"
+          @keyup.enter="immediateReload"
+        />
+        <span v-if="loading && search" class="search-loading" title="Searching…"
+          >⏳</span
+        >
+        <button
+          v-if="search"
+          class="search-clear"
+          type="button"
+          title="Clear search"
+          @click="clearSearch"
+        >
+          ✕
+        </button>
+      </div>
+      <button
+        class="btn secondary toolbar-refresh"
+        type="button"
+        @click="refreshList"
+      >
+        Refresh
+      </button>
     </div>
 
     <div class="metrics">
@@ -54,11 +85,11 @@
       </div>
       <div class="metric">
         <b>{{ cards.resolved || 0 }}</b>
-        <span>Resolved This Week</span>
+        <span>Resolved</span>
       </div>
       <div class="metric">
         <b>{{ cards.closed || 0 }}</b>
-        <span>Closed This Week</span>
+        <span>Closed</span>
       </div>
     </div>
 
@@ -68,8 +99,12 @@
         <span>{{ result.total_count || 0 }} tickets</span>
       </div>
       <p v-if="error" class="error">{{ error }}</p>
-      <p v-else-if="loading" class="empty">Loading tickets...</p>
-      <p v-else-if="!tickets.length" class="empty">No tickets found.</p>
+      <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
+      <p v-else-if="!tickets.length && search" class="empty">
+        No tickets found for <strong>"{{ search }}"</strong> — try a shorter or
+        different term.
+      </p>
+      <p v-else-if="!tickets.length" class="empty">{{ emptyMessage }}</p>
       <div v-else class="scroll-x">
         <table class="ticket-table">
           <thead>
@@ -92,7 +127,13 @@
               @click="openTicket(ticket.name)"
             >
               <td>
-                <strong>#{{ ticket.name }}</strong>
+                <button
+                  class="link-btn"
+                  type="button"
+                  @click.stop="openDeskTicket(ticket.name)"
+                >
+                  #{{ ticket.name }}
+                </button>
               </td>
               <td>
                 <div class="subject">{{ ticket.subject || "No subject" }}</div>
@@ -228,7 +269,13 @@
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { call, formatDate, getAgents, getTicketTypes } from "../api";
+import {
+  call,
+  formatDate,
+  getAgents,
+  getTicketTypes,
+  openDeskPath,
+} from "../api";
 
 const props = defineProps({ view: { type: String, default: "my" } });
 const emit = defineEmits(["title"]);
@@ -237,24 +284,30 @@ const router = useRouter();
 
 const search = ref("");
 const loading = ref(false);
+const loadingMore = ref(false);
 const error = ref("");
+const emptyMessage = ref("No tickets found.");
 const agents = ref([]);
 const ticketTypes = ref([]);
-const summary = ref({ cards: {} });
 const rowSaving = reactive({});
 const editState = reactive({});
 const result = reactive({
   data: [],
   total_count: 0,
+  cards: {},
   start: 0,
   page_length: 20,
 });
 const filters = reactive({
   status: "",
   priority: "",
+  ticket_type: "",
   assigned_to: "",
   created_from: "",
 });
+let activeController = null;
+let activeRequestId = 0;
+let searchDebounceTimer = null;
 
 const title = computed(() =>
   props.view === "my" ? "My Tickets" : "All Tickets"
@@ -263,21 +316,46 @@ const tickets = computed(() => result.data || []);
 const canLoadMore = computed(
   () => tickets.value.length < (result.total_count || 0)
 );
-const cards = computed(() => summary.value.cards || {});
+const cards = computed(() => result.cards || {});
 
 watch(
   () => [props.view, route.fullPath],
   async () => {
     emit("title", title.value, "Search, edit, and open tickets");
+    applyRouteState();
     await reload();
   },
   { immediate: true }
 );
 
+// Debounced auto-search: fires 400 ms after the user stops typing.
+// Requires at least 2 characters or an empty string (to clear search).
+watch(search, (val) => {
+  const trimmed = val.trim();
+  if (trimmed.length === 1) return; // don't search on a single character
+  clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    // Sync URL without pushing a new history entry
+    router.replace({
+      query: { ...route.query, search: trimmed || undefined },
+    });
+    reload();
+  }, 400);
+});
+
 onMounted(async () => {
-  loadSummary();
+  applyRouteState();
   await loadLookups();
 });
+
+function applyRouteState() {
+  search.value = String(route.query.search || "");
+  filters.status = String(route.query.status || "");
+  filters.priority = String(route.query.priority || "");
+  filters.ticket_type = String(route.query.ticket_type || "");
+  filters.assigned_to = String(route.query.assigned_to || "");
+  filters.created_from = String(route.query.created_from || "");
+}
 
 function syncEditState(rows) {
   rows.forEach((ticket) => {
@@ -312,53 +390,120 @@ function cleanFilters() {
   );
 }
 
-async function loadSummary() {
-  try {
-    summary.value = await call("helpdesk.api.unity.get_dashboard_summary", {
-      range: "week",
-    });
-  } catch {
-    summary.value = { cards: {} };
-  }
-}
-
 async function reload() {
   result.start = 0;
-  result.data = [];
-  await load();
+  await load({ append: false });
 }
 
-async function load() {
-  loading.value = true;
+function routeQueryFromState() {
+  return {
+    ...route.query,
+    status: filters.status || undefined,
+    priority: filters.priority || undefined,
+    ticket_type: filters.ticket_type || undefined,
+    assigned_to: filters.assigned_to || undefined,
+    created_from: filters.created_from || undefined,
+    search: search.value.trim() || undefined,
+  };
+}
+
+async function applyFiltersAndReload() {
+  clearTimeout(searchDebounceTimer);
+  await router.replace({ query: routeQueryFromState() });
+  await reload();
+}
+
+// Bypass debounce for Enter key and explicit user actions
+function immediateReload() {
+  clearTimeout(searchDebounceTimer);
+  router.replace({ query: routeQueryFromState() });
+  reload();
+}
+
+function clearSearch() {
+  clearTimeout(searchDebounceTimer);
+  search.value = "";
+  router.replace({ query: routeQueryFromState() });
+  reload();
+}
+
+function refreshList() {
+  clearTimeout(searchDebounceTimer);
+  reload();
+}
+
+function resetResults() {
+  result.data = [];
+  result.total_count = 0;
+  result.cards = {};
+  result.start = 0;
+}
+
+async function load({ append = false } = {}) {
+  const requestId = activeRequestId + 1;
+  activeRequestId = requestId;
+  activeController?.abort();
+  activeController = new AbortController();
+  if (append) {
+    loadingMore.value = true;
+  } else {
+    loading.value = true;
+  }
   error.value = "";
+  emptyMessage.value = "No tickets found.";
   try {
-    const data = await call("helpdesk.api.unity.get_tickets", {
-      view: props.view,
-      filters: cleanFilters(),
-      search: search.value,
-      page_length: result.page_length,
-      start: 0,
-    });
-    Object.assign(result, data);
+    const data = await call(
+      "helpdesk.api.unity_helpdesk.get_tickets",
+      {
+        view: props.view,
+        filters: cleanFilters(),
+        search: search.value,
+        page_length: result.page_length,
+        start: append ? tickets.value.length : 0,
+      },
+      {
+        signal: activeController.signal,
+        timeoutMs: search.value.trim() ? 60000 : 30000,
+      }
+    );
+    if (requestId !== activeRequestId) return;
+    if (append) {
+      result.data = [...result.data, ...(data.data || [])];
+      result.total_count = data.total_count || 0;
+      result.cards = data.cards || {};
+      result.start = data.start || result.start;
+      result.page_length = data.page_length || result.page_length;
+    } else {
+      Object.assign(result, data);
+    }
     syncEditState(data.data || []);
   } catch (err) {
+    if (requestId !== activeRequestId || err.code === "REQUEST_ABORTED") {
+      return;
+    }
+    if (err.code === "REQUEST_TIMEOUT") {
+      resetResults();
+      emptyMessage.value = search.value.trim()
+        ? `Search timed out. Try a more specific query — e.g. a ticket ID or exact name.`
+        : "Loading timed out. Please refresh and try again.";
+      return;
+    }
     error.value = err.message;
   } finally {
-    loading.value = false;
+    if (requestId === activeRequestId) {
+      if (append) {
+        loadingMore.value = false;
+      } else {
+        loading.value = false;
+      }
+      activeController = null;
+    }
   }
 }
 
 async function loadMore() {
-  const data = await call("helpdesk.api.unity.get_tickets", {
-    view: props.view,
-    filters: cleanFilters(),
-    search: search.value,
-    page_length: result.page_length,
-    start: tickets.value.length,
-  });
-  result.data = [...result.data, ...data.data];
-  result.total_count = data.total_count;
-  syncEditState(data.data || []);
+  if (loading.value || loadingMore.value) return;
+  await load({ append: true });
 }
 
 async function quickUpdate(ticket, field, value) {
@@ -376,12 +521,16 @@ async function quickUpdate(ticket, field, value) {
         payload.hold_reason = editState[ticket.name].hold_reason || "";
       }
     }
-    const updated = await call("helpdesk.api.unity_ext.update_ticket", payload);
+    const updated = await call(
+      "helpdesk.api.unity_helpdesk_ext.update_ticket",
+      payload
+    );
     const index = result.data.findIndex((row) => row.name === ticket.name);
     if (index >= 0) {
       result.data[index] = updated;
       syncEditState([updated]);
     }
+    await reload();
   } catch (err) {
     error.value = err.message;
     await load();
@@ -415,7 +564,17 @@ function formatHoldWindow(ticket) {
 }
 
 function openTicket(name) {
-  router.push(`/tickets/${name}`);
+  router.push({
+    path: `/tickets/${name}`,
+    query: {
+      ...routeQueryFromState(),
+      list_view: props.view,
+    },
+  });
+}
+
+function openDeskTicket(name) {
+  openDeskPath(`/app/hd-ticket/${name}`);
 }
 
 function assignmentClass(assignee) {

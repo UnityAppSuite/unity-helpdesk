@@ -38,6 +38,7 @@
   "enable_unity_ticket_reminders",
   "column_break_unity_reminders",
   "unity_reminder_after_days",
+  "unity_email_thread_layout",
   "misc_tab",
   "toasts_column",
   "suppress_default_email_toast",
@@ -249,6 +250,13 @@
    "fieldtype": "Int",
    "label": "Reminder After Days",
    "non_negative": 1
+  },
+  {
+   "default": "Classic",
+   "fieldname": "unity_email_thread_layout",
+   "fieldtype": "Select",
+   "label": "Unity Email Thread Layout",
+   "options": "Classic\nChat Based"
   },
   {
    "default": "0",

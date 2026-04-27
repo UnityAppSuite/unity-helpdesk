@@ -15,9 +15,11 @@ class HDAgent(Document):
 
 	def set_user_roles(self):
 		user = frappe.get_doc("User", self.user)
+		existing_roles = {row.role for row in user.roles}
 
-		for role in ["Agent"]:
-			user.append("roles", {"role": role})
+		for role in ["Agent", "Helpdesk User"]:
+			if role not in existing_roles:
+				user.append("roles", {"role": role})
 
 		user.save()
 

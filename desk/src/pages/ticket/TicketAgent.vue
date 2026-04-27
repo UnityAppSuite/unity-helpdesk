@@ -17,17 +17,7 @@
                 () => {
                   isExpanded = true;
                   mode = Mode.Response;
-                  $nextTick(() =>
-                    $refs.editor.editor
-                      .chain()
-                      .clearContent()
-                      .insertContent(message)
-                      .focus('all')
-                      .setBlockquote()
-                      .insertContentAt(0, { type: 'paragraph' })
-                      .focus('start')
-                      .run()
-                  );
+                  $nextTick(() => $refs.editor.quoteReply(message));
                 }
               "
             >
@@ -155,7 +145,7 @@
                 "
                 theme="gray"
                 variant="solid"
-                :disabled="$refs.editor.editor.isEmpty || resource.loading"
+                :disabled="isComposerEmpty || resource.loading"
                 @click="() => resource.submit()"
               />
             </template>
@@ -168,8 +158,8 @@
       v-model="showCannedResponses"
       @select="
         (content) => {
-          $refs.editor.editor.commands.clearContent();
-          $refs.editor.editor.commands.insertContent(content);
+          $refs.editor.clear();
+          $refs.editor.insertContent(content);
         }
       "
     />
@@ -231,6 +221,13 @@ const showBcc = ref(false);
 const mode = ref(Mode.Comment);
 const focus = ref("");
 const showCannedResponses = ref(false);
+const isComposerEmpty = computed(
+  () =>
+    !content.value
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+);
 
 createResource({
   url: "run_doc_method",
@@ -290,7 +287,7 @@ const resource = computed(() => {
 });
 
 function clear() {
-  editor.value.editor.commands.clearContent(true);
+  editor.value?.clear();
   isExpanded.value = false;
   cc.value = "";
   bcc.value = "";

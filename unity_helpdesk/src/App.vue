@@ -1,5 +1,5 @@
 <template>
-  <div class="app-shell">
+  <div class="app-shell" :class="threadLayoutClass">
     <aside class="sidebar" :class="{ open: sidebarOpen }">
       <RouterLink class="brand" to="/tickets/my" @click="sidebarOpen = false">
         <span class="brand-mark">
@@ -13,19 +13,37 @@
 
       <nav>
         <p>Tickets</p>
-        <RouterLink to="/tickets/my" @click="sidebarOpen = false">
+        <RouterLink
+          v-if="canViewMyTickets"
+          to="/tickets/my"
+          @click="sidebarOpen = false"
+        >
           My Tickets
         </RouterLink>
-        <RouterLink to="/tickets/all" @click="sidebarOpen = false">
+        <RouterLink
+          v-if="canViewAllTickets"
+          to="/tickets/all"
+          @click="sidebarOpen = false"
+        >
           All Tickets
         </RouterLink>
-        <RouterLink to="/dashboard" @click="sidebarOpen = false">
+        <RouterLink
+          v-if="canViewMyTickets"
+          to="/dashboard"
+          @click="sidebarOpen = false"
+        >
           Dashboard
         </RouterLink>
-        <p>Management</p>
-        <RouterLink to="/agents" @click="sidebarOpen = false"
-          >Agents</RouterLink
-        >
+        <template v-if="canManageUnitySettings">
+          <p>Management</p>
+          <RouterLink
+            v-if="canManageUnitySettings"
+            to="/settings"
+            @click="sidebarOpen = false"
+          >
+            Settings
+          </RouterLink>
+        </template>
       </nav>
     </aside>
 
@@ -61,6 +79,14 @@
                 }}</strong>
                 <small>{{ profile.email || "" }}</small>
               </div>
+              <RouterLink
+                v-if="canManageUnitySettings"
+                class="profile-dropdown-item"
+                to="/settings"
+                @click="profileMenuOpen = false"
+              >
+                Settings
+              </RouterLink>
               <a class="profile-dropdown-item" href="/app" target="_top">
                 Switch to Desk
               </a>
@@ -93,6 +119,9 @@
         </div>
         <div class="modal-body stack">
           <p v-if="composerError" class="error">{{ composerError }}</p>
+          <p v-else-if="composerWarning" class="warning-banner">
+            {{ composerWarning }}
+          </p>
 
           <!-- Customer Email with user search -->
           <label>
@@ -179,11 +208,56 @@
           </label>
           <label>
             Email Message
-            <textarea
+            <TinyMceEditor
               v-model="composer.message"
-              rows="8"
+              :min-height="260"
               placeholder="Write the email that should be sent to the customer"
-            ></textarea>
+            />
+          </label>
+          <label>
+            Attachments
+            <div class="composer-attachment-actions">
+              <button
+                type="button"
+                class="btn secondary"
+                :disabled="composerUploading"
+                @click="composerAttachmentInput?.click()"
+              >
+                {{ composerUploading ? "Uploading..." : "Add Attachments" }}
+              </button>
+              <input
+                ref="composerAttachmentInput"
+                type="file"
+                class="hidden-file-input"
+                multiple
+                @change="handleComposerAttachments"
+              />
+            </div>
+            <div
+              v-if="composer.attachments.length"
+              class="attachment-list attachment-list-modal"
+            >
+              <div
+                v-for="attachment in composer.attachments"
+                :key="attachment.name"
+                class="attachment-item"
+              >
+                <a
+                  :href="attachment.file_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ attachment.file_name || attachment.name }}
+                </a>
+                <button
+                  type="button"
+                  class="link-btn danger-link"
+                  @click="removeComposerAttachment(attachment.name)"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
           </label>
         </div>
         <div class="modal-footer">
@@ -198,30 +272,49 @@
 </template>
 
 <script setup>
-import { onMounted, reactive, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, provide, reactive, ref, watch } from "vue";
+import { RouterLink, useRoute, useRouter } from "vue-router";
+import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 import {
   call,
   initials,
   getAgents,
   getTicketTypes,
-  getSidebarProfile,
+  getUnityProfile,
   searchUsers,
+  uploadAttachment,
 } from "./api";
 
+const TICKET_NOTICE_KEY = "unity_helpdesk_ticket_notice";
 const router = useRouter();
+const route = useRoute();
 const sidebarOpen = ref(false);
 const pageTitle = ref("My Tickets");
 const pageSubtitle = ref("Fast support workspace");
 const profile = ref({});
 const profileMenuOpen = ref(false);
-const brandLogo = "/assets/helpdesk/unity_desk/favicon.svg";
+const brandLogo = "/assets/helpdesk/unity_helpdesk/favicon.svg";
 const agents = ref([]);
 const ticketTypes = ref([]);
 const openComposer = ref(false);
 const composerSaving = ref(false);
+const composerUploading = ref(false);
 const composerError = ref("");
+const composerWarning = ref("");
+const composerAttachmentInput = ref(null);
 const userSuggestions = ref([]);
+const session = reactive({
+  name: "",
+  full_name: "",
+  email: "",
+  username: "",
+  user_image: "",
+  roles: [],
+  capabilities: {},
+  settings: {
+    unity_email_thread_layout: "Classic",
+  },
+});
 let suggestTimeout = null;
 const composer = reactive({
   raised_by: "",
@@ -230,30 +323,103 @@ const composer = reactive({
   priority: "",
   ticket_type: "",
   assignee: "",
+  attachments: [],
 });
 
+provide("unitySession", session);
+provide("refreshUnitySession", loadSession);
+
+const capabilities = computed(() => session.capabilities || {});
+const canViewMyTickets = computed(
+  () => !!capabilities.value.can_view_my_tickets
+);
+const canViewAllTickets = computed(
+  () => !!capabilities.value.can_view_all_tickets
+);
+const canManageAgents = computed(() => !!capabilities.value.can_manage_agents);
+const canManageUnitySettings = computed(
+  () => !!capabilities.value.can_manage_unity_settings
+);
+const threadLayout = computed(
+  () => session.settings?.unity_email_thread_layout || "Classic"
+);
+const threadLayoutClass = computed(
+  () =>
+    `thread-layout-${String(threadLayout.value || "classic")
+      .toLowerCase()
+      .replace(/\s+/g, "-")}`
+);
+
 onMounted(async () => {
-  const [profileData, agentRows, typeRows] = await Promise.allSettled([
-    getSidebarProfile(),
-    getAgents(),
-    getTicketTypes(),
-  ]);
-  profile.value =
-    profileData.status === "fulfilled" ? profileData.value || {} : {};
-  agents.value = agentRows.status === "fulfilled" ? agentRows.value || [] : [];
-  ticketTypes.value =
-    typeRows.status === "fulfilled" ? typeRows.value || [] : [];
+  await Promise.allSettled([loadSession(), loadLookups()]);
 });
+
+watch(
+  () => route.fullPath,
+  () => {
+    enforceRouteAccess();
+  }
+);
 
 function setTitle(title, subtitle = "Fast support workspace") {
   pageTitle.value = title;
   pageSubtitle.value = subtitle;
 }
 
+async function loadSession() {
+  try {
+    const data = (await getUnityProfile()) || {};
+    profile.value = data || {};
+    session.name = data.name || "";
+    session.full_name = data.full_name || "";
+    session.email = data.email || "";
+    session.username = data.username || "";
+    session.user_image = data.user_image || "";
+    session.roles = data.roles || [];
+    session.capabilities = data.capabilities || {};
+    session.settings = {
+      unity_email_thread_layout:
+        data.settings?.unity_email_thread_layout || "Classic",
+    };
+    enforceRouteAccess();
+  } catch (err) {
+    composerError.value = err.message;
+  }
+}
+
+async function loadLookups() {
+  const [agentRows, typeRows] = await Promise.allSettled([
+    getAgents(),
+    getTicketTypes(),
+  ]);
+  agents.value = agentRows.status === "fulfilled" ? agentRows.value || [] : [];
+  ticketTypes.value =
+    typeRows.status === "fulfilled" ? typeRows.value || [] : [];
+}
+
+function enforceRouteAccess() {
+  if (!canViewMyTickets.value && route.path !== "/") {
+    return;
+  }
+  if (route.path === "/tickets/all" && !canViewAllTickets.value) {
+    router.replace("/tickets/my");
+    return;
+  }
+  if (route.path === "/agents" && !canManageAgents.value) {
+    router.replace(canManageUnitySettings.value ? "/settings" : "/tickets/my");
+    return;
+  }
+  if (route.path === "/settings" && !canManageUnitySettings.value) {
+    router.replace("/tickets/my");
+  }
+}
+
 function closeComposer() {
   openComposer.value = false;
   composerSaving.value = false;
+  composerUploading.value = false;
   composerError.value = "";
+  composerWarning.value = "";
   userSuggestions.value = [];
   composer.raised_by = "";
   composer.subject = "";
@@ -261,6 +427,7 @@ function closeComposer() {
   composer.priority = "";
   composer.ticket_type = "";
   composer.assignee = "";
+  composer.attachments = [];
 }
 
 function onEmailInput() {
@@ -284,18 +451,51 @@ function selectUser(user) {
   userSuggestions.value = [];
 }
 
+async function handleComposerAttachments(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  composerUploading.value = true;
+  composerError.value = "";
+  try {
+    for (const file of files) {
+      const uploaded = await uploadAttachment(file);
+      composer.attachments.push(uploaded);
+    }
+  } catch (err) {
+    composerError.value = err.message;
+  } finally {
+    composerUploading.value = false;
+    if (composerAttachmentInput.value) {
+      composerAttachmentInput.value.value = "";
+    }
+  }
+}
+
+function removeComposerAttachment(name) {
+  composer.attachments = composer.attachments.filter(
+    (attachment) => attachment.name !== name
+  );
+}
+
 async function createTicket() {
   composerSaving.value = true;
   composerError.value = "";
+  composerWarning.value = "";
   try {
-    const ticket = await call("helpdesk.api.unity_ext.create_ticket", {
+    const result = await call("helpdesk.api.unity_helpdesk_ext.create_ticket", {
       subject: composer.subject,
       raised_by: composer.raised_by,
       message: composer.message,
       priority: composer.priority,
       ticket_type: composer.ticket_type,
       assignee: composer.assignee,
+      attachments: composer.attachments.map((attachment) => attachment.name),
     });
+    const ticket = result?.ticket || {};
+    if (result?.warning) {
+      sessionStorage.setItem(TICKET_NOTICE_KEY, result.warning);
+      composerWarning.value = result.warning;
+    }
     closeComposer();
     if (ticket?.name) {
       router.push(`/tickets/${ticket.name}`);

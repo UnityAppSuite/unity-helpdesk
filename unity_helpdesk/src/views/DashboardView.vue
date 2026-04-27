@@ -15,6 +15,19 @@
       </div>
 
       <div class="dashboard-actions">
+        <label v-if="canViewAgentDashboard" class="date-field agent-filter">
+          <span>Agent</span>
+          <select v-model="selectedAgent" @change="load">
+            <option value="">All agents</option>
+            <option
+              v-for="agent in agents"
+              :key="agent.name"
+              :value="agent.name"
+            >
+              {{ agent.full_name || agent.name }}
+            </option>
+          </select>
+        </label>
         <template v-if="range === 'custom'">
           <label class="date-field">
             <span>From</span>
@@ -186,13 +199,16 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
-import { call, formatDate } from "../api";
+import { computed, inject, onMounted, ref } from "vue";
+import { call, formatDate, getAgents } from "../api";
 
 const emit = defineEmits(["title"]);
+const unitySession = inject("unitySession", { capabilities: {} });
 const range = ref("week");
 const customFrom = ref("");
 const customTo = ref("");
+const selectedAgent = ref("");
+const agents = ref([]);
 const loading = ref(false);
 const error = ref("");
 const summary = ref({
@@ -264,6 +280,9 @@ const formattedWindow = computed(() => {
     summary.value.to_date
   )}`;
 });
+const canViewAgentDashboard = computed(
+  () => !!unitySession.capabilities?.can_view_agent_dashboard
+);
 
 const donutLegend = computed(() => {
   const total = cards.value.total || 0;
@@ -298,8 +317,18 @@ const donutSegments = computed(() => {
 
 onMounted(() => {
   emit("title", "Dashboard", "Advanced ticket analytics and trends");
+  loadAgents();
   load();
 });
+
+async function loadAgents() {
+  if (!canViewAgentDashboard.value) return;
+  try {
+    agents.value = await getAgents();
+  } catch {
+    agents.value = [];
+  }
+}
 
 function setRange(nextRange) {
   range.value = nextRange;
@@ -314,11 +343,15 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    summary.value = await call("helpdesk.api.unity.get_dashboard_summary", {
-      range: range.value,
-      from_date: customFrom.value || undefined,
-      to_date: customTo.value || undefined,
-    });
+    summary.value = await call(
+      "helpdesk.api.unity_helpdesk.get_dashboard_summary",
+      {
+        range: range.value,
+        from_date: customFrom.value || undefined,
+        to_date: customTo.value || undefined,
+        agent: selectedAgent.value || undefined,
+      }
+    );
     if (range.value === "custom") {
       customFrom.value = summary.value.from_date || customFrom.value;
       customTo.value = summary.value.to_date || customTo.value;

@@ -13,7 +13,7 @@ after_migrate = "helpdesk.search.build_index_in_background"
 
 scheduler_events = {
 	"all": ["helpdesk.search.build_index_if_not_exists"],
-	"daily": ["helpdesk.api.unity.send_open_ticket_reminders"],
+	"daily": ["helpdesk.api.unity_helpdesk.send_open_ticket_reminders"],
 }
 
 
