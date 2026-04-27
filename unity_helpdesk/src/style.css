@@ -262,6 +262,10 @@ nav a.router-link-active {
   margin-left: 8px;
 }
 
+.toolbar-search {
+  min-width: 88px;
+}
+
 .toolbar .search-icon {
   position: absolute;
   left: 0.5rem;

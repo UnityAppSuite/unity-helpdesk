@@ -24,6 +24,7 @@ PRIORITY_TARGETS = {
 	"Medium": "1-2 days",
 	"Low": "2-3 days",
 }
+MAX_SEARCH_CANDIDATES = 400
 UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
@@ -51,6 +52,7 @@ OPTIONAL_TICKET_FIELDS = [
 	"custom_search_student_names",
 	"custom_search_student_refs",
 	"custom_search_guardian_emails",
+	"custom_search_message_body",
 ]
 
 
@@ -763,6 +765,9 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 def populate_ticket_student_search_fields(ticket):
 	ticket_doc = frappe.get_doc(TICKET_DOCTYPE, ticket) if isinstance(ticket, str) else ticket
 	if not ticket_doc or not cstr(ticket_doc.get("raised_by")).strip():
+		ticket_name = cstr(ticket_doc.name if ticket_doc else ticket).strip()
+		if ticket_name:
+			update_ticket_message_search_index(ticket_name, ticket_doc=ticket_doc)
 		return {}
 
 	context = get_student_context_for_ticket(ticket_doc.name, ticket_doc.raised_by)
@@ -799,9 +804,67 @@ def populate_ticket_student_search_fields(ticket):
 				if email_text:
 					emails.add(email_text)
 		search_update["custom_search_guardian_emails"] = ", ".join(sorted(emails))
+	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
+		search_update["custom_search_message_body"] = _build_ticket_message_search_text(
+			ticket_doc.name,
+			ticket_doc=ticket_doc,
+		)
 	if search_update:
 		frappe.db.set_value(TICKET_DOCTYPE, ticket_doc.name, search_update, update_modified=False)
+		_invalidate_communication_cache(ticket_doc.name)
 	return context
+
+
+def _truncate_search_text(text, max_chars=12000):
+	text = cstr(text or "").strip()
+	if len(text) <= max_chars:
+		return text
+	return text[:max_chars].rsplit(" ", 1)[0].strip() or text[:max_chars]
+
+
+def _build_ticket_message_search_text(ticket_name, ticket_doc=None):
+	parts = []
+	ticket_doc = ticket_doc or frappe.get_cached_doc(TICKET_DOCTYPE, ticket_name)
+	if ticket_doc:
+		parts.append(_normalize_search_text(ticket_doc.get("description")))
+
+	for row in frappe.get_all(
+		"Communication",
+		fields=["subject", "content"],
+		filters={"reference_doctype": TICKET_DOCTYPE, "reference_name": ticket_name},
+		page_length=0,
+		order_by="creation desc",
+	):
+		parts.append(_normalize_search_text(row.subject))
+		parts.append(_normalize_search_text(row.content))
+
+	for row in frappe.get_all(
+		"HD Ticket Comment",
+		fields=["content"],
+		filters={"reference_ticket": ticket_name},
+		page_length=0,
+		order_by="creation desc",
+	):
+		parts.append(_normalize_search_text(row.content))
+
+	combined = " ".join(part for part in parts if part)
+	return _truncate_search_text(combined)
+
+
+def update_ticket_message_search_index(ticket_name, ticket_doc=None):
+	ticket_name = cstr(ticket_name).strip()
+	if not ticket_name or not frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
+		return ""
+	search_text = _build_ticket_message_search_text(ticket_name, ticket_doc=ticket_doc)
+	frappe.db.set_value(
+		TICKET_DOCTYPE,
+		ticket_name,
+		"custom_search_message_body",
+		search_text,
+		update_modified=False,
+	)
+	_invalidate_communication_cache(ticket_name)
+	return search_text
 
 
 def _identity_bundle_for_tickets(ticket_rows):
@@ -993,7 +1056,6 @@ def _split_search_field(raw):
 
 def _ticket_search_documents(ticket_rows):
 	ticket_rows = [frappe._dict(row) for row in ticket_rows]
-	communication_map = _communication_text_map([row.name for row in ticket_rows])
 
 	# Legacy HTML blob fields still contribute to full-text content_text ranking
 	# (Tier 6), but student/guardian identity now comes from the pre-computed
@@ -1019,6 +1081,7 @@ def _ticket_search_documents(ticket_rows):
 		student_refs = _split_search_field(row.get("custom_search_student_refs"))
 		student_names = _split_search_field(row.get("custom_search_student_names"))
 		guardian_emails = _split_search_field(row.get("custom_search_guardian_emails"))
+		message_body_text = _normalize_search_text(row.get("custom_search_message_body"))
 
 		# Always include raised_by in guardian_emails so exact-email search (Tier 2) works
 		if raised_by and raised_by not in guardian_emails:
@@ -1026,10 +1089,9 @@ def _ticket_search_documents(ticket_rows):
 
 		legacy_parts = [_normalize_search_text(row.get(field)) for field in legacy_content_fields]
 		subject_text = _normalize_search_text(row.get("subject"))
-		description_text = _normalize_search_text(row.get("description"))
 		content_text = " ".join(
 			part
-			for part in [subject_text, description_text, *legacy_parts, communication_map.get(row.name, "")]
+			for part in [subject_text, message_body_text, *legacy_parts]
 			if part
 		)
 		documents[row.name] = {
@@ -1221,11 +1283,12 @@ def _search_candidate_ticket_names(base_filters, search):
 	# Core ticket fields + indexed plain-text search fields (fast — B-tree indexed).
 	# Prefer the indexed custom_search_* fields over the HTML Long Text blobs so the DB
 	# can use its index for prefix scans and avoid full-table scans on large text columns.
-	search_fields = ["name", "subject", "raised_by", "description"]
+	search_fields = ["name", "subject", "raised_by"]
 	for field in [
 		"custom_search_student_names",   # indexed Small Text — student display names
 		"custom_search_student_refs",    # indexed Small Text — student reference numbers
 		"custom_search_guardian_emails", # indexed Small Text — guardian emails
+		"custom_search_message_body",    # indexed Small Text — normalized message body keywords
 	]:
 		if _has_field(TICKET_DOCTYPE, field):
 			search_fields.append(field)
@@ -1240,47 +1303,9 @@ def _search_candidate_ticket_names(base_filters, search):
 			filters=base_filters,
 			or_filters=or_filters,
 			order_by="modified desc",
-			page_length=500,
+			page_length=MAX_SEARCH_CANDIDATES,
 		),
 	)
-
-	# Search inside email body (Communication) and ticket comments.
-	# These cannot be indexed the same way, so we search them separately and
-	# merge the results into the candidate set.
-	communication_names = {
-		cstr(row.reference_name or "").strip()
-		for row in frappe.get_all(
-			"Communication",
-			fields=["reference_name"],
-			filters={"reference_doctype": TICKET_DOCTYPE, "content": ["like", _like_pattern(query)]},
-			page_length=300,
-			order_by="creation desc",
-		)
-		if cstr(row.reference_name or "").strip()
-	}
-	comment_names = {
-		cstr(row.reference_ticket or "").strip()
-		for row in frappe.get_all(
-			"HD Ticket Comment",
-			fields=["reference_ticket"],
-			filters={"content": ["like", _like_pattern(query)]},
-			page_length=300,
-			order_by="creation desc",
-		)
-		if cstr(row.reference_ticket or "").strip()
-	}
-	external_names = list(communication_names | comment_names)
-	if external_names:
-		_append_ticket_names(
-			candidate_names,
-			frappe.get_list(
-				TICKET_DOCTYPE,
-				fields=["name"],
-				filters=_merge_filters(base_filters, [[TICKET_DOCTYPE, "name", "in", external_names]]),
-				order_by="modified desc",
-				page_length=500,
-			),
-		)
 
 	return candidate_names
 
@@ -1458,7 +1483,7 @@ def get_tickets(view="all", filters=None, search=None, page_length=20, start=0):
 				fields=fields,
 				filters=_merge_filters(list_filters, [[TICKET_DOCTYPE, "name", "in", list(candidate_names)]]),
 				order_by="modified desc",
-				page_length=max(len(candidate_names), 1),
+				page_length=min(max(len(candidate_names), 1), MAX_SEARCH_CANDIDATES),
 			)
 			if candidate_names
 			else []

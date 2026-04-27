@@ -42,17 +42,20 @@
       <div class="search-wrapper">
         <span class="search-icon">🔍</span>
         <input
-          v-model="search"
+          v-model="draftSearch"
           class="search"
           type="text"
-          placeholder="Ticket ID, student name, reference no., guardian email or message…"
-          @keyup.enter="immediateReload"
+          placeholder="Ticket ID, student name, reference no., guardian email or message keyword…"
+          @keyup.enter="submitSearch"
         />
-        <span v-if="loading && search" class="search-loading" title="Searching…"
+        <span
+          v-if="loading && appliedSearch"
+          class="search-loading"
+          title="Searching…"
           >⏳</span
         >
         <button
-          v-if="search"
+          v-if="draftSearch"
           class="search-clear"
           type="button"
           title="Clear search"
@@ -61,6 +64,13 @@
           ✕
         </button>
       </div>
+      <button
+        class="btn secondary toolbar-search"
+        type="button"
+        @click="submitSearch"
+      >
+        Search
+      </button>
       <button
         class="btn secondary toolbar-refresh"
         type="button"
@@ -100,9 +110,9 @@
       </div>
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
-      <p v-else-if="!tickets.length && search" class="empty">
-        No tickets found for <strong>"{{ search }}"</strong> — try a shorter or
-        different term.
+      <p v-else-if="!tickets.length && appliedSearch" class="empty">
+        No tickets found for <strong>"{{ appliedSearch }}"</strong> — try a
+        shorter or different term.
       </p>
       <p v-else-if="!tickets.length" class="empty">{{ emptyMessage }}</p>
       <div v-else class="scroll-x">
@@ -282,7 +292,8 @@ const emit = defineEmits(["title"]);
 const route = useRoute();
 const router = useRouter();
 
-const search = ref("");
+const draftSearch = ref("");
+const appliedSearch = ref("");
 const loading = ref(false);
 const loadingMore = ref(false);
 const error = ref("");
@@ -307,7 +318,6 @@ const filters = reactive({
 });
 let activeController = null;
 let activeRequestId = 0;
-let searchDebounceTimer = null;
 
 const title = computed(() =>
   props.view === "my" ? "My Tickets" : "All Tickets"
@@ -328,28 +338,14 @@ watch(
   { immediate: true }
 );
 
-// Debounced auto-search: fires 400 ms after the user stops typing.
-// Requires at least 2 characters or an empty string (to clear search).
-watch(search, (val) => {
-  const trimmed = val.trim();
-  if (trimmed.length === 1) return; // don't search on a single character
-  clearTimeout(searchDebounceTimer);
-  searchDebounceTimer = setTimeout(() => {
-    // Sync URL without pushing a new history entry
-    router.replace({
-      query: { ...route.query, search: trimmed || undefined },
-    });
-    reload();
-  }, 400);
-});
-
 onMounted(async () => {
   applyRouteState();
   await loadLookups();
 });
 
 function applyRouteState() {
-  search.value = String(route.query.search || "");
+  draftSearch.value = String(route.query.search || "");
+  appliedSearch.value = String(route.query.search || "");
   filters.status = String(route.query.status || "");
   filters.priority = String(route.query.priority || "");
   filters.ticket_type = String(route.query.ticket_type || "");
@@ -403,32 +399,29 @@ function routeQueryFromState() {
     ticket_type: filters.ticket_type || undefined,
     assigned_to: filters.assigned_to || undefined,
     created_from: filters.created_from || undefined,
-    search: search.value.trim() || undefined,
+    search: appliedSearch.value.trim() || undefined,
   };
 }
 
 async function applyFiltersAndReload() {
-  clearTimeout(searchDebounceTimer);
   await router.replace({ query: routeQueryFromState() });
   await reload();
 }
 
-// Bypass debounce for Enter key and explicit user actions
-function immediateReload() {
-  clearTimeout(searchDebounceTimer);
+function submitSearch() {
+  appliedSearch.value = draftSearch.value.trim();
   router.replace({ query: routeQueryFromState() });
   reload();
 }
 
 function clearSearch() {
-  clearTimeout(searchDebounceTimer);
-  search.value = "";
+  draftSearch.value = "";
+  appliedSearch.value = "";
   router.replace({ query: routeQueryFromState() });
   reload();
 }
 
 function refreshList() {
-  clearTimeout(searchDebounceTimer);
   reload();
 }
 
@@ -457,13 +450,13 @@ async function load({ append = false } = {}) {
       {
         view: props.view,
         filters: cleanFilters(),
-        search: search.value,
+        search: appliedSearch.value,
         page_length: result.page_length,
         start: append ? tickets.value.length : 0,
       },
       {
         signal: activeController.signal,
-        timeoutMs: search.value.trim() ? 60000 : 30000,
+        timeoutMs: appliedSearch.value.trim() ? 20000 : 30000,
       }
     );
     if (requestId !== activeRequestId) return;
@@ -483,7 +476,7 @@ async function load({ append = false } = {}) {
     }
     if (err.code === "REQUEST_TIMEOUT") {
       resetResults();
-      emptyMessage.value = search.value.trim()
+      emptyMessage.value = appliedSearch.value.trim()
         ? `Search timed out. Try a more specific query — e.g. a ticket ID or exact name.`
         : "Loading timed out. Please refresh and try again.";
       return;
