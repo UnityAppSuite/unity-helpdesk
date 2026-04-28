@@ -13,13 +13,26 @@ after_migrate = "helpdesk.search.build_index_in_background"
 
 scheduler_events = {
 	"all": ["helpdesk.search.build_index_if_not_exists"],
+	"daily": ["helpdesk.api.unity_helpdesk.send_open_ticket_reminders"],
 }
 
 
 website_route_rules = [
 	{
+		"from_route": "/helpdesk",
+		"to_route": "helpdesk",
+	},
+	{
 		"from_route": "/helpdesk/<path:app_path>",
 		"to_route": "helpdesk",
+	},
+	{
+		"from_route": "/unity-helpdesk",
+		"to_route": "unity_helpdesk",
+	},
+	{
+		"from_route": "/unity-helpdesk/<path:app_path>",
+		"to_route": "unity_helpdesk",
 	},
 ]
 

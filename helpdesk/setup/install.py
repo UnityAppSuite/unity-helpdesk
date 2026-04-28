@@ -9,12 +9,19 @@ from .ticket_feedback import create_ticket_feedback_options
 from .ticket_type import create_fallback_ticket_type, create_ootb_ticket_types
 from .welcome_ticket import create_welcome_ticket
 
+UNITY_HELPDESK_ROLES = [
+	"Helpdesk User",
+	"Helpdesk Admin",
+	"Helpdesk Super Admin",
+]
+
 
 def before_install():
 	add_support_redirect_to_tickets()
 
 
 def after_install():
+	ensure_unity_roles()
 	add_default_categories_and_articles()
 	add_default_ticket_priorities()
 	add_default_sla()
@@ -232,6 +239,24 @@ def update_agent_role_permissions():
 		add_permission("File", "Agent", 0)
 		add_permission("Contact", "Agent", 0)
 		add_permission("Email Account", "Agent", 0)
+
+
+def ensure_unity_roles():
+	for role_name in UNITY_HELPDESK_ROLES:
+		if frappe.db.exists("Role", role_name):
+			continue
+		role_doc = frappe.new_doc("Role")
+		role_doc.role_name = role_name
+		role_doc.desk_access = 1
+		role_doc.search_bar = True
+		role_doc.notifications = True
+		role_doc.list_sidebar = True
+		role_doc.bulk_actions = True
+		role_doc.view_switcher = True
+		role_doc.form_sidebar = True
+		role_doc.timeline = True
+		role_doc.dashboard = True
+		role_doc.insert(ignore_permissions=True)
 
 
 def add_default_assignment_rule():

@@ -1,0 +1,1372 @@
+<template>
+  <section class="page">
+    <div class="toolbar">
+      <button class="btn secondary" @click="goBackToList">
+        Back to Tickets
+      </button>
+      <strong v-if="ticket.name">#{{ ticket.name }}</strong>
+      <span
+        v-if="ticket.status_indicator"
+        class="badge"
+        :class="ticket.status_indicator.color"
+      >
+        {{ ticket.status_indicator.label }}
+      </span>
+      <button class="btn" :disabled="saving" @click="markClosed">
+        Mark Closed
+      </button>
+    </div>
+
+    <p v-if="error" class="error">{{ error }}</p>
+    <p v-else-if="notice" class="warning-banner">{{ notice }}</p>
+    <div v-else-if="loading" class="detail-skeleton" aria-hidden="true">
+      <div class="skeleton-block skeleton-hero"></div>
+      <div class="detail-skeleton-grid">
+        <div class="skeleton-stack">
+          <div class="skeleton-block skeleton-card"></div>
+          <div class="skeleton-block skeleton-card skeleton-card-lg"></div>
+          <div class="skeleton-block skeleton-card"></div>
+        </div>
+        <div class="skeleton-stack">
+          <div class="skeleton-block skeleton-side"></div>
+          <div class="skeleton-block skeleton-side"></div>
+          <div class="skeleton-block skeleton-side skeleton-side-lg"></div>
+        </div>
+      </div>
+    </div>
+
+    <div v-else class="detail-grid">
+      <div class="detail-main">
+        <div class="email-hero">
+          <h2>{{ ticket.subject || "No subject" }}</h2>
+          <p>
+            {{ ticket.raised_by || "Unknown sender" }} ·
+            {{ formatDateTime(ticket.creation) }}
+          </p>
+          <span class="priority" :class="priorityClass(ticket.priority)">
+            {{ ticket.priority || "No priority" }}
+          </span>
+        </div>
+
+        <section
+          v-if="
+            shouldRenderStructuredStudentContext || showLegacyStudentSection
+          "
+          class="detail-section"
+        >
+          <h3>Student Details</h3>
+          <div
+            v-if="shouldRenderStructuredStudentContext"
+            class="detail-body stack"
+          >
+            <div
+              class="student-context-banner"
+              :class="studentContextBannerClass(studentContext)"
+            >
+              <strong>{{ studentContextBanner(studentContext) }}</strong>
+              <span v-if="studentContext.current_academic_year">
+                Academic Year: {{ studentContext.current_academic_year }}
+              </span>
+              <p v-if="studentContext.message">{{ studentContext.message }}</p>
+            </div>
+
+            <div v-if="structuredStudents.length" class="scroll-x">
+              <table class="compact-info-table student-context-table">
+                <thead>
+                  <tr>
+                    <th>Detail</th>
+                    <th
+                      v-for="student in structuredStudentColumns"
+                      :key="student.key"
+                    >
+                      <div class="student-context-table__heading">
+                        <strong>{{ student.name }}</strong>
+                        <small>{{ student.id }}</small>
+                        <span class="student-context-pill">
+                          {{ student.role }}
+                        </span>
+                      </div>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in structuredStudentRows" :key="row.field">
+                    <th class="row-heading">{{ row.field }}</th>
+                    <td
+                      v-for="value in row.values"
+                      :key="`${row.field}-${value.key}`"
+                      v-html="value.html || '-'"
+                    ></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div v-else-if="studentRows.length" class="detail-body compact-body">
+            <div class="scroll-x">
+              <table class="compact-info-table">
+                <thead>
+                  <tr>
+                    <th>Detail</th>
+                    <th
+                      v-for="(student, index) in studentColumns"
+                      :key="student.key"
+                    >
+                      {{ student.label || `Student ${index + 1}` }}
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="row in studentTransposedRows" :key="row.field">
+                    <th class="row-heading">{{ row.field }}</th>
+                    <td
+                      v-for="value in row.values"
+                      :key="`${row.field}-${value.key}`"
+                      v-html="value.html || '-'"
+                    ></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div
+            v-else
+            class="detail-body safe-html compact-html"
+            v-html="ticket.custom_list_of_student"
+          ></div>
+        </section>
+
+        <section v-if="showLegacyFeeSection" class="detail-section">
+          <h3>Fees Details</h3>
+          <div v-if="feeRows.length" class="detail-body compact-body">
+            <div class="scroll-x">
+              <table class="compact-info-table">
+                <thead>
+                  <tr>
+                    <th v-for="field in feeFields" :key="field">{{ field }}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(fee, index) in feeRows" :key="fee.__ref || index">
+                    <td
+                      v-for="field in feeFields"
+                      :key="field"
+                      v-html="fee[field] || '-'"
+                    ></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <template v-else>
+            <div
+              v-if="ticket.custom_all_fees_details_of_students"
+              class="detail-body safe-html compact-html"
+              v-html="ticket.custom_all_fees_details_of_students"
+            ></div>
+            <div
+              v-if="ticket.custom_payment_schedule"
+              class="detail-body safe-html compact-html"
+              v-html="ticket.custom_payment_schedule"
+            ></div>
+          </template>
+        </section>
+
+        <section v-if="hasAdditionalDetails" class="detail-section">
+          <button
+            class="section-toggle"
+            type="button"
+            @click="additionalOpen = !additionalOpen"
+          >
+            <span>Previous Ticket Details</span>
+            <small>
+              {{ visiblePreviousTickets.length }} of
+              {{ previousTicketRows.length }} previous tickets
+            </small>
+            <strong>{{ additionalOpen ? "Hide" : "Show" }}</strong>
+          </button>
+          <div class="detail-body stack">
+            <div class="thread-filters thread-filters-compact">
+              <label>
+                Created From
+                <input v-model="additionalFilters.from" type="date" />
+              </label>
+              <label>
+                Created To
+                <input v-model="additionalFilters.to" type="date" />
+              </label>
+              <button
+                class="btn secondary"
+                type="button"
+                @click="clearAdditionalFilters"
+              >
+                Clear
+              </button>
+            </div>
+            <div class="stack">
+              <div
+                v-if="ticket.custom_student_remark && additionalOpen"
+                class="safe-html compact-html"
+                v-html="ticket.custom_student_remark"
+              ></div>
+              <div v-if="previousTicketRows.length" class="scroll-x">
+                <table class="compact-info-table previous-ticket-table">
+                  <thead>
+                    <tr>
+                      <th>Ticket No</th>
+                      <th>Subject</th>
+                      <th>Created On</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in visiblePreviousTickets" :key="row.name">
+                      <td>
+                        <button
+                          class="link-btn"
+                          type="button"
+                          @click="openDeskTicket(row.name)"
+                        >
+                          {{ row.name }}
+                        </button>
+                      </td>
+                      <td>{{ row.subject || "-" }}</td>
+                      <td>{{ formatDate(row.creation) }}</td>
+                      <td>{{ row.status || "-" }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <p
+                  v-if="!visiblePreviousTickets.length"
+                  class="muted inline-empty"
+                >
+                  No previous tickets found in this date range.
+                </p>
+              </div>
+              <div
+                v-else-if="previousTicketsHtml"
+                class="safe-html compact-html"
+                v-html="previousTicketsHtml"
+              ></div>
+              <div
+                v-if="ticket.custom_previous_ticket_details && additionalOpen"
+                class="safe-html compact-html"
+                v-html="ticket.custom_previous_ticket_details"
+              ></div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="timeline.length" class="detail-section">
+          <h3>Email Thread</h3>
+          <div class="chat-thread">
+            <div
+              v-for="item in timeline"
+              :key="item.name"
+              class="chat-msg"
+              :class="{
+                'chat-msg--agent':
+                  item._type === 'comm' && item.sent_or_received === 'Sent',
+                'chat-msg--customer':
+                  item._type === 'comm' && item.sent_or_received === 'Received',
+                'chat-msg--comment': item._type === 'comment',
+              }"
+            >
+              <div class="chat-msg-meta">
+                <span class="chat-msg-label">
+                  <template v-if="item._type === 'comment'">Note</template>
+                  <template v-else-if="item.sent_or_received === 'Sent'"
+                    >Agent</template
+                  >
+                  <template v-else>Customer</template>
+                </span>
+                <span class="chat-msg-time">{{
+                  formatDateTime(item.creation)
+                }}</span>
+              </div>
+              <div
+                class="chat-msg-body safe-html"
+                v-html="threadContent(item)"
+              ></div>
+              <div
+                v-if="item.attachments?.length"
+                class="attachment-list attachment-list-thread"
+              >
+                <a
+                  v-for="attachment in item.attachments"
+                  :key="attachment.name"
+                  class="attachment-chip"
+                  :href="attachment.file_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ attachment.file_name || attachment.name }}
+                </a>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="detail-section">
+          <div class="compose-tabs">
+            <button
+              class="compose-tab"
+              :class="{ active: composeMode === 'reply' }"
+              type="button"
+              @click="
+                composeMode = 'reply';
+                actionError = '';
+              "
+            >
+              Reply
+            </button>
+            <button
+              class="compose-tab compose-tab-comment"
+              :class="{ active: composeMode === 'comment' }"
+              type="button"
+              @click="
+                composeMode = 'comment';
+                actionError = '';
+              "
+            >
+              Internal Note
+            </button>
+          </div>
+          <div class="detail-body stack">
+            <p v-if="actionError" class="error">{{ actionError }}</p>
+            <div class="editor-toolbar editor-toolbar-tinymce">
+              <button
+                type="button"
+                class="btn secondary"
+                :disabled="uploadingAttachment"
+                @click="triggerAttachmentPicker"
+              >
+                {{ uploadingAttachment ? "Uploading..." : "Attach Files" }}
+              </button>
+              <input
+                ref="attachmentInput"
+                type="file"
+                class="hidden-file-input"
+                multiple
+                @change="handleAttachmentPick"
+              />
+            </div>
+            <TinyMceEditor
+              ref="editorRef"
+              v-model="composerHtml"
+              :min-height="260"
+              :placeholder="
+                composeMode === 'reply'
+                  ? 'Type your reply to the customer...'
+                  : 'Add an internal note (not sent to customer)...'
+              "
+            />
+            <div v-if="composerAttachments.length" class="attachment-list">
+              <div
+                v-for="attachment in composerAttachments"
+                :key="attachment.name"
+                class="attachment-item"
+              >
+                <a
+                  :href="attachment.file_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ attachment.file_name || attachment.name }}
+                </a>
+                <button
+                  type="button"
+                  class="link-btn danger-link"
+                  @click="removeComposerAttachment(attachment.name)"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+            <button
+              v-if="composeMode === 'reply'"
+              class="btn"
+              :disabled="saving || composerIsEmpty"
+              @click="sendReply"
+            >
+              {{ saving ? "Sending..." : "Send Reply" }}
+            </button>
+            <button
+              v-else
+              class="btn"
+              style="background: #f59e0b; border-color: #f59e0b"
+              :disabled="saving || composerIsEmpty"
+              @click="sendComment"
+            >
+              {{ saving ? "Saving..." : "Add Note" }}
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <aside class="detail-side">
+        <section class="detail-section">
+          <h3>Update Ticket</h3>
+          <div class="detail-body stack">
+            <label>
+              Assigned To
+              <select v-model="form.assignee">
+                <option value="">Unassigned</option>
+                <option
+                  v-for="user in agentUsers"
+                  :key="user.name"
+                  :value="user.name"
+                >
+                  {{ user.full_name || user.name }}
+                </option>
+              </select>
+            </label>
+            <label>
+              Status
+              <select v-model="form.status">
+                <option>On Hold</option>
+                <option>Open</option>
+                <option>Replied</option>
+                <option>Resolved</option>
+                <option>Closed</option>
+              </select>
+            </label>
+            <label>
+              Ticket Type
+              <select v-model="form.ticket_type">
+                <option value="">Not set</option>
+                <option
+                  v-for="ticketType in ticketTypes"
+                  :key="ticketType.name"
+                  :value="ticketType.name"
+                >
+                  {{ ticketType.name }}
+                </option>
+              </select>
+            </label>
+            <label>
+              Priority
+              <select v-model="form.priority">
+                <option value="">Not set</option>
+                <option>High</option>
+                <option>Medium</option>
+                <option>Low</option>
+              </select>
+            </label>
+            <label>
+              <input v-model="form.is_on_hold" type="checkbox" />
+              Put On Hold
+            </label>
+            <label>
+              Hold From
+              <input
+                v-model="form.hold_from"
+                type="date"
+                :disabled="!form.is_on_hold"
+              />
+            </label>
+            <label>
+              Hold To
+              <input
+                v-model="form.hold_to"
+                type="date"
+                :disabled="!form.is_on_hold"
+              />
+            </label>
+            <label>
+              Reason Of Hold
+              <textarea
+                v-model="form.hold_reason"
+                rows="3"
+                :disabled="!form.is_on_hold"
+              ></textarea>
+            </label>
+            <p v-if="actionError" class="error" style="font-size: 12px">
+              {{ actionError }}
+            </p>
+            <button class="btn" :disabled="saving" @click="saveTicket">
+              {{ saving ? "Saving..." : "Update Ticket" }}
+            </button>
+          </div>
+        </section>
+
+        <section class="detail-section">
+          <h3>Assignment History</h3>
+          <div class="detail-body history">
+            <p v-if="!assignmentHistory.length" class="muted">
+              No assignment history yet.
+            </p>
+            <div
+              v-for="item in assignmentHistory"
+              :key="item.name"
+              class="history-item history-item-assignment"
+            >
+              <strong>
+                {{
+                  item.assigned_by_full_name ||
+                  item.assigned_by ||
+                  "Unknown user"
+                }}
+                assigned this ticket to
+                {{
+                  item.allocated_to_full_name ||
+                  item.allocated_to ||
+                  "Unknown agent"
+                }}
+              </strong>
+              <br />
+              <small class="muted">
+                {{ formatDateTime(item.assigned_at || item.creation) }}
+              </small>
+            </div>
+          </div>
+        </section>
+
+        <section class="detail-section">
+          <h3>Issue History</h3>
+          <div class="detail-body history">
+            <p v-if="!history.length" class="muted">No history yet.</p>
+            <div v-for="item in history" :key="item.name" class="history-item">
+              <strong>{{ item.action }}</strong>
+              <br />
+              <small class="muted">
+                {{ item.owner }} · {{ formatDateTime(item.creation) }}
+              </small>
+            </div>
+          </div>
+        </section>
+      </aside>
+    </div>
+  </section>
+</template>
+
+<script setup>
+import { computed, inject, reactive, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
+import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
+import {
+  call,
+  formatDate,
+  formatDateTime,
+  getAgents,
+  getTicketTypes,
+  openDeskPath,
+  uploadAttachment,
+} from "../api";
+
+const TICKET_NOTICE_KEY = "unity_helpdesk_ticket_notice";
+const props = defineProps({ ticketId: { type: String, required: true } });
+const emit = defineEmits(["title"]);
+const route = useRoute();
+const router = useRouter();
+
+const ticket = ref({});
+const agents = ref([]);
+const ticketTypes = ref([]);
+const communications = ref([]);
+const comments = ref([]);
+const loading = ref(false);
+const saving = ref(false);
+const error = ref(""); // page-load errors only
+const notice = ref("");
+const actionError = ref(""); // reply / comment / save errors
+const composeMode = ref("reply"); // 'reply' | 'comment'
+const composerHtml = ref("");
+const composerAttachments = ref([]);
+const editorRef = ref(null);
+const attachmentInput = ref(null);
+const uploadingAttachment = ref(false);
+const additionalOpen = ref(false);
+const previousTicketRows = ref([]);
+let activeTicketRequestId = 0;
+const parsedDescription = ref({
+  students: [],
+  fees: [],
+  previousTicketsHtml: "",
+  remainingHtml: "",
+});
+const additionalFilters = reactive({
+  from: "",
+  to: "",
+});
+const form = reactive({
+  assignee: "",
+  status: "Open",
+  priority: "",
+  ticket_type: "",
+  is_on_hold: false,
+  hold_from: "",
+  hold_to: "",
+  hold_reason: "",
+});
+
+const history = computed(() => ticket.value.history || []);
+const assignmentHistory = computed(() => ticket.value.assignment_history || []);
+const timeline = computed(() => {
+  const comms = communications.value.map((c) => ({
+    ...c,
+    _type: "comm",
+  }));
+  const notes = comments.value.map((c) => ({
+    ...c,
+    _type: "comment",
+    sender: c.commented_by,
+  }));
+  return [...comms, ...notes].sort(
+    (a, b) => new Date(a.creation) - new Date(b.creation)
+  );
+});
+const filteredPreviousTickets = computed(() =>
+  previousTicketRows.value.filter((item) =>
+    isInsideAdditionalRange(item.creation)
+  )
+);
+const visiblePreviousTickets = computed(() =>
+  additionalOpen.value
+    ? filteredPreviousTickets.value
+    : filteredPreviousTickets.value.slice(0, 5)
+);
+const agentUsers = computed(() => agents.value);
+const studentContext = computed(() => ticket.value.student_context || {});
+const structuredStudents = computed(() => studentContext.value.students || []);
+const hasStructuredStudentContext = computed(
+  () =>
+    !!studentContext.value.match_type ||
+    !!studentContext.value.message ||
+    structuredStudents.value.length > 0
+);
+const shouldRenderStructuredStudentContext = computed(
+  () =>
+    structuredStudents.value.length > 0 ||
+    (!ticket.value.custom_list_of_student && hasStructuredStudentContext.value)
+);
+const showLegacyStudentSection = computed(
+  () =>
+    !shouldRenderStructuredStudentContext.value &&
+    !!(studentRows.value.length || ticket.value.custom_list_of_student)
+);
+const showLegacyFeeSection = computed(
+  () =>
+    !shouldRenderStructuredStudentContext.value &&
+    !!(
+      feeRows.value.length ||
+      ticket.value.custom_all_fees_details_of_students ||
+      ticket.value.custom_payment_schedule
+    )
+);
+const structuredStudentColumns = computed(() =>
+  structuredStudents.value.map((student, index) => ({
+    key: student.student_id || `student-${index}`,
+    id: student.student_id || `Student ${index + 1}`,
+    name: student.student_name || student.student_id || `Student ${index + 1}`,
+    role: studentRoleLabel(student),
+  }))
+);
+const structuredStudentRows = computed(() => {
+  const rows = [
+    ["Class", (student) => displayClassCell(student)],
+    ["PE Document Status", (student) => displayPEDocumentStatus(student)],
+    ["Status", (student) => displayValue(student.student_status)],
+    ["Primary Contact", (student) => displayValue(student.primary_contact)],
+    [
+      "Student Mobile",
+      (student) => displayValue(student.student_mobile_number),
+    ],
+    ["WhatsApp Number", (student) => displayValue(student.whatsapp_number)],
+    ["Guardian Emails", (student) => displayList(student.guardian_emails)],
+    ["Payment Plan", (student) => displayPaymentPlan(student)],
+    ["Fees", (student) => displayFeesDocument(student)],
+    ["Total Fees", (student) => formatMoney(student.fees?.grand_total)],
+    ["Fees Paid", (student) => formatMoney(student.fees?.paid_amount)],
+    ["Outstanding", (student) => formatMoney(student.fees?.outstanding_amount)],
+    ["Due Date", (student) => formatDate(student.fees?.due_date)],
+    ["Fee Link", (student) => displayFeeLink(student)],
+    [
+      "Next Payment Plan",
+      (student) => nextPaymentSummary(student.fees?.next_payment),
+    ],
+  ];
+
+  return rows.map(([field, formatter]) => ({
+    field,
+    values: structuredStudents.value.map((student, index) => ({
+      key: student.student_id || `student-${index}`,
+      html: formatter(student),
+    })),
+  }));
+});
+const studentRows = computed(() => parsedDescription.value.students);
+const feeRows = computed(() => parsedDescription.value.fees);
+const previousTicketsHtml = computed(
+  () => parsedDescription.value.previousTicketsHtml
+);
+const studentFields = computed(() =>
+  orderedFields(studentRows.value, [
+    "ID",
+    "Name",
+    "School",
+    "Class",
+    "Division",
+    "Status",
+    "Contact",
+    "Bus",
+  ])
+);
+const studentColumns = computed(() =>
+  studentRows.value.map((student, index) => ({
+    key: student.__ref || student.ID || `student-${index}`,
+    label: student.__ref || student.ID || `Student ${index + 1}`,
+  }))
+);
+const studentTransposedRows = computed(() =>
+  studentFields.value.map((field) => ({
+    field,
+    values: studentRows.value.map((student, index) => ({
+      key: student.__ref || student.ID || `student-${index}`,
+      html: student[field] || "-",
+    })),
+  }))
+);
+const feeFields = computed(() =>
+  orderedFields(feeRows.value, [
+    "Student",
+    "Payment Plan",
+    "Total Fee",
+    "Fees Paid",
+    "Fee Link",
+  ])
+);
+const hasAdditionalDetails = computed(
+  () =>
+    previousTicketsHtml.value ||
+    previousTicketRows.value.length ||
+    ticket.value.custom_student_remark ||
+    ticket.value.custom_previous_ticket_details
+);
+const composerIsEmpty = computed(() => !hasMeaningfulHtml(composerHtml.value));
+
+watch(
+  () => props.ticketId,
+  async () => {
+    emit("title", "Ticket Detail", `#${props.ticketId}`);
+    comments.value = [];
+    previousTicketRows.value = [];
+    await Promise.all([loadTicket(), loadLookups()]);
+  },
+  { immediate: true }
+);
+
+function priorityClass(priority = "") {
+  return priority.toLowerCase();
+}
+
+function studentContextBanner(context) {
+  if (context?.match_type === "student") return "Matched via Student";
+  if (context?.match_type === "guardian") return "Matched via Guardian";
+  return "This email is not in our records";
+}
+
+function studentContextBannerClass(context) {
+  if (context?.match_type === "student")
+    return "student-context-banner--success";
+  if (context?.match_type === "guardian") return "student-context-banner--info";
+  return "student-context-banner--warning";
+}
+
+function studentRoleLabel(student) {
+  if (student?.is_primary_match) return "Primary Student";
+  if (student?.is_sibling) return "Sibling";
+  return "Student";
+}
+
+function displayClassCell(student) {
+  const className = displayValue(student.class_program);
+  if (className === "-") return displayValue(student.division);
+  const division = cleanText(String(student?.division || ""));
+  return division ? `${division} - ${className}` : className;
+}
+
+function displayPEDocumentStatus(student) {
+  const enrollment = student?.enrollment;
+  if (!enrollment) return "-";
+  return displayValue(enrollment.docstatus_label);
+}
+
+function displayValue(value) {
+  const text = cleanText(String(value ?? ""));
+  return text || "-";
+}
+
+function displayList(values = []) {
+  const items = (values || [])
+    .map((value) => cleanText(String(value || "")))
+    .filter(Boolean);
+  return items.length ? items.join(", ") : "-";
+}
+
+function compactPaymentPlan(value) {
+  const text = cleanText(String(value ?? ""));
+  if (!text) return "-";
+  if (text.length <= 56) return text;
+  return `${text.slice(0, 56)}...`;
+}
+
+function displayPaymentPlan(student) {
+  return compactPaymentPlan(
+    student?.fees?.payment_plan || student?.enrollment?.payment_plan || ""
+  );
+}
+
+function displayFeesDocument(student) {
+  const feeName = cleanText(String(student?.fees?.name || ""));
+  if (!feeName) return "-";
+  const link = cleanText(String(student?.fees?.link || ""));
+  if (!link) return feeName;
+  return `<a href="${link}" target="_top" rel="noopener noreferrer">${feeName}</a>`;
+}
+
+function displayFeeLink(student) {
+  const link = cleanText(String(student?.fees?.link || ""));
+  if (!link) return "-";
+  return `<a href="${link}" target="_top" rel="noopener noreferrer">Open Fees</a>`;
+}
+
+function nextPaymentSummary(nextPayment) {
+  if (!nextPayment) return "-";
+  const parts = [
+    displayValue(nextPayment.payment_term),
+    formatDate(nextPayment.due_date),
+    formatMoney(nextPayment.payment_amount),
+    `Outstanding ${formatMoney(nextPayment.outstanding)}`,
+  ];
+  if (nextPayment.payment_status) {
+    parts.push(displayValue(nextPayment.payment_status));
+  }
+  return parts.join(" · ");
+}
+
+function goBackToList() {
+  const listView = route.query.list_view === "all" ? "all" : "my";
+  router.push({
+    path: `/tickets/${listView}`,
+    query: { ...route.query, list_view: undefined },
+  });
+}
+
+function formatMoney(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "-";
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 2,
+  }).format(number);
+}
+
+function clearAdditionalFilters() {
+  additionalFilters.from = "";
+  additionalFilters.to = "";
+}
+
+function isInsideAdditionalRange(value) {
+  return isInsideDateRange(value, additionalFilters);
+}
+
+function isInsideDateRange(value, filters) {
+  if (!value) return true;
+  const created = new Date(value);
+  if (filters.from) {
+    const from = new Date(`${filters.from}T00:00:00`);
+    if (created < from) return false;
+  }
+  if (filters.to) {
+    const to = new Date(`${filters.to}T23:59:59`);
+    if (created > to) return false;
+  }
+  return true;
+}
+
+function orderedFields(rows, preferred) {
+  const fields = new Set();
+  rows.forEach((row) =>
+    Object.keys(row).forEach((key) => !key.startsWith("__") && fields.add(key))
+  );
+  return [
+    ...preferred.filter((field) => fields.has(field)),
+    ...[...fields].filter((field) => !preferred.includes(field)),
+  ];
+}
+
+function parseTicketDescription(html) {
+  const result = {
+    students: [],
+    fees: [],
+    previousTicketsHtml: "",
+    remainingHtml: html || "",
+  };
+  if (
+    !html ||
+    typeof window === "undefined" ||
+    typeof DOMParser === "undefined"
+  ) {
+    return result;
+  }
+
+  const container = document.createElement("div");
+  container.innerHTML = html;
+  const nodes = Array.from(container.childNodes);
+  const consumed = new Set();
+
+  nodes.forEach((node, index) => {
+    const label = cleanText(node.textContent || "").toUpperCase();
+    if (label.includes("STUDENT DETAILS")) {
+      const tableIndex = findNextTableIndex(nodes, index + 1);
+      if (tableIndex >= 0) {
+        const ref = extractRef(nodes, index, tableIndex);
+        result.students.push({
+          ...parseKeyValueTable(nodes[tableIndex]),
+          ...(ref ? { __ref: ref } : {}),
+        });
+        markConsumed(consumed, index, tableIndex);
+      }
+    } else if (label.includes("FEE DETAILS")) {
+      const tableIndex = findNextTableIndex(nodes, index + 1);
+      if (tableIndex >= 0) {
+        const ref = extractRef(nodes, index, tableIndex);
+        result.fees.push({
+          ...(ref ? { Student: ref, __ref: ref } : {}),
+          ...parseKeyValueTable(nodes[tableIndex]),
+        });
+        markConsumed(consumed, index, tableIndex);
+      }
+    } else if (label.includes("PREVIOUS TICKETS")) {
+      const tableIndex = findNextTableIndex(nodes, index + 1);
+      if (tableIndex >= 0) {
+        result.previousTicketsHtml = nodes[tableIndex].outerHTML;
+        markConsumed(consumed, index, tableIndex);
+      }
+    }
+  });
+
+  result.remainingHtml = nodes
+    .filter((_, index) => !consumed.has(index))
+    .map((node) => node.outerHTML || node.textContent || "")
+    .join("")
+    .trim();
+  result.previousTicketsHtml = normalizeTicketLinksInHtml(
+    result.previousTicketsHtml
+  );
+  result.remainingHtml = normalizeTicketLinksInHtml(result.remainingHtml);
+
+  return result;
+}
+
+function triggerAttachmentPicker() {
+  attachmentInput.value?.click();
+}
+
+async function handleAttachmentPick(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  uploadingAttachment.value = true;
+  actionError.value = "";
+  try {
+    for (const file of files) {
+      const uploaded = await uploadAttachment(
+        file,
+        "HD Ticket",
+        props.ticketId
+      );
+      composerAttachments.value.push(uploaded);
+    }
+  } catch (err) {
+    actionError.value = err.message;
+  } finally {
+    uploadingAttachment.value = false;
+    if (attachmentInput.value) {
+      attachmentInput.value.value = "";
+    }
+  }
+}
+
+function removeComposerAttachment(name) {
+  composerAttachments.value = composerAttachments.value.filter(
+    (attachment) => attachment.name !== name
+  );
+}
+
+function composerPayloadHtml() {
+  return composerHtml.value;
+}
+
+function composerCommentHtml() {
+  if (!composerAttachments.value.length) {
+    return composerPayloadHtml();
+  }
+  const attachmentLinks = composerAttachments.value
+    .map(
+      (attachment) =>
+        `<li><a href="${
+          attachment.file_url
+        }" target="_blank" rel="noopener noreferrer">${
+          attachment.file_name || attachment.name
+        }</a></li>`
+    )
+    .join("");
+  return `${composerPayloadHtml()}<p><strong>Attachments</strong></p><ul>${attachmentLinks}</ul>`;
+}
+
+async function resetComposer() {
+  composerAttachments.value = [];
+  composerHtml.value = "";
+  editorRef.value?.clear?.();
+}
+
+function findNextTableIndex(nodes, start) {
+  for (let index = start; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (
+      node.nodeType === Node.ELEMENT_NODE &&
+      node.tagName?.toLowerCase() === "table"
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function extractRef(nodes, start, end) {
+  const text = nodes
+    .slice(start, end)
+    .map((node) => node.textContent || "")
+    .join(" ");
+  const match = text.match(/-\s*([A-Za-z0-9/_-]+)/);
+  return match?.[1] || "";
+}
+
+function parseKeyValueTable(table) {
+  const row = {};
+  table.querySelectorAll("tr").forEach((tr) => {
+    const cells = Array.from(tr.children);
+    if (cells.length < 2) return;
+    const key = cleanText(cells[0].textContent || "").replace(/:$/, "");
+    if (!key) return;
+    row[key] = cells[1].innerHTML.trim() || "-";
+  });
+  return row;
+}
+
+function markConsumed(consumed, start, end) {
+  for (let index = start; index <= end; index += 1) {
+    consumed.add(index);
+  }
+}
+
+function cleanText(value) {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function normalizeHtml(value) {
+  return cleanText((value || "").replace(/<[^>]*>/g, " "));
+}
+
+function hasMeaningfulHtml(value) {
+  return !!normalizeHtml(value || "");
+}
+
+function normalizeTicketLinksInHtml(value) {
+  if (!value || typeof document === "undefined") return value || "";
+  const container = document.createElement("div");
+  container.innerHTML = value;
+  Array.from(container.querySelectorAll("a")).forEach((anchor) => {
+    const href = anchor.getAttribute("href") || "";
+    const hrefMatch = href.match(/\/app\/hd-ticket\/([^/?#]+)/i);
+    const text = cleanText(anchor.textContent || "");
+    const textMatch = text.match(/^\d+$/);
+    const ticketId = hrefMatch?.[1] || textMatch?.[0];
+    if (!ticketId) return;
+    anchor.setAttribute("href", `/app/hd-ticket/${ticketId}`);
+    anchor.setAttribute("target", "_top");
+    anchor.setAttribute("rel", "noopener noreferrer");
+  });
+  return container.innerHTML;
+}
+
+function threadContent(item) {
+  if (item?._type !== "comm") {
+    return normalizeTicketLinksInHtml(item?.content || "");
+  }
+
+  const parsedContent = parseTicketDescription(item.content || "");
+  const hasStructuredBlocks =
+    parsedContent.students.length ||
+    parsedContent.fees.length ||
+    parsedContent.previousTicketsHtml;
+  const trimmedThreadHtml = (parsedContent.remainingHtml || "").trim();
+
+  if (hasStructuredBlocks && hasMeaningfulHtml(trimmedThreadHtml)) {
+    return normalizeTicketLinksInHtml(trimmedThreadHtml);
+  }
+  if (hasStructuredBlocks) {
+    return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+  }
+
+  const matchesDescription =
+    normalizeHtml(item.content) &&
+    normalizeHtml(item.content) === normalizeHtml(ticket.value.description);
+  if (
+    matchesDescription &&
+    hasMeaningfulHtml(parsedDescription.value.remainingHtml || "")
+  ) {
+    return normalizeTicketLinksInHtml(
+      (parsedDescription.value.remainingHtml || "").trim()
+    );
+  }
+
+  return normalizeTicketLinksInHtml(item.content || "");
+}
+
+function applyForm() {
+  const current = ticket.value || {};
+  form.assignee = current.assignee?.name || "";
+  form.status = current.custom_is_on_hold
+    ? "On Hold"
+    : current.status || "Open";
+  form.priority = current.priority || "";
+  form.ticket_type = current.ticket_type || "";
+  form.is_on_hold = !!Number(current.custom_is_on_hold || 0);
+  form.hold_from = current.custom_hold_from || "";
+  form.hold_to = current.custom_hold_to || "";
+  form.hold_reason = current.custom_hold_reason || "";
+}
+
+async function loadLookups() {
+  const [agentResult, typeResult] = await Promise.allSettled([
+    getAgents(),
+    getTicketTypes(),
+  ]);
+  agents.value =
+    agentResult.status === "fulfilled" ? agentResult.value || [] : [];
+  ticketTypes.value =
+    typeResult.status === "fulfilled" ? typeResult.value || [] : [];
+}
+
+async function loadTicket() {
+  const requestId = activeTicketRequestId + 1;
+  activeTicketRequestId = requestId;
+  loading.value = true;
+  error.value = "";
+  notice.value = sessionStorage.getItem(TICKET_NOTICE_KEY) || "";
+  if (notice.value) {
+    sessionStorage.removeItem(TICKET_NOTICE_KEY);
+  }
+  try {
+    const detail = await call(
+      "helpdesk.api.unity_helpdesk_ext.get_ticket_detail",
+      { name: props.ticketId },
+      { timeoutMs: 20000 }
+    );
+    if (requestId !== activeTicketRequestId) return;
+    ticket.value = detail;
+    communications.value = ticket.value.communications || [];
+    comments.value = ticket.value.comments || [];
+    parsedDescription.value = parseTicketDescription(
+      ticket.value.description || ""
+    );
+    applyForm();
+    queueMicrotask(() => {
+      if (requestId === activeTicketRequestId) {
+        loadPreviousTicketDetails();
+      }
+    });
+  } catch (err) {
+    if (requestId === activeTicketRequestId) {
+      error.value = err.message;
+    }
+  } finally {
+    if (requestId === activeTicketRequestId) {
+      loading.value = false;
+    }
+  }
+}
+
+async function loadPreviousTicketDetails() {
+  const fallbackRows = parsePreviousTicketRows(
+    parsedDescription.value.previousTicketsHtml
+  );
+  const names = fallbackRows.map((row) => row.name).filter(Boolean);
+  previousTicketRows.value = fallbackRows;
+  if (!names.length) return;
+
+  try {
+    const rows = await call(
+      "helpdesk.api.unity_helpdesk.get_accessible_ticket_summaries",
+      {
+        names,
+      }
+    );
+    const byName = Object.fromEntries(
+      (rows || []).map((row) => [String(row.name), row])
+    );
+    previousTicketRows.value = fallbackRows
+      .filter((row) => byName[String(row.name)])
+      .map((row) => ({
+        ...row,
+        ...(byName[String(row.name)] || {}),
+      }));
+  } catch {
+    previousTicketRows.value = fallbackRows;
+  }
+}
+
+function parsePreviousTicketRows(html) {
+  if (!html) return [];
+  const container = document.createElement("div");
+  container.innerHTML = normalizeTicketLinksInHtml(html);
+  return Array.from(container.querySelectorAll("tr"))
+    .map((tr) => {
+      const cells = Array.from(tr.children);
+      if (cells.length < 2) return null;
+      const link = cells[0].querySelector("a");
+      const name = cleanText(link?.textContent || cells[0].textContent || "");
+      if (!name || name.toLowerCase().includes("ticket")) return null;
+      return {
+        name,
+        subject: cleanText(cells[1].textContent || ""),
+        creation: "",
+        status: "",
+      };
+    })
+    .filter(Boolean);
+}
+
+function openDeskTicket(name) {
+  openDeskPath(`/app/hd-ticket/${name}`);
+}
+
+async function saveTicket() {
+  saving.value = true;
+  actionError.value = "";
+  try {
+    const isOnHold = form.status === "On Hold" ? 1 : form.is_on_hold ? 1 : 0;
+    await call("helpdesk.api.unity_helpdesk_ext.update_ticket", {
+      name: props.ticketId,
+      assignee: form.assignee,
+      status: form.status,
+      priority: form.priority,
+      ticket_type: form.ticket_type,
+      is_on_hold: isOnHold,
+      hold_from: form.hold_from,
+      hold_to: form.hold_to,
+      hold_reason: form.hold_reason,
+    });
+    await loadTicket();
+  } catch (err) {
+    actionError.value = err.message;
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function markClosed() {
+  form.status = "Closed";
+  form.is_on_hold = false;
+  await saveTicket();
+}
+
+// Create a Communication record directly from the frontend (fallback when
+// unity_ext.reply fails — e.g. module cache stale or no email account).
+async function _createCommunicationDirect(message) {
+  const sender = await call("frappe.auth.get_logged_user");
+  await call("frappe.client.insert", {
+    doc: {
+      doctype: "Communication",
+      communication_type: "Communication",
+      communication_medium: "",
+      sent_or_received: "Sent",
+      email_status: "Open",
+      subject: `Re: ${ticket.value.subject || ""} (#${props.ticketId})`,
+      sender: sender || "",
+      recipients: ticket.value.raised_by || "",
+      content: message,
+      status: "Linked",
+      reference_doctype: "HD Ticket",
+      reference_name: props.ticketId,
+    },
+  });
+}
+
+async function sendReply() {
+  saving.value = true;
+  actionError.value = "";
+  try {
+    try {
+      await call("helpdesk.api.unity_helpdesk_ext.reply", {
+        name: props.ticketId,
+        message: composerPayloadHtml(),
+        attachments: composerAttachments.value.map(
+          (attachment) => attachment.name
+        ),
+      });
+    } catch {
+      // unity_ext.reply unavailable (module cache stale) or no email account —
+      // fall back to creating the Communication record directly.
+      await _createCommunicationDirect(composerPayloadHtml());
+    }
+    await resetComposer();
+    await loadTicket();
+  } catch (err) {
+    actionError.value = err.message;
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function sendComment() {
+  saving.value = true;
+  actionError.value = "";
+  try {
+    await call("helpdesk.api.unity_helpdesk_ext.add_comment", {
+      name: props.ticketId,
+      content: composerCommentHtml(),
+    });
+    await resetComposer();
+    await loadTicket();
+  } catch (err) {
+    actionError.value = err.message;
+  } finally {
+    saving.value = false;
+  }
+}
+
+watch(
+  () => form.status,
+  (value) => {
+    if (value === "On Hold") {
+      form.is_on_hold = true;
+    } else if (form.is_on_hold) {
+      form.is_on_hold = false;
+    }
+  }
+);
+
+watch(
+  () => form.is_on_hold,
+  (value) => {
+    if (value && form.status !== "On Hold") {
+      form.status = "On Hold";
+    }
+    if (!value && form.status === "On Hold") {
+      form.status = "Open";
+    }
+  }
+);
+
+watch(
+  () => composeMode.value,
+  () => {
+    actionError.value = "";
+    resetComposer();
+  }
+);
+</script>

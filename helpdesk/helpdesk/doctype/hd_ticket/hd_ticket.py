@@ -186,6 +186,12 @@ class HDTicket(Document):
 		log_ticket_activity(self.name, "created this ticket")
 		capture_event("ticket_created")
 		publish_event("helpdesk:new-ticket", {"name": self.name})
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index after_insert")
 
 	def on_update(self):
 		if self.status == "Open":
@@ -199,6 +205,12 @@ class HDTicket(Document):
 		self.remove_assignment_if_not_in_team()
 		self.publish_update()
 		self.update_search_index()
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
 	
 	def notify_agent(self, agent, notiification_type="Assignment"):
 		frappe.get_doc(frappe._dict(
@@ -492,12 +504,6 @@ class HDTicket(Document):
 		communication.insert(ignore_permissions=True)
 		capture_event("agent_replied")
 
-		if skip_email_workflow:
-			return
-
-		if not sender_email:
-			frappe.throw(_("Can not send email. No sender email set up!"))
-
 		_attachments = []
 
 		for attachment in attachments:
@@ -506,6 +512,12 @@ class HDTicket(Document):
 			file_doc.attached_to_doctype = "Communication"
 			file_doc.save(ignore_permissions=True)
 			_attachments.append({"file_url": file_doc.file_url})
+
+		if skip_email_workflow:
+			return
+
+		if not sender_email:
+			frappe.throw(_("Can not send email. No sender email set up!"))
 
 		reply_to_email = sender_email.email_id
 		template = (

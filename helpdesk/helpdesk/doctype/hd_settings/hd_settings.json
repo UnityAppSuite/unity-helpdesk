@@ -33,6 +33,12 @@
   "images_column",
   "brand_logo",
   "column_break_fsjn",
+  "unity_helpdesk_section",
+  "helpdesk_ui",
+  "enable_unity_ticket_reminders",
+  "column_break_unity_reminders",
+  "unity_reminder_after_days",
+  "unity_email_thread_layout",
   "misc_tab",
   "toasts_column",
   "suppress_default_email_toast",
@@ -214,6 +220,43 @@
   {
    "fieldname": "column_break_fsjn",
    "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "unity_helpdesk_section",
+   "fieldtype": "Section Break",
+   "label": "Unity Helpdesk"
+  },
+  {
+   "default": "Default Helpdesk",
+   "fieldname": "helpdesk_ui",
+   "fieldtype": "Select",
+   "label": "Preferred Helpdesk UI",
+   "options": "Default Helpdesk\nUnity Helpdesk"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_unity_ticket_reminders",
+   "fieldtype": "Check",
+   "label": "Enable Unity Ticket Reminders"
+  },
+  {
+   "fieldname": "column_break_unity_reminders",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "3",
+   "depends_on": "enable_unity_ticket_reminders",
+   "fieldname": "unity_reminder_after_days",
+   "fieldtype": "Int",
+   "label": "Reminder After Days",
+   "non_negative": 1
+  },
+  {
+   "default": "Classic",
+   "fieldname": "unity_email_thread_layout",
+   "fieldtype": "Select",
+   "label": "Unity Email Thread Layout",
+   "options": "Classic\nChat Based"
   },
   {
    "default": "0",

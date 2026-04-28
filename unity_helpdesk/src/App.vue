@@ -1,0 +1,509 @@
+<template>
+  <div class="app-shell" :class="threadLayoutClass">
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
+      <RouterLink class="brand" to="/tickets/my" @click="sidebarOpen = false">
+        <span class="brand-mark">
+          <img :src="brandLogo" alt="Unity Helpdesk" />
+        </span>
+        <span class="brand-copy">
+          <strong>Unity Helpdesk</strong>
+          <small>Fast support workspace</small>
+        </span>
+      </RouterLink>
+
+      <nav>
+        <p>Tickets</p>
+        <RouterLink
+          v-if="canViewMyTickets"
+          to="/tickets/my"
+          @click="sidebarOpen = false"
+        >
+          My Tickets
+        </RouterLink>
+        <RouterLink
+          v-if="canViewAllTickets"
+          to="/tickets/all"
+          @click="sidebarOpen = false"
+        >
+          All Tickets
+        </RouterLink>
+        <RouterLink
+          v-if="canViewMyTickets"
+          to="/dashboard"
+          @click="sidebarOpen = false"
+        >
+          Dashboard
+        </RouterLink>
+        <template v-if="canManageUnitySettings">
+          <p>Management</p>
+          <RouterLink
+            v-if="canManageUnitySettings"
+            to="/settings"
+            @click="sidebarOpen = false"
+          >
+            Settings
+          </RouterLink>
+        </template>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="topbar-main">
+          <button class="menu-btn" @click="sidebarOpen = !sidebarOpen">
+            Menu
+          </button>
+          <div>
+            <strong>{{ pageTitle }}</strong>
+            <span>{{ pageSubtitle }}</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button class="btn" @click="openComposer = true">New Ticket</button>
+
+          <!-- Avatar with dropdown -->
+          <div class="avatar-wrap" @click="profileMenuOpen = !profileMenuOpen">
+            <img
+              v-if="profile.user_image"
+              class="top-avatar-image"
+              :src="profile.user_image"
+              :alt="profile.full_name || profile.name || 'User'"
+            />
+            <span v-else class="avatar avatar-lg top-avatar-fallback">
+              {{ initials(profile.full_name || profile.name || "") || "U" }}
+            </span>
+            <div v-if="profileMenuOpen" class="profile-dropdown" @click.stop>
+              <div class="profile-dropdown-header">
+                <strong>{{
+                  profile.full_name || profile.name || "User"
+                }}</strong>
+                <small>{{ profile.email || "" }}</small>
+              </div>
+              <RouterLink
+                v-if="canManageUnitySettings"
+                class="profile-dropdown-item"
+                to="/settings"
+                @click="profileMenuOpen = false"
+              >
+                Settings
+              </RouterLink>
+              <a class="profile-dropdown-item" href="/app" target="_top">
+                Switch to Desk
+              </a>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <!-- Click-away overlay for profile menu -->
+      <div
+        v-if="profileMenuOpen"
+        class="profile-overlay"
+        @click="profileMenuOpen = false"
+      ></div>
+
+      <RouterView @title="setTitle" />
+    </main>
+
+    <!-- Create Ticket modal -->
+    <div v-if="openComposer" class="modal-backdrop" @click.self="closeComposer">
+      <section class="modal-card">
+        <div class="modal-header">
+          <div>
+            <strong>Create Ticket</strong>
+            <span
+              >Create a ticket and send the first email to the customer.</span
+            >
+          </div>
+          <button class="btn secondary" @click="closeComposer">Close</button>
+        </div>
+        <div class="modal-body stack">
+          <p v-if="composerError" class="error">{{ composerError }}</p>
+          <p v-else-if="composerWarning" class="warning-banner">
+            {{ composerWarning }}
+          </p>
+
+          <!-- Customer Email with user search -->
+          <label>
+            Customer Email
+            <div class="input-with-action">
+              <input
+                v-model="composer.raised_by"
+                type="email"
+                placeholder="customer@example.com"
+                autocomplete="off"
+                @input="onEmailInput"
+                @focus="onEmailInput"
+              />
+              <a
+                href="/app/user/new-user-1"
+                target="_blank"
+                class="btn secondary input-action-btn"
+                title="Add new user"
+              >
+                + Add User
+              </a>
+            </div>
+            <!-- User suggestions -->
+            <ul v-if="userSuggestions.length" class="user-suggestions">
+              <li
+                v-for="u in userSuggestions"
+                :key="u.name"
+                @mousedown.prevent="selectUser(u)"
+              >
+                <span
+                  class="avatar"
+                  style="width: 20px; height: 20px; font-size: 9px"
+                >
+                  {{ initials(u.full_name || u.name) }}
+                </span>
+                <span>{{ u.full_name || u.name }}</span>
+                <small>{{ u.email || u.name }}</small>
+              </li>
+            </ul>
+          </label>
+
+          <label>
+            Subject
+            <input
+              v-model="composer.subject"
+              type="text"
+              placeholder="Enter ticket subject"
+            />
+          </label>
+          <label>
+            Ticket Type
+            <select v-model="composer.ticket_type">
+              <option value="">Not set</option>
+              <option
+                v-for="ticketType in ticketTypes"
+                :key="ticketType.name"
+                :value="ticketType.name"
+              >
+                {{ ticketType.name }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Priority
+            <select v-model="composer.priority">
+              <option value="">Not set</option>
+              <option>High</option>
+              <option>Medium</option>
+              <option>Low</option>
+            </select>
+          </label>
+          <label>
+            Assign To
+            <select v-model="composer.assignee">
+              <option value="">Unassigned</option>
+              <option
+                v-for="agent in agents"
+                :key="agent.name"
+                :value="agent.name"
+              >
+                {{ agent.full_name || agent.name }}
+              </option>
+            </select>
+          </label>
+          <label>
+            Email Message
+            <TinyMceEditor
+              v-model="composer.message"
+              :min-height="260"
+              placeholder="Write the email that should be sent to the customer"
+            />
+          </label>
+          <label>
+            Attachments
+            <div class="composer-attachment-actions">
+              <button
+                type="button"
+                class="btn secondary"
+                :disabled="composerUploading"
+                @click="composerAttachmentInput?.click()"
+              >
+                {{ composerUploading ? "Uploading..." : "Add Attachments" }}
+              </button>
+              <input
+                ref="composerAttachmentInput"
+                type="file"
+                class="hidden-file-input"
+                multiple
+                @change="handleComposerAttachments"
+              />
+            </div>
+            <div
+              v-if="composer.attachments.length"
+              class="attachment-list attachment-list-modal"
+            >
+              <div
+                v-for="attachment in composer.attachments"
+                :key="attachment.name"
+                class="attachment-item"
+              >
+                <a
+                  :href="attachment.file_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ attachment.file_name || attachment.name }}
+                </a>
+                <button
+                  type="button"
+                  class="link-btn danger-link"
+                  @click="removeComposerAttachment(attachment.name)"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button class="btn secondary" @click="closeComposer">Cancel</button>
+          <button class="btn" :disabled="composerSaving" @click="createTicket">
+            {{ composerSaving ? "Sending..." : "Create & Send Email" }}
+          </button>
+        </div>
+      </section>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed, onMounted, provide, reactive, ref, watch } from "vue";
+import { RouterLink, useRoute, useRouter } from "vue-router";
+import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
+import {
+  call,
+  initials,
+  getAgents,
+  getTicketTypes,
+  getUnityProfile,
+  searchUsers,
+  uploadAttachment,
+} from "./api";
+
+const TICKET_NOTICE_KEY = "unity_helpdesk_ticket_notice";
+const router = useRouter();
+const route = useRoute();
+const sidebarOpen = ref(false);
+const pageTitle = ref("My Tickets");
+const pageSubtitle = ref("Fast support workspace");
+const profile = ref({});
+const profileMenuOpen = ref(false);
+const brandLogo = "/assets/helpdesk/unity_helpdesk/favicon.svg";
+const agents = ref([]);
+const ticketTypes = ref([]);
+const openComposer = ref(false);
+const composerSaving = ref(false);
+const composerUploading = ref(false);
+const composerError = ref("");
+const composerWarning = ref("");
+const composerAttachmentInput = ref(null);
+const userSuggestions = ref([]);
+const session = reactive({
+  name: "",
+  full_name: "",
+  email: "",
+  username: "",
+  user_image: "",
+  roles: [],
+  capabilities: {},
+  settings: {
+    unity_email_thread_layout: "Classic",
+  },
+});
+let suggestTimeout = null;
+const composer = reactive({
+  raised_by: "",
+  subject: "",
+  message: "",
+  priority: "",
+  ticket_type: "",
+  assignee: "",
+  attachments: [],
+});
+
+provide("unitySession", session);
+provide("refreshUnitySession", loadSession);
+
+const capabilities = computed(() => session.capabilities || {});
+const canViewMyTickets = computed(
+  () => !!capabilities.value.can_view_my_tickets
+);
+const canViewAllTickets = computed(
+  () => !!capabilities.value.can_view_all_tickets
+);
+const canManageAgents = computed(() => !!capabilities.value.can_manage_agents);
+const canManageUnitySettings = computed(
+  () => !!capabilities.value.can_manage_unity_settings
+);
+const threadLayout = computed(
+  () => session.settings?.unity_email_thread_layout || "Classic"
+);
+const threadLayoutClass = computed(
+  () =>
+    `thread-layout-${String(threadLayout.value || "classic")
+      .toLowerCase()
+      .replace(/\s+/g, "-")}`
+);
+
+onMounted(async () => {
+  await Promise.allSettled([loadSession(), loadLookups()]);
+});
+
+watch(
+  () => route.fullPath,
+  () => {
+    enforceRouteAccess();
+  }
+);
+
+function setTitle(title, subtitle = "Fast support workspace") {
+  pageTitle.value = title;
+  pageSubtitle.value = subtitle;
+}
+
+async function loadSession() {
+  try {
+    const data = (await getUnityProfile()) || {};
+    profile.value = data || {};
+    session.name = data.name || "";
+    session.full_name = data.full_name || "";
+    session.email = data.email || "";
+    session.username = data.username || "";
+    session.user_image = data.user_image || "";
+    session.roles = data.roles || [];
+    session.capabilities = data.capabilities || {};
+    session.settings = {
+      unity_email_thread_layout:
+        data.settings?.unity_email_thread_layout || "Classic",
+    };
+    enforceRouteAccess();
+  } catch (err) {
+    composerError.value = err.message;
+  }
+}
+
+async function loadLookups() {
+  const [agentRows, typeRows] = await Promise.allSettled([
+    getAgents(),
+    getTicketTypes(),
+  ]);
+  agents.value = agentRows.status === "fulfilled" ? agentRows.value || [] : [];
+  ticketTypes.value =
+    typeRows.status === "fulfilled" ? typeRows.value || [] : [];
+}
+
+function enforceRouteAccess() {
+  if (!canViewMyTickets.value && route.path !== "/") {
+    return;
+  }
+  if (route.path === "/tickets/all" && !canViewAllTickets.value) {
+    router.replace("/tickets/my");
+    return;
+  }
+  if (route.path === "/agents" && !canManageAgents.value) {
+    router.replace(canManageUnitySettings.value ? "/settings" : "/tickets/my");
+    return;
+  }
+  if (route.path === "/settings" && !canManageUnitySettings.value) {
+    router.replace("/tickets/my");
+  }
+}
+
+function closeComposer() {
+  openComposer.value = false;
+  composerSaving.value = false;
+  composerUploading.value = false;
+  composerError.value = "";
+  composerWarning.value = "";
+  userSuggestions.value = [];
+  composer.raised_by = "";
+  composer.subject = "";
+  composer.message = "";
+  composer.priority = "";
+  composer.ticket_type = "";
+  composer.assignee = "";
+  composer.attachments = [];
+}
+
+function onEmailInput() {
+  clearTimeout(suggestTimeout);
+  const query = composer.raised_by;
+  if (!query || query.length < 2) {
+    userSuggestions.value = [];
+    return;
+  }
+  suggestTimeout = setTimeout(async () => {
+    try {
+      userSuggestions.value = await searchUsers(query);
+    } catch {
+      userSuggestions.value = [];
+    }
+  }, 300);
+}
+
+function selectUser(user) {
+  composer.raised_by = user.email || user.name;
+  userSuggestions.value = [];
+}
+
+async function handleComposerAttachments(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  composerUploading.value = true;
+  composerError.value = "";
+  try {
+    for (const file of files) {
+      const uploaded = await uploadAttachment(file);
+      composer.attachments.push(uploaded);
+    }
+  } catch (err) {
+    composerError.value = err.message;
+  } finally {
+    composerUploading.value = false;
+    if (composerAttachmentInput.value) {
+      composerAttachmentInput.value.value = "";
+    }
+  }
+}
+
+function removeComposerAttachment(name) {
+  composer.attachments = composer.attachments.filter(
+    (attachment) => attachment.name !== name
+  );
+}
+
+async function createTicket() {
+  composerSaving.value = true;
+  composerError.value = "";
+  composerWarning.value = "";
+  try {
+    const result = await call("helpdesk.api.unity_helpdesk_ext.create_ticket", {
+      subject: composer.subject,
+      raised_by: composer.raised_by,
+      message: composer.message,
+      priority: composer.priority,
+      ticket_type: composer.ticket_type,
+      assignee: composer.assignee,
+      attachments: composer.attachments.map((attachment) => attachment.name),
+    });
+    const ticket = result?.ticket || {};
+    if (result?.warning) {
+      sessionStorage.setItem(TICKET_NOTICE_KEY, result.warning);
+      composerWarning.value = result.warning;
+    }
+    closeComposer();
+    if (ticket?.name) {
+      router.push(`/tickets/${ticket.name}`);
+    }
+  } catch (err) {
+    composerError.value = err.message;
+  } finally {
+    composerSaving.value = false;
+  }
+}
+</script>

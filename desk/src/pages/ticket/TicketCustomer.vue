@@ -44,7 +44,7 @@
             label="Send"
             theme="gray"
             variant="solid"
-            :disabled="$refs.editor.editor.isEmpty || send.loading"
+            :disabled="isEditorEmpty || send.loading"
             @click="() => send.submit()"
           />
         </template>
@@ -86,6 +86,13 @@ const editorContent = ref("");
 const attachments = ref([]);
 const showFeedbackDialog = ref(false);
 const isExpanded = ref(false);
+const isEditorEmpty = computed(
+  () =>
+    !editorContent.value
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+);
 
 const send = createResource({
   url: "run_doc_method",
@@ -100,7 +107,7 @@ const send = createResource({
     },
   }),
   onSuccess: () => {
-    editor.value.editor.commands.clearContent(true);
+    editor.value?.clear();
     attachments.value = [];
     isExpanded.value = false;
     ticket.reload();

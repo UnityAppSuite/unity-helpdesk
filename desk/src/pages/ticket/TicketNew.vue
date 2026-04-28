@@ -35,9 +35,7 @@
             label="Submit"
             theme="gray"
             variant="solid"
-            :disabled="
-              $refs.editor.editor.isEmpty || ticket.loading || !subject
-            "
+            :disabled="isDescriptionEmpty || ticket.loading || !subject"
             @click="() => ticket.submit()"
           />
         </template>
@@ -72,6 +70,13 @@ const subject = ref("");
 const description = ref("");
 const attachments = ref([]);
 const templateFields = reactive({});
+const isDescriptionEmpty = computed(
+  () =>
+    !description.value
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+);
 
 const template = createResource({
   url: "helpdesk.helpdesk.doctype.hd_ticket_template.api.get_one",

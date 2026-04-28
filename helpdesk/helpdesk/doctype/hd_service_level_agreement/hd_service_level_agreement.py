@@ -247,7 +247,14 @@ class HDServiceLevelAgreement(Document):
 		target: Literal["response_time", "resolution_time"],
 	):
 		res = get_datetime(start_at)
-		priority = self.get_priorities()[priority]
+		priority_map = self.get_priorities()
+		priority = (
+			priority_map.get(priority)
+			or priority_map.get(self.default_priority)
+			or next(iter(priority_map.values()), None)
+		)
+		if not priority:
+			return res
 		time_needed = priority.get(target, 0)
 		holidays = self.get_holidays()
 		weekdays = get_weekdays()

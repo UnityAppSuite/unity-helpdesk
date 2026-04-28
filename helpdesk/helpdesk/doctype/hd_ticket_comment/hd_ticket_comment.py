@@ -5,6 +5,7 @@ from frappe.model.document import Document
 
 from helpdesk.mixins.mentions import HasMentions
 from helpdesk.utils import capture_event, publish_event
+from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
 
 
 class HDTicketComment(HasMentions, Document):
@@ -12,6 +13,7 @@ class HDTicketComment(HasMentions, Document):
 
 	def on_update(self):
 		self.notify_mentions()
+		update_ticket_message_search_index(self.reference_ticket)
 
 	def after_insert(self):
 		event = "helpdesk:new-ticket-comment"
@@ -20,6 +22,7 @@ class HDTicketComment(HasMentions, Document):
 
 		publish_event(event, data)
 		capture_event(telemetry_event)
+		update_ticket_message_search_index(self.reference_ticket)
 
 	def after_delete(self):
 		event = "helpdesk:delete-ticket-comment"
@@ -28,3 +31,4 @@ class HDTicketComment(HasMentions, Document):
 
 		publish_event(event, data)
 		capture_event(telemetry_event)
+		update_ticket_message_search_index(self.reference_ticket)
