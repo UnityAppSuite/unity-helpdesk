@@ -12,21 +12,25 @@ helpers were present from the first load and are always available).
 import frappe
 from frappe import _
 from frappe.desk.form.assign_to import clear as clear_all_assignments
+from frappe.utils import cstr
 
 # These helpers are in the cached unity_helpdesk.py — they were there from the start.
 from helpdesk.api.unity_helpdesk import (
     _decorate_ticket,
     _has_field,
+    _log_hold_reason,
     _parse_json,
     _require_unity_access,
     _require_ticket_access,
     _ticket_fields,
     get_student_context_for_ticket,
+    update_ticket_message_search_index,
     FINAL_STATUSES,
     STATUS_OPTIONS,
     TICKET_DOCTYPE,
 )
 from helpdesk.api.ticket import assign_ticket_to_agent
+from helpdesk.helpdesk.doctype.hd_ticket.api import get_ticket_thread_components
 
 
 def _user_map(usernames):
@@ -87,44 +91,26 @@ def _assignment_history(ticket_name):
     return history
 
 
-def _attachments_by_communication(communication_names):
-    communication_names = [name for name in communication_names if name]
-    if not communication_names:
-        return {}
-
-    attachment_map = {name: [] for name in communication_names}
-    for row in frappe.get_all(
-        "File",
-        fields=["name", "file_name", "file_url", "attached_to_name"],
-        filters={
-            "attached_to_doctype": "Communication",
-            "attached_to_name": ["in", communication_names],
-        },
-        order_by="creation asc",
-        page_length=max(len(communication_names) * 5, 50),
-    ):
-        attachment_map.setdefault(row.attached_to_name, []).append(
-            {
-                "name": row.name,
-                "file_name": row.file_name,
-                "file_url": row.file_url,
-            }
-        )
-    return attachment_map
+def _attach_files_to_communication(file_names, communication_name):
+    for file_name in _parse_json(file_names, []) or []:
+        file_name = cstr(file_name).strip()
+        if not file_name or not frappe.db.exists("File", file_name):
+            continue
+        file_doc = frappe.get_doc("File", file_name)
+        file_doc.attached_to_doctype = "Communication"
+        file_doc.attached_to_name = communication_name
+        file_doc.save(ignore_permissions=True)
 
 
-def _log_hold_reason(ticket_name, hold_reason):
-    if not hold_reason:
-        return
-    frappe.get_doc(
-        {
-            "doctype": "HD Ticket Comment",
-            "commented_by": frappe.session.user,
-            "content": f"Hold Reason: {hold_reason}",
-            "is_pinned": 0,
-            "reference_ticket": ticket_name,
-        }
-    ).insert(ignore_permissions=True)
+def _is_missing_sender_error(exc):
+    message = cstr(exc).lower()
+    return (
+        "sender email" in message
+        or "no sender" in message
+        or "sendmail" in message
+        or "outgoing email" in message
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -157,37 +143,10 @@ def get_ticket_detail(name):
     decorated.history = history
     decorated.assignment_history = _assignment_history(name)
 
-    # Email thread — all Communications linked to this ticket
-    communications = frappe.get_all(
-        "Communication",
-        fields=[
-            "name",
-            "subject",
-            "content",
-            "sender",
-            "sent_or_received",
-            "creation",
-            "cc",
-            "bcc",
-        ],
-        filters={"reference_doctype": TICKET_DOCTYPE, "reference_name": name},
-        order_by="creation asc",
-        page_length=200,
-    )
-    attachment_map = _attachments_by_communication(
-        [communication.name for communication in communications]
-    )
-    for communication in communications:
-        communication.attachments = attachment_map.get(communication.name, [])
-    decorated.communications = communications
-
-    decorated.comments = frappe.get_all(
-        "HD Ticket Comment",
-        fields=["name", "content", "commented_by", "creation", "is_pinned"],
-        filters={"reference_ticket": name},
-        order_by="creation asc",
-        page_length=200,
-    )
+    thread_components = get_ticket_thread_components(name)
+    decorated.communications = thread_components.communications
+    decorated.comments = thread_components.comments
+    decorated.thread = thread_components.thread
     decorated.student_context = get_student_context_for_ticket(
         ticket_name=name,
         raised_by=decorated.get("raised_by"),
@@ -262,8 +221,12 @@ def create_ticket(
         )
         email_sent = True
     except Exception as exc:
-        warning = _("Ticket created, but the email could not be sent: {0}").format(exc)
-        frappe.log_error(frappe.get_traceback(), "Unity Helpdesk create_ticket reply_via_agent")
+        if _is_missing_sender_error(exc):
+            _create_communication_direct(doc, message, attachments=attachments)
+            warning = _("Ticket created and reply saved, but no outgoing email account is configured.")
+        else:
+            warning = _("Ticket created, but the email could not be sent: {0}").format(exc)
+            frappe.log_error(frappe.get_traceback(), "Unity Helpdesk create_ticket reply_via_agent")
 
     try:
         rows = frappe.get_list(
@@ -381,9 +344,9 @@ def update_ticket(
 # Reply
 # ---------------------------------------------------------------------------
 
-def _create_communication_direct(ticket, message, cc=None, bcc=None):
+def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments=None):
     """Create a Communication record without sending email (fallback when no email account set up)."""
-    frappe.get_doc({
+    communication = frappe.get_doc({
         "doctype": "Communication",
         "communication_type": "Communication",
         "communication_medium": "",
@@ -399,6 +362,9 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None):
         "cc": cc or "",
         "bcc": bcc or "",
     }).insert(ignore_permissions=True)
+    _attach_files_to_communication(attachments, communication.name)
+    update_ticket_message_search_index(ticket.name, ticket_doc=ticket)
+    return communication
 
 
 @frappe.whitelist()
@@ -416,18 +382,18 @@ def reply(name, message, cc=None, bcc=None, attachments=None):
             attachments=_parse_json(attachments, []),
         )
     except frappe.ValidationError as exc:
-        err = str(exc)
-        if "sender email" in err.lower() or "no sender" in err.lower() or "sendmail" in err.lower():
+        if _is_missing_sender_error(exc):
             # No outgoing email account configured — save communication record only
-            _create_communication_direct(ticket, message, cc, bcc)
+            _create_communication_direct(ticket, message, cc, bcc, attachments)
         else:
             raise
     except Exception as exc:
-        err = str(exc)
-        if "sender email" in err.lower() or "no sender" in err.lower():
-            _create_communication_direct(ticket, message, cc, bcc)
+        if _is_missing_sender_error(exc):
+            _create_communication_direct(ticket, message, cc, bcc, attachments)
         else:
             raise
+    else:
+        update_ticket_message_search_index(name, ticket_doc=ticket)
     return {"ok": True}
 
 
@@ -441,11 +407,12 @@ def add_comment(name, content):
     _require_ticket_access(name, capabilities)
     if not content:
         frappe.throw(_("Please enter a comment"))
-    frappe.get_doc({
+    comment = frappe.get_doc({
         "doctype": "HD Ticket Comment",
         "commented_by": frappe.session.user,
         "content": content,
         "is_pinned": False,
         "reference_ticket": name,
     }).insert(ignore_permissions=True)
+    update_ticket_message_search_index(name)
     return {"ok": True}

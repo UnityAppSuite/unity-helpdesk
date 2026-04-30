@@ -1,3 +1,12 @@
+import DOMPurify from "dompurify";
+
+export function sanitize(html) {
+  return DOMPurify.sanitize(html || "", {
+    ADD_ATTR: ["target", "rel"],
+    FORBID_TAGS: ["script", "style", "iframe"],
+  });
+}
+
 export async function call(method, params = {}, options = {}) {
   const controller = new AbortController();
   const timeoutMs = Number(options.timeoutMs || 0);

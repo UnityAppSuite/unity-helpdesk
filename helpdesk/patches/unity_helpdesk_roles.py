@@ -12,7 +12,8 @@ def execute():
 
 
 def _assign_role_if_missing(user, role):
-	if role not in UNITY_HELPDESK_ROLES and role != "Agent":
+	allowed_roles = set(UNITY_HELPDESK_ROLES) | {"Agent"}
+	if role not in allowed_roles:
 		return
 	if not frappe.db.exists("User", user):
 		return

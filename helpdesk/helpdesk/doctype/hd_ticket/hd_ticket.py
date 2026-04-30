@@ -197,7 +197,7 @@ class HDTicket(Document):
 		if self.status == "Open":
 			if self.get_doc_before_save() and self.get_doc_before_save().status != "Open":
 				
-				agent = json.loads(self._assign)
+				agent = frappe.parse_json(self._assign or "[]")
 				if len(agent) > 0:
 					self.notify_agent(agent[0], "Reaction")
 		
@@ -205,20 +205,26 @@ class HDTicket(Document):
 		self.remove_assignment_if_not_in_team()
 		self.publish_update()
 		self.update_search_index()
-		try:
-			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+		doc_before = self.get_doc_before_save()
+		if (
+			not doc_before
+			or self.has_value_changed("description")
+			or self.has_value_changed("subject")
+		):
+			try:
+				from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
 
-			update_ticket_message_search_index(self.name, ticket_doc=self)
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
-	
-	def notify_agent(self, agent, notiification_type="Assignment"):
+				update_ticket_message_search_index(self.name, ticket_doc=self)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
+
+	def notify_agent(self, agent, notification_type="Assignment"):
 		frappe.get_doc(frappe._dict(
 			doctype="HD Notification",
 			user_from=frappe.session.user,
 			reference_ticket=self.name,
 			user_to=agent,
-			notification_type=notiification_type,
+			notification_type=notification_type,
 		)).insert(ignore_permissions=True)
 
 	def update_search_index(self):
@@ -355,7 +361,7 @@ class HDTicket(Document):
 			return
 
 		if self._assign:
-			assignees = json.loads(self._assign)
+			assignees = frappe.parse_json(self._assign or "[]")
 			for assignee in assignees:
 				if agent == assignee:
 					# the agent is already set as an assignee
@@ -369,7 +375,7 @@ class HDTicket(Document):
 	def get_assigned_agent(self):
 		# for some reason _assign is not set, maybe a framework bug?
 		if hasattr(self, "_assign") and self._assign:
-			assignees = json.loads(self._assign)
+			assignees = frappe.parse_json(self._assign or "[]")
 			if len(assignees) > 0:
 				agent_doc = frappe.get_doc("HD Agent", assignees[0])
 				return agent_doc
@@ -503,6 +509,12 @@ class HDTicket(Document):
 
 		communication.insert(ignore_permissions=True)
 		capture_event("agent_replied")
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index reply_via_agent")
 
 		_attachments = []
 
@@ -581,6 +593,15 @@ class HDTicket(Document):
 		c.ignore_permissions = True
 		c.ignore_mandatory = True
 		c.save(ignore_permissions=True)
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				"HD Ticket message search index create_communication_via_contact",
+			)
 
 		if not len(attachments):
 			return

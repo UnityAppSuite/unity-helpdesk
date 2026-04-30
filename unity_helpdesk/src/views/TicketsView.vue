@@ -45,7 +45,7 @@
           v-model="draftSearch"
           class="search"
           type="text"
-          placeholder="Ticket ID, student name, reference no., guardian email or message keyword…"
+          placeholder="Ticket ID, student name, reference no., guardian email or message text…"
           @keyup.enter="submitSearch"
         />
         <span
@@ -111,7 +111,7 @@
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
       <p v-else-if="!tickets.length && appliedSearch" class="empty">
-        No tickets found for <strong>"{{ appliedSearch }}"</strong> — try a
+        No tickets found for <strong>{{ activeFilterSummary }}</strong> — try a
         shorter or different term.
       </p>
       <p v-else-if="!tickets.length" class="empty">{{ emptyMessage }}</p>
@@ -327,6 +327,9 @@ const canLoadMore = computed(
   () => tickets.value.length < (result.total_count || 0)
 );
 const cards = computed(() => result.cards || {});
+const activeFilterSummary = computed(() => {
+  return `search: "${appliedSearch.value.trim()}"`;
+});
 
 watch(
   () => [props.view, route.fullPath],
@@ -344,8 +347,11 @@ onMounted(async () => {
 });
 
 function applyRouteState() {
-  draftSearch.value = String(route.query.search || "");
-  appliedSearch.value = String(route.query.search || "");
+  const routeSearch = String(
+    route.query.search || route.query.message_body || ""
+  );
+  draftSearch.value = routeSearch;
+  appliedSearch.value = routeSearch;
   filters.status = String(route.query.status || "");
   filters.priority = String(route.query.priority || "");
   filters.ticket_type = String(route.query.ticket_type || "");
@@ -394,6 +400,7 @@ async function reload() {
 function routeQueryFromState() {
   return {
     ...route.query,
+    message_body: undefined,
     status: filters.status || undefined,
     priority: filters.priority || undefined,
     ticket_type: filters.ticket_type || undefined,
@@ -403,22 +410,40 @@ function routeQueryFromState() {
   };
 }
 
+function compactQuery(query) {
+  return Object.fromEntries(
+    Object.entries(query || {}).filter(([, value]) => value !== undefined)
+  );
+}
+
+function sameQuery(left, right) {
+  return (
+    JSON.stringify(compactQuery(left)) === JSON.stringify(compactQuery(right))
+  );
+}
+
+async function replaceRouteOrReload() {
+  const nextQuery = routeQueryFromState();
+  if (sameQuery(route.query, nextQuery)) {
+    await reload();
+    return;
+  }
+  await router.replace({ query: nextQuery });
+}
+
 async function applyFiltersAndReload() {
-  await router.replace({ query: routeQueryFromState() });
-  await reload();
+  await replaceRouteOrReload();
 }
 
-function submitSearch() {
+async function submitSearch() {
   appliedSearch.value = draftSearch.value.trim();
-  router.replace({ query: routeQueryFromState() });
-  reload();
+  await replaceRouteOrReload();
 }
 
-function clearSearch() {
+async function clearSearch() {
   draftSearch.value = "";
   appliedSearch.value = "";
-  router.replace({ query: routeQueryFromState() });
-  reload();
+  await replaceRouteOrReload();
 }
 
 function refreshList() {

@@ -95,7 +95,7 @@
                     <td
                       v-for="value in row.values"
                       :key="`${row.field}-${value.key}`"
-                      v-html="value.html || '-'"
+                      v-html="sanitize(value.html || '-')"
                     ></td>
                   </tr>
                 </tbody>
@@ -122,7 +122,7 @@
                     <td
                       v-for="value in row.values"
                       :key="`${row.field}-${value.key}`"
-                      v-html="value.html || '-'"
+                      v-html="sanitize(value.html || '-')"
                     ></td>
                   </tr>
                 </tbody>
@@ -132,7 +132,7 @@
           <div
             v-else
             class="detail-body safe-html compact-html"
-            v-html="ticket.custom_list_of_student"
+            v-html="sanitize(ticket.custom_list_of_student)"
           ></div>
         </section>
 
@@ -151,7 +151,7 @@
                     <td
                       v-for="field in feeFields"
                       :key="field"
-                      v-html="fee[field] || '-'"
+                      v-html="sanitize(fee[field] || '-')"
                     ></td>
                   </tr>
                 </tbody>
@@ -162,12 +162,12 @@
             <div
               v-if="ticket.custom_all_fees_details_of_students"
               class="detail-body safe-html compact-html"
-              v-html="ticket.custom_all_fees_details_of_students"
+              v-html="sanitize(ticket.custom_all_fees_details_of_students)"
             ></div>
             <div
               v-if="ticket.custom_payment_schedule"
               class="detail-body safe-html compact-html"
-              v-html="ticket.custom_payment_schedule"
+              v-html="sanitize(ticket.custom_payment_schedule)"
             ></div>
           </template>
         </section>
@@ -207,7 +207,7 @@
               <div
                 v-if="ticket.custom_student_remark && additionalOpen"
                 class="safe-html compact-html"
-                v-html="ticket.custom_student_remark"
+                v-html="sanitize(ticket.custom_student_remark)"
               ></div>
               <div v-if="previousTicketRows.length" class="scroll-x">
                 <table class="compact-info-table previous-ticket-table">
@@ -246,12 +246,12 @@
               <div
                 v-else-if="previousTicketsHtml"
                 class="safe-html compact-html"
-                v-html="previousTicketsHtml"
+                v-html="sanitize(previousTicketsHtml)"
               ></div>
               <div
                 v-if="ticket.custom_previous_ticket_details && additionalOpen"
                 class="safe-html compact-html"
-                v-html="ticket.custom_previous_ticket_details"
+                v-html="sanitize(ticket.custom_previous_ticket_details)"
               ></div>
             </div>
           </div>
@@ -286,7 +286,7 @@
               </div>
               <div
                 class="chat-msg-body safe-html"
-                v-html="threadContent(item)"
+                v-html="sanitize(threadContent(item))"
               ></div>
               <div
                 v-if="item.attachments?.length"
@@ -551,6 +551,7 @@ import {
   getAgents,
   getTicketTypes,
   openDeskPath,
+  sanitize,
   uploadAttachment,
 } from "../api";
 
@@ -603,6 +604,11 @@ const form = reactive({
 const history = computed(() => ticket.value.history || []);
 const assignmentHistory = computed(() => ticket.value.assignment_history || []);
 const timeline = computed(() => {
+  if (Array.isArray(ticket.value.thread) && ticket.value.thread.length) {
+    return [...ticket.value.thread].sort(
+      (a, b) => new Date(a.creation) - new Date(b.creation)
+    );
+  }
   const comms = communications.value.map((c) => ({
     ...c,
     _type: "comm",
@@ -1000,20 +1006,26 @@ function composerPayloadHtml() {
 }
 
 function composerCommentHtml() {
+  const base = composerPayloadHtml();
   if (!composerAttachments.value.length) {
-    return composerPayloadHtml();
+    return base;
   }
-  const attachmentLinks = composerAttachments.value
-    .map(
-      (attachment) =>
-        `<li><a href="${
-          attachment.file_url
-        }" target="_blank" rel="noopener noreferrer">${
-          attachment.file_name || attachment.name
-        }</a></li>`
-    )
-    .join("");
-  return `${composerPayloadHtml()}<p><strong>Attachments</strong></p><ul>${attachmentLinks}</ul>`;
+  const ul = document.createElement("ul");
+  for (const att of composerAttachments.value) {
+    const a = document.createElement("a");
+    a.href = att.file_url || "#";
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = att.file_name || att.name || "attachment";
+    const li = document.createElement("li");
+    li.appendChild(a);
+    ul.appendChild(li);
+  }
+  const p = document.createElement("p");
+  const strong = document.createElement("strong");
+  strong.textContent = "Attachments";
+  p.appendChild(strong);
+  return `${base}${p.outerHTML}${ul.outerHTML}`;
 }
 
 async function resetComposer() {
@@ -1274,45 +1286,17 @@ async function markClosed() {
   await saveTicket();
 }
 
-// Create a Communication record directly from the frontend (fallback when
-// unity_ext.reply fails — e.g. module cache stale or no email account).
-async function _createCommunicationDirect(message) {
-  const sender = await call("frappe.auth.get_logged_user");
-  await call("frappe.client.insert", {
-    doc: {
-      doctype: "Communication",
-      communication_type: "Communication",
-      communication_medium: "",
-      sent_or_received: "Sent",
-      email_status: "Open",
-      subject: `Re: ${ticket.value.subject || ""} (#${props.ticketId})`,
-      sender: sender || "",
-      recipients: ticket.value.raised_by || "",
-      content: message,
-      status: "Linked",
-      reference_doctype: "HD Ticket",
-      reference_name: props.ticketId,
-    },
-  });
-}
-
 async function sendReply() {
   saving.value = true;
   actionError.value = "";
   try {
-    try {
-      await call("helpdesk.api.unity_helpdesk_ext.reply", {
-        name: props.ticketId,
-        message: composerPayloadHtml(),
-        attachments: composerAttachments.value.map(
-          (attachment) => attachment.name
-        ),
-      });
-    } catch {
-      // unity_ext.reply unavailable (module cache stale) or no email account —
-      // fall back to creating the Communication record directly.
-      await _createCommunicationDirect(composerPayloadHtml());
-    }
+    await call("helpdesk.api.unity_helpdesk_ext.reply", {
+      name: props.ticketId,
+      message: composerPayloadHtml(),
+      attachments: composerAttachments.value.map(
+        (attachment) => attachment.name
+      ),
+    });
     await resetComposer();
     await loadTicket();
   } catch (err) {

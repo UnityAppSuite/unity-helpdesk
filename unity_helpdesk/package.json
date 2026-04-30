@@ -11,6 +11,7 @@
   "dependencies": {
     "@tinymce/tinymce-vue": "^6.2.1",
     "@vitejs/plugin-vue": "^4.0.0",
+    "dompurify": "^3.1.6",
     "tinymce": "^7.9.1",
     "vite": "^4.1.4",
     "vue": "^3.3.4",

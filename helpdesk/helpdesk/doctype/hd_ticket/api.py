@@ -91,6 +91,10 @@ def get_assignee(_assign: str):
 
 
 def get_communications(ticket: str):
+	return get_ticket_thread_components(ticket)["communications"]
+
+
+def get_ticket_thread_components(ticket: str):
 	QBCommunication = frappe.qb.DocType("Communication")
 	communications = (
 		frappe.qb.from_(QBCommunication)
@@ -100,7 +104,10 @@ def get_communications(ticket: str):
 			QBCommunication.content,
 			QBCommunication.creation,
 			QBCommunication.name,
+			QBCommunication.recipients,
+			QBCommunication.sent_or_received,
 			QBCommunication.sender,
+			QBCommunication.subject,
 		)
 		.where(QBCommunication.reference_doctype == "HD Ticket")
 		.where(QBCommunication.reference_name == ticket)
@@ -108,10 +115,29 @@ def get_communications(ticket: str):
 		.run(as_dict=True)
 	)
 	for c in communications:
+		c._type = "comm"
 		c.attachments = get_attachments("Communication", c.name)
 		c.user = get_user_info_for_avatar(c.sender)
-	return communications
 
+	comments = get_comments(ticket)
+	for c in comments:
+		c._type = "comment"
+		c.sender = c.commented_by
+		c.attachments = []
+
+	thread = sorted(
+		[*communications, *comments],
+		key=lambda row: (row.creation, row.name),
+	)
+	return frappe._dict({
+		"communications": communications,
+		"comments": comments,
+		"thread": thread,
+	})
+
+
+def get_ticket_thread(ticket: str):
+	return get_ticket_thread_components(ticket)["thread"]
 
 def get_comments(ticket: str):
 	if not frappe.has_permission("HD Ticket Comment", "read"):

@@ -9,7 +9,10 @@ from frappe.desk.form.assign_to import clear as clear_all_assignments
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
-from helpdesk.helpdesk.doctype.hd_ticket.api import get_one as get_ticket_doc
+from helpdesk.helpdesk.doctype.hd_ticket.api import (
+	get_one as get_ticket_doc,
+	get_ticket_thread_components,
+)
 
 
 TICKET_DOCTYPE = "HD Ticket"
@@ -52,6 +55,8 @@ OPTIONAL_TICKET_FIELDS = [
 	"custom_search_student_names",
 	"custom_search_student_refs",
 	"custom_search_guardian_emails",
+	"custom_primary_message_html",
+	"custom_primary_message_text",
 	"custom_search_message_body",
 ]
 
@@ -142,13 +147,11 @@ def _require_ticket_access(name, capabilities=None):
 	capabilities = capabilities or _require_unity_access()
 	if capabilities.can_view_all_tickets:
 		return
-	rows = frappe.get_all(
-		TICKET_DOCTYPE,
-		filters={"name": name, "_assign": ["like", f"%{_session_user()}%"]},
-		fields=["name"],
-		limit=1,
-	)
-	if not rows:
+	assign_value = frappe.db.get_value(TICKET_DOCTYPE, name, "_assign")
+	if assign_value is None:
+		frappe.throw(_("Ticket not found"), frappe.DoesNotExistError)
+	assigned = frappe.parse_json(assign_value or "[]")
+	if _session_user() not in (assigned or []):
 		frappe.throw(_("You do not have access to this ticket"), frappe.PermissionError)
 
 
@@ -234,6 +237,18 @@ def _search_tokens(value):
 
 def _like_pattern(value):
 	return f"%{cstr(value or '').strip()}%"
+
+
+def _ticket_message_search_fields():
+	return [
+		field
+		for field in [
+			"custom_primary_message_html",
+			"custom_primary_message_text",
+			"custom_search_message_body",
+		]
+		if frappe.db.has_column(TICKET_DOCTYPE, field)
+	]
 
 
 def _student_display_name(student):
@@ -772,6 +787,8 @@ def populate_ticket_student_search_fields(ticket):
 
 	context = get_student_context_for_ticket(ticket_doc.name, ticket_doc.raised_by)
 	search_update = {}
+	# These three fields are Data type (VARCHAR 255) — truncate to stay within limit.
+	_DATA_FIELD_MAX = 255
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_student_names"):
 		search_update["custom_search_student_names"] = ", ".join(
 			sorted(
@@ -781,7 +798,7 @@ def populate_ticket_student_search_fields(ticket):
 					if cstr(student.get("student_name")).strip()
 				}
 			)
-		)
+		)[:_DATA_FIELD_MAX]
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_student_refs"):
 		search_update["custom_search_student_refs"] = ", ".join(
 			sorted(
@@ -791,7 +808,7 @@ def populate_ticket_student_search_fields(ticket):
 					if cstr(student.get("reference_number")).strip()
 				}
 			)
-		)
+		)[:_DATA_FIELD_MAX]
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_guardian_emails"):
 		emails = {
 			cstr(ticket_doc.get("raised_by")).strip().lower()
@@ -803,12 +820,8 @@ def populate_ticket_student_search_fields(ticket):
 				email_text = cstr(email_value).strip().lower()
 				if email_text:
 					emails.add(email_text)
-		search_update["custom_search_guardian_emails"] = ", ".join(sorted(emails))
-	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
-		search_update["custom_search_message_body"] = _build_ticket_message_search_text(
-			ticket_doc.name,
-			ticket_doc=ticket_doc,
-		)
+		search_update["custom_search_guardian_emails"] = ", ".join(sorted(emails))[:_DATA_FIELD_MAX]
+	search_update.update(_build_ticket_message_search_field_update(ticket_doc.name, ticket_doc=ticket_doc))
 	if search_update:
 		frappe.db.set_value(TICKET_DOCTYPE, ticket_doc.name, search_update, update_modified=False)
 		_invalidate_communication_cache(ticket_doc.name)
@@ -822,47 +835,91 @@ def _truncate_search_text(text, max_chars=12000):
 	return text[:max_chars].rsplit(" ", 1)[0].strip() or text[:max_chars]
 
 
-def _build_ticket_message_search_text(ticket_name, ticket_doc=None):
-	parts = []
+def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=None):
 	ticket_doc = ticket_doc or frappe.get_cached_doc(TICKET_DOCTYPE, ticket_name)
-	if ticket_doc:
-		parts.append(_normalize_search_text(ticket_doc.get("description")))
+	communication_rows = communication_rows or []
 
-	for row in frappe.get_all(
-		"Communication",
-		fields=["subject", "content"],
-		filters={"reference_doctype": TICKET_DOCTYPE, "reference_name": ticket_name},
-		page_length=0,
-		order_by="creation desc",
-	):
+	for row in communication_rows:
+		if cstr(row.get("sent_or_received")).strip() != "Received":
+			continue
+		content_html = cstr(row.get("content") or "").strip()
+		if not content_html:
+			continue
+		return content_html, _normalize_search_text(content_html)
+
+	if ticket_doc and not communication_rows:
+		description_html = cstr(ticket_doc.get("description") or "").strip()
+		if description_html:
+			return description_html, _normalize_search_text(description_html)
+
+	return "", ""
+
+
+def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
+	ticket_doc = ticket_doc or frappe.get_cached_doc(TICKET_DOCTYPE, ticket_name)
+	thread_components = get_ticket_thread_components(ticket_name)
+	communication_rows = thread_components.communications
+	primary_message_html, primary_message_text = _primary_message_values(
+		ticket_name,
+		ticket_doc=ticket_doc,
+		communication_rows=communication_rows,
+	)
+
+	parts = []
+	subject_text = _normalize_search_text(ticket_doc.get("subject")) if ticket_doc else ""
+	if subject_text:
+		parts.append(subject_text)
+	if primary_message_text:
+		parts.append(primary_message_text)
+	for row in communication_rows:
 		parts.append(_normalize_search_text(row.subject))
 		parts.append(_normalize_search_text(row.content))
 
-	for row in frappe.get_all(
-		"HD Ticket Comment",
-		fields=["content"],
-		filters={"reference_ticket": ticket_name},
-		page_length=0,
-		order_by="creation desc",
-	):
+	for row in thread_components.comments:
 		parts.append(_normalize_search_text(row.content))
 
-	combined = " ".join(part for part in parts if part)
-	return _truncate_search_text(combined)
+	if ticket_doc and not communication_rows:
+		parts.append(_normalize_search_text(ticket_doc.get("description")))
+
+	combined = _truncate_search_text(" ".join(part for part in parts if part))
+	return primary_message_html, primary_message_text, combined
+
+
+def _build_ticket_message_search_field_update(ticket_name, ticket_doc=None):
+	field_names = _ticket_message_search_fields()
+	if not field_names:
+		return {}
+	primary_message_html, primary_message_text, search_text = _build_ticket_message_search_values(
+		ticket_name,
+		ticket_doc=ticket_doc,
+	)
+	search_update = {}
+	if "custom_primary_message_html" in field_names:
+		search_update["custom_primary_message_html"] = primary_message_html
+	if "custom_primary_message_text" in field_names:
+		search_update["custom_primary_message_text"] = primary_message_text
+	if "custom_search_message_body" in field_names:
+		search_update["custom_search_message_body"] = search_text
+	return search_update
+
+
+def _build_ticket_message_search_text(ticket_name, ticket_doc=None):
+	return _build_ticket_message_search_values(ticket_name, ticket_doc=ticket_doc)[2]
 
 
 def update_ticket_message_search_index(ticket_name, ticket_doc=None):
 	ticket_name = cstr(ticket_name).strip()
-	if not ticket_name or not frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
+	if not ticket_name:
 		return ""
-	search_text = _build_ticket_message_search_text(ticket_name, ticket_doc=ticket_doc)
-	frappe.db.set_value(
-		TICKET_DOCTYPE,
-		ticket_name,
-		"custom_search_message_body",
-		search_text,
-		update_modified=False,
-	)
+	search_update = _build_ticket_message_search_field_update(ticket_name, ticket_doc=ticket_doc)
+	search_text = cstr(search_update.get("custom_search_message_body") or "").strip()
+	if search_update:
+		frappe.db.set_value(
+			TICKET_DOCTYPE,
+			ticket_name,
+			search_update,
+			update_modified=False,
+		)
 	_invalidate_communication_cache(ticket_name)
 	return search_text
 
@@ -1280,15 +1337,30 @@ def _search_candidate_ticket_names(base_filters, search):
 
 	candidate_names = set()
 
+	if frappe.db.exists(TICKET_DOCTYPE, query):
+		_append_ticket_names(
+			candidate_names,
+			frappe.get_list(
+				TICKET_DOCTYPE,
+				fields=["name"],
+				filters=_merge_filters(base_filters, [[TICKET_DOCTYPE, "name", "=", query]]),
+				page_length=1,
+			),
+		)
+		if candidate_names:
+			return candidate_names
+
 	# Core ticket fields + indexed plain-text search fields (fast — B-tree indexed).
 	# Prefer the indexed custom_search_* fields over the HTML Long Text blobs so the DB
 	# can use its index for prefix scans and avoid full-table scans on large text columns.
+	# Note: custom_search_message_body is Small Text (no B-tree index) — full table scan.
+	#       custom_search_student_names/refs/guardian_emails are Data VARCHAR(255) — indexed.
 	search_fields = ["name", "subject", "raised_by"]
 	for field in [
-		"custom_search_student_names",   # indexed Small Text — student display names
-		"custom_search_student_refs",    # indexed Small Text — student reference numbers
-		"custom_search_guardian_emails", # indexed Small Text — guardian emails
-		"custom_search_message_body",    # indexed Small Text — normalized message body keywords
+		"custom_search_student_names",   # Data VARCHAR(255), B-tree indexed — student display names
+		"custom_search_student_refs",    # Data VARCHAR(255), B-tree indexed — student reference numbers
+		"custom_search_guardian_emails", # Data VARCHAR(255), B-tree indexed — guardian emails
+		"custom_search_message_body",    # Small Text, no index — full scan fallback
 	]:
 		if _has_field(TICKET_DOCTYPE, field):
 			search_fields.append(field)
@@ -1307,7 +1379,109 @@ def _search_candidate_ticket_names(base_filters, search):
 		),
 	)
 
+	if candidate_names:
+		return candidate_names
+
 	return candidate_names
+
+
+@frappe.whitelist()
+def backfill_ticket_message_search_fields(ticket_names=None, limit=500):
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to backfill Unity search fields"), frappe.PermissionError)
+	names = [cstr(name).strip() for name in (_parse_json(ticket_names, []) or []) if cstr(name).strip()]
+	if names:
+		target_names = names
+	else:
+		fields = ["name"]
+		if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
+			fields.append("custom_search_message_body")
+		if frappe.db.has_column(TICKET_DOCTYPE, "custom_primary_message_text"):
+			fields.append("custom_primary_message_text")
+		rows = frappe.get_all(
+			TICKET_DOCTYPE,
+			fields=fields,
+			order_by="modified desc",
+			page_length=int(limit or 500),
+		)
+		target_names = [
+			cstr(row.name).strip()
+			for row in rows
+			if cstr(row.name).strip()
+			and (
+				not cstr(row.get("custom_search_message_body") or "").strip()
+				or not cstr(row.get("custom_primary_message_text") or "").strip()
+			)
+		]
+
+	updated = 0
+	for ticket_name in target_names:
+		update_ticket_message_search_index(ticket_name)
+		updated += 1
+	if updated:
+		frappe.db.commit()
+
+	return {"updated": updated, "ticket_names": target_names}
+
+
+@frappe.whitelist()
+def backfill_ticket_message_search_index(ticket_names=None, limit=500):
+	return backfill_ticket_message_search_fields(ticket_names=ticket_names, limit=limit)
+
+
+@frappe.whitelist()
+def diagnose_ticket_thread_and_search(name, text=None):
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to run Unity Helpdesk diagnostics"), frappe.PermissionError)
+
+	ticket_name = cstr(name).strip()
+	if not ticket_name:
+		frappe.throw(_("Ticket name is required"))
+
+	ticket_fields = ["name", "status", "modified", "modified_by", "subject", "raised_by"]
+	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_message_body"):
+		ticket_fields.append("custom_search_message_body")
+	ticket = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, ticket_fields, as_dict=True)
+	if not ticket:
+		frappe.throw(_("Ticket not found"), frappe.DoesNotExistError)
+
+	thread_components = get_ticket_thread_components(ticket_name)
+	search_text = cstr(ticket.get("custom_search_message_body") or "")
+	needle = _normalize_search_text(text)
+
+	return {
+		"ticket": {
+			"name": ticket.name,
+			"status": ticket.status,
+			"modified": ticket.modified,
+			"modified_by": ticket.modified_by,
+			"subject": ticket.subject,
+			"raised_by": ticket.raised_by,
+		},
+		"counts": {
+			"linked_communications": frappe.db.count(
+				"Communication",
+				{"reference_doctype": TICKET_DOCTYPE, "reference_name": ticket_name},
+			),
+			"hd_ticket_comments": frappe.db.count("HD Ticket Comment", {"reference_ticket": ticket_name}),
+			"native_communications": len(thread_components.communications),
+			"native_comments": len(thread_components.comments),
+			"native_thread": len(thread_components.thread),
+			"unity_communications": len(thread_components.communications),
+			"unity_comments": len(thread_components.comments),
+			"unity_thread": len(thread_components.thread),
+		},
+		"communication_names": [row.name for row in thread_components.communications],
+		"comment_names": [row.name for row in thread_components.comments],
+		"search": {
+			"text": text or "",
+			"normalized_text": needle,
+			"index_length": len(search_text),
+			"text_found_in_index": bool(needle and needle in search_text),
+		},
+	}
 
 
 def _build_filters(view="all", filters=None, assigned_agent=None):
@@ -1436,11 +1610,12 @@ def _ticket_type_options():
 def _log_hold_reason(ticket_name, hold_reason):
 	if not hold_reason:
 		return
+	safe_reason = frappe.utils.escape_html(cstr(hold_reason).strip())
 	frappe.get_doc(
 		{
 			"doctype": "HD Ticket Comment",
 			"commented_by": frappe.session.user,
-			"content": f"Hold Reason: {hold_reason}",
+			"content": f"Hold Reason: {safe_reason}",
 			"is_pinned": 0,
 			"reference_ticket": ticket_name,
 		}
@@ -1462,10 +1637,11 @@ def _agent_candidates():
 
 
 @frappe.whitelist()
-def get_tickets(view="all", filters=None, search=None, page_length=20, start=0):
+def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
 	capabilities = _require_unity_access()
 	page_length = int(page_length or 20)
 	start = int(start or 0)
+	search = cstr(search or message_body or "").strip()
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
 	list_filters = _build_filters(
 		"all" if search else effective_view,
@@ -1473,10 +1649,12 @@ def get_tickets(view="all", filters=None, search=None, page_length=20, start=0):
 		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
 	)
 	fields = _ticket_fields()
-	search = cstr(search or "").strip()
-
+	search_candidate_names = None
 	if search:
-		candidate_names = _search_candidate_ticket_names(list_filters, search)
+		search_candidate_names = _search_candidate_ticket_names(list_filters, search)
+	candidate_names = search_candidate_names
+
+	if candidate_names is not None:
 		candidate_rows = (
 			frappe.get_list(
 				TICKET_DOCTYPE,
@@ -1488,7 +1666,18 @@ def get_tickets(view="all", filters=None, search=None, page_length=20, start=0):
 			if candidate_names
 			else []
 		)
-		ranked_ids = _ranked_ticket_ids(candidate_rows, search)
+		ranked_ids = (
+			_ranked_ticket_ids(candidate_rows, search)
+			if search
+			else [
+				row.name
+				for row in sorted(
+					candidate_rows,
+					key=lambda row: get_datetime(row.modified),
+					reverse=True,
+				)
+			]
+		)
 		paginated_ids = ranked_ids[start : start + page_length]
 		row_map = {}
 		if paginated_ids:
@@ -1810,15 +1999,25 @@ def get_accessible_ticket_summaries(names):
 	names = _parse_json(names, []) or []
 	if not names:
 		return []
-	filters = [[TICKET_DOCTYPE, "name", "in", names]]
-	if not capabilities.can_view_all_tickets:
-		filters.append([TICKET_DOCTYPE, "_assign", "like", f"%{_session_user()}%"])
-	return frappe.get_list(
+	if capabilities.can_view_all_tickets:
+		return frappe.get_list(
+			TICKET_DOCTYPE,
+			fields=["name", "subject", "creation", "status"],
+			filters={"name": ["in", names]},
+			page_length=max(len(names), 1),
+		)
+	current_user = _session_user()
+	rows = frappe.get_list(
 		TICKET_DOCTYPE,
-		fields=["name", "subject", "creation", "status"],
-		filters=filters,
+		fields=["name", "subject", "creation", "status", "_assign"],
+		filters={"name": ["in", names]},
 		page_length=max(len(names), 1),
 	)
+	return [
+		{k: v for k, v in row.items() if k != "_assign"}
+		for row in rows
+		if current_user in frappe.parse_json(row.get("_assign") or "[]")
+	]
 
 
 @frappe.whitelist()
@@ -2006,8 +2205,6 @@ def reply(name, message, cc=None, bcc=None, attachments=None):
 		frappe.throw(_("Please enter a reply"))
 	ticket = frappe.get_doc(TICKET_DOCTYPE, name)
 	ticket.reply_via_agent(message=message, cc=cc, bcc=bcc, attachments=_parse_json(attachments, []))
-	# Invalidate the communication text cache so subsequent searches see the new reply
-	_invalidate_communication_cache(name)
 	return {"ok": True}
 
 
@@ -2029,30 +2226,44 @@ def send_open_ticket_reminders():
 		return
 
 	reminder_after_days = int(frappe.db.get_single_value("HD Settings", "unity_reminder_after_days") or 3)
-	tickets = frappe.get_list(
-		TICKET_DOCTYPE,
-		fields=["name", "subject", "raised_by", "_assign"],
-		filters=_reminder_ticket_filter(reminder_after_days),
-		page_length=0,
-	)
+	base_filters = _reminder_ticket_filter(reminder_after_days)
+	_BATCH_SIZE = 200
+	start = 0
 
-	for ticket in tickets:
-		for assignee in json.loads(ticket._assign or "[]"):
-			if not assignee:
-				continue
-			frappe.sendmail(
-				recipients=[assignee],
-				subject=f"Reminder: Ticket #{ticket.name} is still open",
-				message=(
-					f"<p>Ticket <b>#{ticket.name}</b> has been open for at least "
-					f"{reminder_after_days} days.</p>"
-					f"<p><b>Subject:</b> {frappe.utils.escape_html(ticket.subject or '')}</p>"
-					f"<p><a href='{get_url('/unity-helpdesk/tickets/' + str(ticket.name))}'>Open ticket</a></p>"
-				),
-				delayed=True,
-				reference_doctype=TICKET_DOCTYPE,
-				reference_name=ticket.name,
-			)
+	while True:
+		tickets = frappe.get_list(
+			TICKET_DOCTYPE,
+			fields=["name", "subject", "raised_by", "_assign"],
+			filters=base_filters,
+			page_length=_BATCH_SIZE,
+			limit_start=start,
+			order_by="modified asc",
+		)
+		if not tickets:
+			break
+
+		for ticket in tickets:
+			for assignee in frappe.parse_json(ticket._assign or "[]"):
+				if not assignee:
+					continue
+				safe_name = frappe.utils.escape_html(cstr(ticket.name))
+				frappe.sendmail(
+					recipients=[assignee],
+					subject=f"Reminder: Ticket #{safe_name} is still open",
+					message=(
+						f"<p>Ticket <b>#{safe_name}</b> has been open for at least "
+						f"{reminder_after_days} days.</p>"
+						f"<p><b>Subject:</b> {frappe.utils.escape_html(ticket.subject or '')}</p>"
+						f"<p><a href='{get_url('/unity-helpdesk/tickets/' + cstr(ticket.name))}'>Open ticket</a></p>"
+					),
+					delayed=True,
+					reference_doctype=TICKET_DOCTYPE,
+					reference_name=ticket.name,
+				)
+
+		start += _BATCH_SIZE
+		if len(tickets) < _BATCH_SIZE:
+			break
 
 
 @frappe.whitelist()
