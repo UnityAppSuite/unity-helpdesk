@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect width="64" height="64" rx="16" fill="url(#bg)"/>
+
+  <!-- Headset arc -->
+  <path d="M 17 31 A 15 15 0 0 1 47 31" stroke="white" stroke-width="3" stroke-linecap="round"/>
+
+  <!-- Left ear cup -->
+  <rect x="12" y="29" width="8" height="12" rx="4" fill="white"/>
+
+  <!-- Right ear cup -->
+  <rect x="44" y="29" width="8" height="12" rx="4" fill="white"/>
+
+  <!-- Face panel -->
+  <rect x="19" y="29" width="26" height="20" rx="7" fill="white"/>
+
+  <!-- Left eye -->
+  <circle cx="27" cy="37" r="2.2" fill="#6d28d9"/>
+
+  <!-- Right eye -->
+  <circle cx="37" cy="37" r="2.2" fill="#6d28d9"/>
+
+  <!-- Smile -->
+  <path d="M 26 43 Q 32 47.5 38 43" stroke="#6d28d9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Mic stem -->
+  <rect x="30" y="49" width="4" height="4" rx="2" fill="white" opacity="0.8"/>
+
+  <!-- Mic horizontal bar -->
+  <rect x="27" y="52" width="10" height="2.5" rx="1.25" fill="white" opacity="0.7"/>
+</svg>

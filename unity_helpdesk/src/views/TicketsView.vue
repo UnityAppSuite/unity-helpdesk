@@ -42,12 +42,22 @@
       <div class="search-wrapper">
         <span class="search-icon">🔍</span>
         <input
+          ref="searchInput"
           v-model="draftSearch"
           class="search"
           type="text"
-          placeholder="Ticket ID, student name, reference no., guardian email or message keyword…"
+          placeholder="Ticket ID, student, ref no., email, subject, mail body…"
+          aria-label="Search tickets (press Ctrl+K to focus)"
           @keyup.enter="submitSearch"
+          @focus="searchFocused = true"
+          @blur="onSearchBlur"
         />
+        <kbd
+          v-if="!draftSearch && !searchFocused"
+          class="search-shortcut"
+          aria-hidden="true"
+          >{{ shortcutLabel }}</kbd
+        >
         <span
           v-if="loading && appliedSearch"
           class="search-loading"
@@ -63,6 +73,31 @@
         >
           ✕
         </button>
+        <ul
+          v-if="
+            searchFocused && !draftSearch.trim() && recentSearches.length
+          "
+          class="recent-searches"
+          @mousedown.prevent
+        >
+          <li class="recent-searches__heading">Recent searches</li>
+          <li
+            v-for="(item, idx) in recentSearches"
+            :key="`${item}-${idx}`"
+            class="recent-searches__item"
+            @click="useRecentSearch(item)"
+          >
+            <span class="recent-searches__term">{{ item }}</span>
+            <button
+              type="button"
+              class="recent-searches__remove"
+              title="Remove from recent"
+              @click.stop="removeRecentSearch(item)"
+            >
+              ✕
+            </button>
+          </li>
+        </ul>
       </div>
       <button
         class="btn secondary toolbar-search"
@@ -111,7 +146,7 @@
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
       <p v-else-if="!tickets.length && appliedSearch" class="empty">
-        No tickets found for <strong>"{{ appliedSearch }}"</strong> — try a
+        No tickets found for <strong>{{ activeFilterSummary }}</strong> — try a
         shorter or different term.
       </p>
       <p v-else-if="!tickets.length" class="empty">{{ emptyMessage }}</p>
@@ -277,7 +312,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   call,
@@ -319,6 +354,87 @@ const filters = reactive({
 let activeController = null;
 let activeRequestId = 0;
 
+// --- Search UX helpers ---
+const RECENT_SEARCH_KEY = "unity-helpdesk:recent-searches";
+const RECENT_SEARCH_LIMIT = 8;
+const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+const shortcutLabel = isMac ? "⌘K" : "Ctrl+K";
+
+const searchInput = ref(null);
+const searchFocused = ref(false);
+const recentSearches = ref([]);
+
+function loadRecentSearches() {
+  try {
+    const raw = localStorage.getItem(RECENT_SEARCH_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    recentSearches.value = Array.isArray(parsed)
+      ? parsed.filter((s) => typeof s === "string" && s.trim()).slice(0, RECENT_SEARCH_LIMIT)
+      : [];
+  } catch {
+    recentSearches.value = [];
+  }
+}
+
+function persistRecentSearches() {
+  try {
+    localStorage.setItem(RECENT_SEARCH_KEY, JSON.stringify(recentSearches.value));
+  } catch {
+    /* storage unavailable — ignore */
+  }
+}
+
+function rememberSearch(term) {
+  const value = (term || "").trim();
+  if (!value) return;
+  const next = [value, ...recentSearches.value.filter((s) => s !== value)];
+  recentSearches.value = next.slice(0, RECENT_SEARCH_LIMIT);
+  persistRecentSearches();
+}
+
+function removeRecentSearch(term) {
+  recentSearches.value = recentSearches.value.filter((s) => s !== term);
+  persistRecentSearches();
+}
+
+function useRecentSearch(term) {
+  draftSearch.value = term;
+  searchFocused.value = false;
+  submitSearch();
+}
+
+function onSearchBlur() {
+  // Delay so click on a recent-search item registers before the dropdown closes.
+  setTimeout(() => {
+    searchFocused.value = false;
+  }, 120);
+}
+
+function focusSearchInput() {
+  const el = searchInput.value;
+  if (el && typeof el.focus === "function") {
+    el.focus();
+    el.select?.();
+  }
+}
+
+function onGlobalKeydown(event) {
+  // Ctrl/Cmd+K → focus search; Esc with input focused → blur it.
+  const isShortcut =
+    (event.ctrlKey || event.metaKey) &&
+    !event.shiftKey &&
+    !event.altKey &&
+    (event.key === "k" || event.key === "K");
+  if (isShortcut) {
+    event.preventDefault();
+    focusSearchInput();
+    return;
+  }
+  if (event.key === "Escape" && document.activeElement === searchInput.value) {
+    searchInput.value?.blur();
+  }
+}
+
 const title = computed(() =>
   props.view === "my" ? "My Tickets" : "All Tickets"
 );
@@ -327,6 +443,9 @@ const canLoadMore = computed(
   () => tickets.value.length < (result.total_count || 0)
 );
 const cards = computed(() => result.cards || {});
+const activeFilterSummary = computed(() => {
+  return `search: "${appliedSearch.value.trim()}"`;
+});
 
 watch(
   () => [props.view, route.fullPath],
@@ -340,12 +459,25 @@ watch(
 
 onMounted(async () => {
   applyRouteState();
+  loadRecentSearches();
+  if (typeof window !== "undefined") {
+    window.addEventListener("keydown", onGlobalKeydown);
+  }
   await loadLookups();
 });
 
+onBeforeUnmount(() => {
+  if (typeof window !== "undefined") {
+    window.removeEventListener("keydown", onGlobalKeydown);
+  }
+});
+
 function applyRouteState() {
-  draftSearch.value = String(route.query.search || "");
-  appliedSearch.value = String(route.query.search || "");
+  const routeSearch = String(
+    route.query.search || route.query.message_body || ""
+  );
+  draftSearch.value = routeSearch;
+  appliedSearch.value = routeSearch;
   filters.status = String(route.query.status || "");
   filters.priority = String(route.query.priority || "");
   filters.ticket_type = String(route.query.ticket_type || "");
@@ -394,6 +526,7 @@ async function reload() {
 function routeQueryFromState() {
   return {
     ...route.query,
+    message_body: undefined,
     status: filters.status || undefined,
     priority: filters.priority || undefined,
     ticket_type: filters.ticket_type || undefined,
@@ -403,22 +536,42 @@ function routeQueryFromState() {
   };
 }
 
+function compactQuery(query) {
+  return Object.fromEntries(
+    Object.entries(query || {}).filter(([, value]) => value !== undefined)
+  );
+}
+
+function sameQuery(left, right) {
+  return (
+    JSON.stringify(compactQuery(left)) === JSON.stringify(compactQuery(right))
+  );
+}
+
+async function replaceRouteOrReload() {
+  const nextQuery = routeQueryFromState();
+  if (sameQuery(route.query, nextQuery)) {
+    await reload();
+    return;
+  }
+  await router.replace({ query: nextQuery });
+}
+
 async function applyFiltersAndReload() {
-  await router.replace({ query: routeQueryFromState() });
-  await reload();
+  await replaceRouteOrReload();
 }
 
-function submitSearch() {
+async function submitSearch() {
   appliedSearch.value = draftSearch.value.trim();
-  router.replace({ query: routeQueryFromState() });
-  reload();
+  rememberSearch(appliedSearch.value);
+  searchFocused.value = false;
+  await replaceRouteOrReload();
 }
 
-function clearSearch() {
+async function clearSearch() {
   draftSearch.value = "";
   appliedSearch.value = "";
-  router.replace({ query: routeQueryFromState() });
-  reload();
+  await replaceRouteOrReload();
 }
 
 function refreshList() {

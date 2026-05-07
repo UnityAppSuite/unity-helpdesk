@@ -116,11 +116,19 @@ class HDAgent(Document):
 				if skip:
 					continue
 
+				# Capture user count BEFORE the append so we can tell apart a
+				# self-disabled empty rule (auto-recoverable) from a populated
+				# rule that an admin manually disabled (must stay disabled).
+				was_empty_before_add = not (rule_doc.users and len(rule_doc.users) > 0)
+
 				user_doc = frappe.get_doc(
 					{"doctype": "Assignment Rule User", "user": self.user}
 				)
 				rule_doc.append("users", user_doc)
-				rule_doc.disabled = False  # enable the rule if it is disabled
+				# Only auto-enable when recovering from the empty/self-disabled state.
+				# A populated + disabled rule was disabled on purpose — respect that.
+				if was_empty_before_add:
+					rule_doc.disabled = False
 				rule_doc.save(ignore_permissions=True)
 
 	def remove_from_support_rotations(self, group=None):

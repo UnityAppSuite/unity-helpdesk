@@ -39,6 +39,8 @@
   "column_break_unity_reminders",
   "unity_reminder_after_days",
   "unity_email_thread_layout",
+  "enable_auto_reply",
+  "auto_reply_email_template",
   "misc_tab",
   "toasts_column",
   "suppress_default_email_toast",
@@ -260,6 +262,19 @@
   },
   {
    "default": "0",
+   "fieldname": "enable_auto_reply",
+   "fieldtype": "Check",
+   "label": "Enable Auto Reply on New Ticket"
+  },
+  {
+   "depends_on": "eval:doc.enable_auto_reply",
+   "fieldname": "auto_reply_email_template",
+   "fieldtype": "Link",
+   "label": "Auto Reply Email Template",
+   "options": "Email Template"
+  },
+  {
+   "default": "0",
    "fieldname": "prefer_knowledge_base",
    "fieldtype": "Check",
    "label": "Prefer knowledge base"
@@ -282,7 +297,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2023-08-23 17:59:49.761375",
+ "modified": "2026-04-30 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Helpdesk",
  "name": "HD Settings",

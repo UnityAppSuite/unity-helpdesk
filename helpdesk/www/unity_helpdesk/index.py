@@ -10,4 +10,3 @@ def get_context(context):
 	context.frappe_version = frappe.__version__
 	context.helpdesk_version = __version__
 	context.site_name = frappe.local.site
-	frappe.db.commit()

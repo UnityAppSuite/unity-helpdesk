@@ -192,12 +192,13 @@ class HDTicket(Document):
 			update_ticket_message_search_index(self.name, ticket_doc=self)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index after_insert")
+		self.validate_auto_reply()
 
 	def on_update(self):
 		if self.status == "Open":
 			if self.get_doc_before_save() and self.get_doc_before_save().status != "Open":
 				
-				agent = json.loads(self._assign)
+				agent = frappe.parse_json(self._assign or "[]")
 				if len(agent) > 0:
 					self.notify_agent(agent[0], "Reaction")
 		
@@ -211,14 +212,14 @@ class HDTicket(Document):
 			update_ticket_message_search_index(self.name, ticket_doc=self)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
-	
-	def notify_agent(self, agent, notiification_type="Assignment"):
+
+	def notify_agent(self, agent, notification_type="Assignment"):
 		frappe.get_doc(frappe._dict(
 			doctype="HD Notification",
 			user_from=frappe.session.user,
 			reference_ticket=self.name,
 			user_to=agent,
-			notification_type=notiification_type,
+			notification_type=notification_type,
 		)).insert(ignore_permissions=True)
 
 	def update_search_index(self):
@@ -355,7 +356,7 @@ class HDTicket(Document):
 			return
 
 		if self._assign:
-			assignees = json.loads(self._assign)
+			assignees = frappe.parse_json(self._assign or "[]")
 			for assignee in assignees:
 				if agent == assignee:
 					# the agent is already set as an assignee
@@ -369,7 +370,7 @@ class HDTicket(Document):
 	def get_assigned_agent(self):
 		# for some reason _assign is not set, maybe a framework bug?
 		if hasattr(self, "_assign") and self._assign:
-			assignees = json.loads(self._assign)
+			assignees = frappe.parse_json(self._assign or "[]")
 			if len(assignees) > 0:
 				agent_doc = frappe.get_doc("HD Agent", assignees[0])
 				return agent_doc
@@ -503,6 +504,12 @@ class HDTicket(Document):
 
 		communication.insert(ignore_permissions=True)
 		capture_event("agent_replied")
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index reply_via_agent")
 
 		_attachments = []
 
@@ -581,6 +588,15 @@ class HDTicket(Document):
 		c.ignore_permissions = True
 		c.ignore_mandatory = True
 		c.save(ignore_permissions=True)
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name, ticket_doc=self)
+		except Exception:
+			frappe.log_error(
+				frappe.get_traceback(),
+				"HD Ticket message search index create_communication_via_contact",
+			)
 
 		if not len(attachments):
 			return
@@ -709,6 +725,50 @@ class HDTicket(Document):
 		self.description = self.description or c.content
 		# Save the ticket, allowing for hooks to run.
 		self.save()
+		# Rebuild the message search index so new email content is immediately searchable.
+		# on_update only rebuilds when description/subject changes — it misses new Communications.
+		try:
+			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+			update_ticket_message_search_index(self.name)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket search index on_communication_update")
+
+	def validate_auto_reply(self):
+		try:
+			settings = frappe.get_single("HD Settings")
+			template_name = getattr(settings, "auto_reply_email_template", None)
+			if getattr(settings, "enable_auto_reply", 0) and template_name:
+				self._send_auto_reply(template_name)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "HD Ticket auto reply")
+
+	def _send_auto_reply(self, template_name):
+		from frappe.core.doctype.communication.email import make
+
+		template = frappe.get_doc("Email Template", template_name)
+		context = self.as_dict()
+		subject = frappe.render_template(template.subject, context=context)
+		message = frappe.render_template(template.response, context=context)
+		email_accounts = frappe.get_all(
+			"Email Account", filters={"enable_outgoing": 1}, limit=1
+		)
+		if not email_accounts:
+			return
+		email_account = frappe.get_doc("Email Account", email_accounts[0].name)
+		make(
+			doctype=self.doctype,
+			name=self.name,
+			subject=subject,
+			content=message,
+			sender=email_account.email_id,
+			sender_full_name=email_account.name,
+			send_email=True,
+			recipients=self.raised_by,
+			sent_or_received="Sent",
+			communication_type="Communication",
+			now=True,
+		)
 	
 	@staticmethod
 	def default_list_data():
