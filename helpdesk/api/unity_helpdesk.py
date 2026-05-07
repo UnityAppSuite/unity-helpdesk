@@ -147,11 +147,12 @@ def _require_ticket_access(name, capabilities=None):
 	capabilities = capabilities or _require_unity_access()
 	if capabilities.can_view_all_tickets:
 		return
-	assign_value = frappe.db.get_value(TICKET_DOCTYPE, name, "_assign")
-	if assign_value is None:
+	# Fetch (name, _assign) so we can tell apart a missing row from one with NULL _assign.
+	row = frappe.db.get_value(TICKET_DOCTYPE, name, ["name", "_assign"], as_dict=True)
+	if not row:
 		frappe.throw(_("Ticket not found"), frappe.DoesNotExistError)
-	assigned = frappe.parse_json(assign_value or "[]")
-	if _session_user() not in (assigned or []):
+	assigned = frappe.parse_json(row.get("_assign") or "[]") or []
+	if _session_user() not in assigned:
 		frappe.throw(_("You do not have access to this ticket"), frappe.PermissionError)
 
 
@@ -574,7 +575,14 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 	if all_guardian_ids:
 		for row in frappe.get_all(
 			"Guardian",
-			fields=["name", "guardian_name", "email_address", "user"],
+			fields=[
+				"name",
+				"guardian_name",
+				"email_address",
+				"user",
+				"mobile_number",
+				"alternate_number",
+			],
 			filters={"name": ["in", all_guardian_ids]},
 			page_length=0,
 		):
@@ -675,6 +683,7 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 		]
 		guardian_names = []
 		guardian_emails = []
+		guardian_cards = []
 		for guardian_id in student_guardian_ids:
 			guardian_doc = guardian_docs.get(guardian_id) or {}
 			guardian_name = cstr(
@@ -683,6 +692,7 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			).strip()
 			if guardian_name:
 				guardian_names.append(guardian_name)
+			email_for_card = ""
 			for email_value in [
 				guardian_doc.get("email_address"),
 				guardian_doc.get("user"),
@@ -690,6 +700,16 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				email_text = cstr(email_value).strip().lower()
 				if email_text:
 					guardian_emails.append(email_text)
+					email_for_card = email_for_card or email_text
+			guardian_cards.append(
+				{
+					"id": guardian_id,
+					"name": guardian_name,
+					"email": email_for_card,
+					"mobile": cstr(guardian_doc.get("mobile_number") or "").strip(),
+					"alternate_mobile": cstr(guardian_doc.get("alternate_number") or "").strip(),
+				}
+			)
 
 		next_schedule = _next_payment_schedule(
 			payment_schedule_by_fee.get(selected_fee.get("name"), []) if selected_fee else []
@@ -711,6 +731,7 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"guardian_ids": student_guardian_ids,
 				"guardian_names": sorted(set(guardian_names)),
 				"guardian_emails": sorted(set(guardian_emails)),
+				"guardians": guardian_cards,
 				"reference_number": student.get("reference_number"),
 				"enrollment": (
 					{
@@ -1168,7 +1189,7 @@ def _ticket_search_documents(ticket_rows):
 	return documents
 
 
-def _rank_ticket_document(document, query, tokens):
+def _rank_ticket_document(document, query, tokens, family_terms=None):
 	if not query:
 		return None
 
@@ -1183,6 +1204,26 @@ def _rank_ticket_document(document, query, tokens):
 	student_names = document.get("student_names", [])
 	subject_text = document.get("subject_text", "")
 	content_text = document.get("content_text", "")
+
+	# Family-aware match: when the user searched a guardian email, accept any
+	# ticket whose identity links to the same family (even if the literal
+	# query string isn't anywhere on the ticket). Treated as Tier-2 — same
+	# tier as a direct email match — so it ranks above content matches.
+	if family_terms:
+		doc_emails_lc = {e.lower() for e in identity_emails if e}
+		fam_emails_lc = {e.lower() for e in family_terms.get("emails") or []}
+		if doc_emails_lc & fam_emails_lc:
+			return (2, 0)
+		raised_by = (document.get("raised_by") or "").lower()
+		for sid in family_terms.get("student_ids") or []:
+			if sid and f"{sid.lower()}@" in raised_by:
+				return (2, 0)
+		fam_refs_lc = {r.lower() for r in family_terms.get("student_refs") or []}
+		if {r.lower() for r in student_refs if r} & fam_refs_lc:
+			return (2, 0)
+		fam_names_lc = {n.lower() for n in family_terms.get("student_names") or []}
+		if {n.lower() for n in student_names if n} & fam_names_lc:
+			return (2, 0)
 
 	if ticket_id == query:
 		return (0, 0)
@@ -1221,14 +1262,18 @@ def _rank_ticket_document(document, query, tokens):
 	return None
 
 
-def _ranked_ticket_ids(ticket_rows, search):
+def _ranked_ticket_ids(ticket_rows, search, family_terms=None):
 	query = _normalize_search_text(search)
 	tokens = _search_tokens(search)
 	documents = _ticket_search_documents(ticket_rows)
 	ranked = []
 	for row in ticket_rows:
 		document = documents.get(row.name)
-		rank = _rank_ticket_document(document, query, tokens) if document else None
+		rank = (
+			_rank_ticket_document(document, query, tokens, family_terms=family_terms)
+			if document
+			else None
+		)
 		if rank is None:
 			continue
 		ranked.append((rank, get_datetime(row.modified), row.name))
@@ -1333,6 +1378,114 @@ def _related_emails_for_search(search):
 	return emails
 
 
+_EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+def _looks_like_email(value):
+	return bool(_EMAIL_RE.match(cstr(value or "").strip()))
+
+
+def _expand_email_to_family_search_terms(email):
+	"""Given a guardian email, return every search term that identifies the
+	whole family: every guardian's email + the students' login emails + the
+	students' reference numbers + the students' display names + the student
+	IDs themselves. Searching by one parent's email then surfaces every
+	ticket associated with the family, including ones raised by the student
+	directly or indexed only by student ref/name."""
+	email = cstr(email or "").strip().lower()
+	terms = {
+		"emails": {email} if email else set(),
+		"student_refs": set(),
+		"student_names": set(),
+		"student_ids": set(),
+	}
+	if not email:
+		return terms
+	if not (_has_doctype("Guardian") and _has_doctype("Student Guardian")):
+		return terms
+
+	guardian_ids = set()
+	for row in frappe.get_all(
+		"Guardian",
+		fields=["name"],
+		filters={"email_address": email},
+		page_length=0,
+	):
+		guardian_ids.add(row.name)
+	for row in frappe.get_all(
+		"Guardian",
+		fields=["name"],
+		filters={"user": email},
+		page_length=0,
+	):
+		guardian_ids.add(row.name)
+	if not guardian_ids:
+		return terms
+
+	student_ids = set()
+	for row in frappe.get_all(
+		"Student Guardian",
+		fields=["parent"],
+		filters={"parenttype": "Student", "guardian": ["in", list(guardian_ids)]},
+		page_length=0,
+	):
+		if row.parent:
+			student_ids.add(row.parent)
+	if not student_ids:
+		return terms
+
+	family_guardian_ids = set()
+	for row in frappe.get_all(
+		"Student Guardian",
+		fields=["guardian"],
+		filters={"parenttype": "Student", "parent": ["in", list(student_ids)]},
+		page_length=0,
+	):
+		if row.guardian:
+			family_guardian_ids.add(row.guardian)
+	if family_guardian_ids:
+		for row in frappe.get_all(
+			"Guardian",
+			fields=["email_address", "user"],
+			filters={"name": ["in", list(family_guardian_ids)]},
+			page_length=0,
+		):
+			for value in (row.email_address, row.user):
+				text = cstr(value or "").strip().lower()
+				if text:
+					terms["emails"].add(text)
+
+	# Pull each student's identifiers: id, ref, name, login email.
+	if _has_doctype("Student"):
+		for row in frappe.get_all(
+			"Student",
+			fields=["name", "first_name", "last_name", "reference_number", "user"],
+			filters={"name": ["in", list(student_ids)]},
+			page_length=0,
+		):
+			terms["student_ids"].add(cstr(row.name).strip())
+			ref = cstr(row.get("reference_number") or "").strip()
+			if ref:
+				terms["student_refs"].add(ref)
+			full_name = " ".join(
+				p
+				for p in (cstr(row.get("first_name") or ""), cstr(row.get("last_name") or ""))
+				if p.strip()
+			).strip()
+			if full_name:
+				terms["student_names"].add(full_name)
+			user_email = cstr(row.get("user") or "").strip().lower()
+			if user_email:
+				terms["emails"].add(user_email)
+
+	return terms
+
+
+def _expand_email_to_family_emails(email):
+	"""Backward-compat shim — kept so external callers still work."""
+	return _expand_email_to_family_search_terms(email)["emails"]
+
+
 def _search_candidate_ticket_names(base_filters, search):
 	query = cstr(search or "").strip()
 	if not query:
@@ -1340,6 +1493,7 @@ def _search_candidate_ticket_names(base_filters, search):
 
 	candidate_names = set()
 
+	# Fast path: user typed an exact ticket ID.
 	if frappe.db.exists(TICKET_DOCTYPE, query):
 		_append_ticket_names(
 			candidate_names,
@@ -1353,38 +1507,141 @@ def _search_candidate_ticket_names(base_filters, search):
 		if candidate_names:
 			return candidate_names
 
-	# Core ticket fields + indexed plain-text search fields (fast — B-tree indexed).
-	# Prefer the indexed custom_search_* fields over the HTML Long Text blobs so the DB
-	# can use its index for prefix scans and avoid full-table scans on large text columns.
-	# Note: custom_search_message_body is Small Text (no B-tree index) — full table scan.
-	#       custom_search_student_names/refs/guardian_emails are Data VARCHAR(255) — indexed.
+	# Build the searchable column list dynamically — Data fields are indexed, the
+	# message body is a Small Text full-scan fallback.
 	search_fields = ["name", "subject", "raised_by"]
 	for field in [
-		"custom_search_student_names",   # Data VARCHAR(255), B-tree indexed — student display names
-		"custom_search_student_refs",    # Data VARCHAR(255), B-tree indexed — student reference numbers
-		"custom_search_guardian_emails", # Data VARCHAR(255), B-tree indexed — guardian emails
-		"custom_search_message_body",    # Small Text, no index — full scan fallback
+		"custom_search_student_names",
+		"custom_search_student_refs",
+		"custom_search_guardian_emails",
+		"custom_search_message_body",
 	]:
 		if _has_field(TICKET_DOCTYPE, field):
 			search_fields.append(field)
 
-	or_filters = [[TICKET_DOCTYPE, field, "like", _like_pattern(query)] for field in search_fields]
+	# Guardian-email family expansion: if the query is a single email, surface
+	# every ticket associated with the family. We expand to:
+	#   - every guardian's email + student login emails
+	#   - every student id / reference number / display name
+	# and OR-search across raised_by and the indexed Data fields. This is robust
+	# to historical tickets that were indexed before all guardians were linked
+	# (e.g. ticket raised by the student themselves with only raised_by populated).
+	if _looks_like_email(query):
+		terms = _expand_email_to_family_search_terms(query)
+		family_emails = terms["emails"]
+		family_refs = terms["student_refs"]
+		family_names = terms["student_names"]
+		family_ids = terms["student_ids"]
+		# Only enter the expanded path when expansion actually found something
+		# beyond the literal query (otherwise fall through to normal token search).
+		expanded = (
+			len(family_emails) > 1
+			or family_refs
+			or family_names
+			or family_ids
+		)
+		if expanded:
+			or_filters = []
+			for email in family_emails:
+				or_filters.append([TICKET_DOCTYPE, "raised_by", "=", email])
+				if _has_field(TICKET_DOCTYPE, "custom_search_guardian_emails"):
+					or_filters.append(
+						[
+							TICKET_DOCTYPE,
+							"custom_search_guardian_emails",
+							"like",
+							f"%{email}%",
+						]
+					)
+				# Some tickets are raised by the student's own login (waca78@…) —
+				# those won't be in custom_search_guardian_emails, so the raised_by
+				# equality covers them.
+			if _has_field(TICKET_DOCTYPE, "custom_search_student_refs"):
+				for ref in family_refs:
+					or_filters.append(
+						[TICKET_DOCTYPE, "custom_search_student_refs", "like", f"%{ref}%"]
+					)
+			if _has_field(TICKET_DOCTYPE, "custom_search_student_names"):
+				for sname in family_names:
+					or_filters.append(
+						[TICKET_DOCTYPE, "custom_search_student_names", "like", f"%{sname}%"]
+					)
+			# Many tickets have raised_by = "<student-id>@<domain>" — a substring
+			# match on the local part lets us catch them even if the domain
+			# isn't in the family email set.
+			for student_id in family_ids:
+				or_filters.append(
+					[TICKET_DOCTYPE, "raised_by", "like", f"%{student_id}@%"]
+				)
+			_append_ticket_names(
+				candidate_names,
+				frappe.get_list(
+					TICKET_DOCTYPE,
+					fields=["name"],
+					filters=base_filters,
+					or_filters=or_filters,
+					order_by="modified desc",
+					page_length=MAX_SEARCH_CANDIDATES,
+				),
+			)
+			return candidate_names
 
-	_append_ticket_names(
-		candidate_names,
-		frappe.get_list(
+	# Tokenize the query the same way the index was tokenized (HTML-stripped,
+	# lowercase, alphanumerics + @._-). This makes pasted chunks of email body
+	# match even though the index has normalized whitespace and stripped tags.
+	# Pasting the entire customer mail used to fail because LIKE %<200 chars>%
+	# could not span the indexed/normalized whitespace boundaries.
+	tokens = _search_tokens(query)
+	# Drop very short tokens (1-2 chars) — they explode candidate sets and rarely help.
+	# Keep "to", "of"-length only when the *entire* query is short, so single-letter
+	# searches like "AC" still work.
+	if len(tokens) > 1:
+		tokens = [t for t in tokens if len(t) >= 3]
+	# Cap to keep the worst-case at MAX_SEARCH_TOKENS DB round-trips.
+	MAX_SEARCH_TOKENS = 8
+	tokens = tokens[:MAX_SEARCH_TOKENS]
+
+	if not tokens:
+		# Fall back to substring match on the raw query so users with quoted
+		# punctuation/short queries that tokenize to nothing still get results.
+		or_filters = [
+			[TICKET_DOCTYPE, field, "like", _like_pattern(query)] for field in search_fields
+		]
+		_append_ticket_names(
+			candidate_names,
+			frappe.get_list(
+				TICKET_DOCTYPE,
+				fields=["name"],
+				filters=base_filters,
+				or_filters=or_filters,
+				order_by="modified desc",
+				page_length=MAX_SEARCH_CANDIDATES,
+			),
+		)
+		return candidate_names
+
+	# Multi-token: each token must match in at least one searchable field
+	# (AND-of-OR). One DB query per token, then intersect.
+	per_token_sets = []
+	for token in tokens:
+		or_filters = [
+			[TICKET_DOCTYPE, field, "like", f"%{token}%"] for field in search_fields
+		]
+		rows = frappe.get_list(
 			TICKET_DOCTYPE,
 			fields=["name"],
 			filters=base_filters,
 			or_filters=or_filters,
 			order_by="modified desc",
 			page_length=MAX_SEARCH_CANDIDATES,
-		),
-	)
+		)
+		token_set = {row.name for row in rows}
+		if not token_set:
+			# Any required token with zero matches → AND-intersection is empty.
+			return set()
+		per_token_sets.append(token_set)
 
-	if candidate_names:
-		return candidate_names
-
+	candidate_names = set.intersection(*per_token_sets) if per_token_sets else set()
 	return candidate_names
 
 
@@ -1653,8 +1910,21 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 	)
 	fields = _ticket_fields()
 	search_candidate_names = None
+	search_family_terms = None
 	if search:
 		search_candidate_names = _search_candidate_ticket_names(list_filters, search)
+		# When the search is a guardian email, we expanded to the whole family.
+		# Pass the expansion to the ranker so it accepts family matches as
+		# Tier-2 hits even when the literal email isn't on the ticket.
+		if _looks_like_email(search):
+			expanded = _expand_email_to_family_search_terms(search)
+			if (
+				len(expanded.get("emails") or set()) > 1
+				or expanded.get("student_refs")
+				or expanded.get("student_names")
+				or expanded.get("student_ids")
+			):
+				search_family_terms = expanded
 	candidate_names = search_candidate_names
 
 	if candidate_names is not None:
@@ -1670,7 +1940,7 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 			else []
 		)
 		ranked_ids = (
-			_ranked_ticket_ids(candidate_rows, search)
+			_ranked_ticket_ids(candidate_rows, search, family_terms=search_family_terms)
 			if search
 			else [
 				row.name

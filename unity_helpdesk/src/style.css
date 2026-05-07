@@ -307,6 +307,83 @@ nav a.router-link-active {
   50% { opacity: 0.4; }
 }
 
+.toolbar .search-shortcut {
+  position: absolute;
+  right: 0.5rem;
+  pointer-events: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border, #d1d5db);
+  background: var(--surface-2, #f3f4f6);
+  color: var(--muted, #6b7280);
+  letter-spacing: 0.3px;
+}
+
+.recent-searches {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+  z-index: 25;
+  max-height: 280px;
+  overflow-y: auto;
+}
+
+.recent-searches__heading {
+  padding: 6px 12px;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted, #6b7280);
+}
+
+.recent-searches__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--text, #111827);
+}
+
+.recent-searches__item:hover {
+  background: var(--surface-2, #f3f4f6);
+}
+
+.recent-searches__term {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-searches__remove {
+  background: none;
+  border: none;
+  color: var(--muted, #9ca3af);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+  margin-left: 8px;
+}
+
+.recent-searches__remove:hover {
+  background: var(--border, #e5e7eb);
+  color: var(--text, #111);
+}
+
 .dashboard-page {
   display: flex;
   flex-direction: column;
@@ -1252,6 +1329,41 @@ tbody tr:hover {
 .student-context-banner--success {
   background: #ecfdf5;
   border-color: #bbf7d0;
+}
+
+.guardian-context {
+  margin-top: 12px;
+}
+
+.guardian-context__title {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+}
+
+.guardian-context-table {
+  min-width: 520px;
+}
+
+.guardian-context-table th {
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+}
+
+.guardian-context-table td {
+  font-size: 13px;
+}
+
+.guardian-context-table__alt {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
 }
 
 .student-context-banner--info {

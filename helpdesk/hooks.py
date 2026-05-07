@@ -43,6 +43,18 @@ doc_events = {
 	"Assignment Rule": {
 		"on_trash": "helpdesk.overrides.on_assignment_rule_trash",
 	},
+	# Keep the unity search index resilient to whatever override another app installs
+	# on HD Ticket / Communication / HD Ticket Comment. doc_events run alongside class
+	# methods, so even if an override skips super(), search stays fresh.
+	"HD Ticket": {
+		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_ticket_after_insert",
+	},
+	"Communication": {
+		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_communication_after_insert",
+	},
+	"HD Ticket Comment": {
+		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_comment_after_insert",
+	},
 }
 
 has_permission = {

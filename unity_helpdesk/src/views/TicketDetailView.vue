@@ -101,6 +101,42 @@
                 </tbody>
               </table>
             </div>
+
+            <div
+              v-if="showGuardianTable && guardianRows.length"
+              class="scroll-x guardian-context"
+            >
+              <h4 class="guardian-context__title">Guardian Details</h4>
+              <table class="compact-info-table guardian-context-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Mobile</th>
+                    <th>Email</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="g in guardianRows" :key="g.key">
+                    <td>{{ g.name || "-" }}</td>
+                    <td>
+                      <a v-if="g.mobile" :href="`tel:${g.mobile}`">{{ g.mobile }}</a>
+                      <span v-else>-</span>
+                      <small
+                        v-if="g.alternate_mobile"
+                        class="guardian-context-table__alt"
+                      >
+                        alt:
+                        <a :href="`tel:${g.alternate_mobile}`">{{ g.alternate_mobile }}</a>
+                      </small>
+                    </td>
+                    <td>
+                      <a v-if="g.email" :href="`mailto:${g.email}`">{{ g.email }}</a>
+                      <span v-else>-</span>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
           <div v-else-if="studentRows.length" class="detail-body compact-body">
             <div class="scroll-x">
@@ -700,6 +736,32 @@ const structuredStudentRows = computed(() => {
       html: formatter(student),
     })),
   }));
+});
+const showGuardianTable = computed(
+  () =>
+    !studentContext.value.siblings_present &&
+    structuredStudents.value.length > 0
+);
+const guardianRows = computed(() => {
+  // No-sibling case: collect distinct guardians across the (single) primary student.
+  if (!showGuardianTable.value) return [];
+  const seen = new Map();
+  for (const student of structuredStudents.value) {
+    const guardians = student.guardians || [];
+    for (const g of guardians) {
+      const dedupeKey =
+        (g.id || "") + "|" + (g.email || "") + "|" + (g.mobile || "");
+      if (seen.has(dedupeKey)) continue;
+      seen.set(dedupeKey, {
+        key: dedupeKey,
+        name: g.name || "",
+        mobile: g.mobile || "",
+        alternate_mobile: g.alternate_mobile || "",
+        email: g.email || "",
+      });
+    }
+  }
+  return [...seen.values()];
 });
 const studentRows = computed(() => parsedDescription.value.students);
 const feeRows = computed(() => parsedDescription.value.fees);
