@@ -847,10 +847,11 @@ def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=Non
 			continue
 		return content_html, _normalize_search_text(content_html)
 
-	if ticket_doc and not communication_rows:
-		description_html = cstr(ticket_doc.get("description") or "").strip()
-		if description_html:
-			return description_html, _normalize_search_text(description_html)
+	# Fallback to description regardless of whether other (Sent) comms exist.
+	# Without this, tickets where only agent comms exist show no primary message.
+	description_html = cstr(ticket_doc.get("description") or "").strip() if ticket_doc else ""
+	if description_html:
+		return description_html, _normalize_search_text(description_html)
 
 	return "", ""
 
@@ -878,7 +879,9 @@ def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
 	for row in thread_components.comments:
 		parts.append(_normalize_search_text(row.content))
 
-	if ticket_doc and not communication_rows:
+	# Always include the ticket description so the original customer message is searchable
+	# even after communications are added to the thread.
+	if ticket_doc:
 		parts.append(_normalize_search_text(ticket_doc.get("description")))
 
 	combined = _truncate_search_text(" ".join(part for part in parts if part))

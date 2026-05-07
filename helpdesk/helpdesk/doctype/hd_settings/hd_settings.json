@@ -39,6 +39,8 @@
   "column_break_unity_reminders",
   "unity_reminder_after_days",
   "unity_email_thread_layout",
+  "enable_auto_reply",
+  "auto_reply_email_template",
   "misc_tab",
   "toasts_column",
   "suppress_default_email_toast",
@@ -257,6 +259,19 @@
    "fieldtype": "Select",
    "label": "Unity Email Thread Layout",
    "options": "Classic\nChat Based"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_auto_reply",
+   "fieldtype": "Check",
+   "label": "Enable Auto Reply on New Ticket"
+  },
+  {
+   "depends_on": "eval:doc.enable_auto_reply",
+   "fieldname": "auto_reply_email_template",
+   "fieldtype": "Link",
+   "label": "Auto Reply Email Template",
+   "options": "Email Template"
   },
   {
    "default": "0",

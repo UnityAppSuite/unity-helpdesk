@@ -9,6 +9,8 @@ Functions here import helpers from the already-cached unity_helpdesk.py module (
 helpers were present from the first load and are always available).
 """
 
+import time
+
 import frappe
 from frappe import _
 from frappe.desk.form.assign_to import clear as clear_all_assignments
@@ -345,7 +347,12 @@ def update_ticket(
 # ---------------------------------------------------------------------------
 
 def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments=None):
-    """Create a Communication record without sending email (fallback when no email account set up)."""
+    """Create a Communication record without sending email (fallback when no email account set up).
+
+    Sets a synthetic message_id so that customer email replies can be threaded back to this
+    ticket by Frappe's email processor via the In-Reply-To header.
+    """
+    synthetic_msg_id = f"<{ticket.name}.{int(time.time())}@helpdesk>"
     communication = frappe.get_doc({
         "doctype": "Communication",
         "communication_type": "Communication",
@@ -361,6 +368,7 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments
         "reference_name": ticket.name,
         "cc": cc or "",
         "bcc": bcc or "",
+        "message_id": synthetic_msg_id,
     }).insert(ignore_permissions=True)
     _attach_files_to_communication(attachments, communication.name)
     update_ticket_message_search_index(ticket.name, ticket_doc=ticket)
