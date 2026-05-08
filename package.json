@@ -1,9 +1,9 @@
 {
 	"private": true,
 	"scripts": {
-		"postinstall": "husky install && cd desk && yarn install",
+		"postinstall": "husky install && cd desk && yarn install && cd ../unity_helpdesk && yarn install",
 		"dev": "cd desk && yarn dev",
-		"build": "cd desk && yarn build && cd ../unity_helpdesk && yarn build"
+		"build": "cd desk && yarn build && cd ../unity_helpdesk && yarn install && yarn build"
 	},
 	"dependencies": {
 		"@typescript-eslint/eslint-plugin": "^5.55.0",
