@@ -22,6 +22,7 @@ def before_install():
 
 def after_install():
 	ensure_unity_roles()
+	ensure_unity_custom_fields()
 	add_default_categories_and_articles()
 	add_default_ticket_priorities()
 	add_default_sla()
@@ -35,6 +36,23 @@ def after_install():
 	create_ootb_ticket_types()
 	create_welcome_ticket()
 	create_ticket_feedback_options()
+
+
+def ensure_unity_custom_fields():
+	"""Create Unity Helpdesk custom fields on a fresh install.
+
+	On `bench install-app`, Frappe marks patches in patches.txt as applied
+	without executing them — so the patches that create the unity custom
+	fields never run on a brand-new site. We invoke their execute() here
+	(both are idempotent, and their backfill loops are no-ops on a fresh
+	site that has no tickets yet)."""
+	from helpdesk.patches import (
+		unity_helpdesk_student_search_fields,
+		unity_ticket_message_search_fields,
+	)
+
+	unity_helpdesk_student_search_fields.execute()
+	unity_ticket_message_search_fields.execute()
 
 
 def add_support_redirect_to_tickets():
