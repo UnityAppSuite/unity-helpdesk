@@ -216,6 +216,11 @@ AVAILABLE_TICKET_COLUMN_KEYS = {c["key"] for c in AVAILABLE_TICKET_COLUMNS}
 COLUMN_PREFS_DEFAULT_KEY = "unity_helpdesk_columns"
 COLUMN_WIDTH_MIN = 60
 COLUMN_WIDTH_MAX = 600
+COLUMN_PREFS_MAX_ITEMS = 100
+
+
+def _localized_available_columns():
+	return [{**col, "label": _(col["label"])} for col in AVAILABLE_TICKET_COLUMNS]
 
 
 def _default_column_preferences():
@@ -227,12 +232,12 @@ def _default_column_preferences():
 
 
 def _load_column_preferences():
-	try:
-		raw = frappe.defaults.get_user_default(COLUMN_PREFS_DEFAULT_KEY)
-	except Exception:
-		raw = None
+	raw = frappe.db.get_default(COLUMN_PREFS_DEFAULT_KEY, frappe.session.user)
 	if not raw:
 		return _default_column_preferences()
+	# Older Frappe versions can wrap a single value in a 1-element list — unwrap.
+	if isinstance(raw, list | tuple) and len(raw) == 1:
+		raw = raw[0]
 	try:
 		stored = json.loads(raw) if isinstance(raw, str) else raw
 	except (TypeError, ValueError):
@@ -2703,7 +2708,7 @@ def get_profile():
 			"unity_email_thread_layout": _default_thread_layout(),
 			"column_preferences": _load_column_preferences(),
 		},
-		"available_columns": AVAILABLE_TICKET_COLUMNS,
+		"available_columns": _localized_available_columns(),
 	}
 
 
@@ -2717,6 +2722,8 @@ def update_column_preferences(column_preferences):
 		frappe.throw(_("Invalid column preferences payload"))
 	if not isinstance(parsed, list):
 		frappe.throw(_("Invalid column preferences payload"))
+	if len(parsed) > COLUMN_PREFS_MAX_ITEMS:
+		frappe.throw(_("Too many column preferences (max {0})").format(COLUMN_PREFS_MAX_ITEMS))
 	cleaned = []
 	seen = set()
 	for item in parsed:
