@@ -2841,31 +2841,35 @@ def enqueue_auto_assign_ticket_types():
 
 
 def _bulk_auto_assign_ticket_types():
-	"""Process tickets with empty/Unspecified ticket_type in batches of 200."""
-	from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import _get_ticket_type_keyword_map
+	"""Process tickets with empty/Unspecified ticket_type. Snapshot names upfront so
+	matched rows leaving the filter set don't shift pagination and skip unmatched ones."""
+	from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import (
+		_get_ticket_type_keyword_map,
+		_match_ticket_type_by_keywords,
+	)
 
 	keyword_map = _get_ticket_type_keyword_map()
 	if not keyword_map:
 		return
 
+	names = frappe.get_all(
+		"HD Ticket",
+		filters=[["ticket_type", "in", ["", "Unspecified"]]],
+		pluck="name",
+		order_by="creation asc",
+	)
+
 	batch_size = 200
-	start = 0
-	while True:
-		tickets = frappe.get_all(
+	for i in range(0, len(names), batch_size):
+		batch = names[i : i + batch_size]
+		rows = frappe.get_all(
 			"HD Ticket",
-			filters=[["ticket_type", "in", ["", "Unspecified"]]],
+			filters=[["name", "in", batch]],
 			fields=["name", "subject", "description"],
-			limit_start=start,
-			limit_page_length=batch_size,
-			order_by="creation asc",
 		)
-		if not tickets:
-			break
-		for t in tickets:
-			text = f"{t.subject or ''} {t.description or ''}".lower()
-			for ticket_type, keywords in keyword_map.items():
-				if any(kw in text for kw in keywords):
-					frappe.db.set_value("HD Ticket", t.name, "ticket_type", ticket_type)
-					break
+		for t in rows:
+			text = f"{t.subject or ''} {t.description or ''}"
+			match = _match_ticket_type_by_keywords(text, keyword_map)
+			if match:
+				frappe.db.set_value("HD Ticket", t.name, "ticket_type", match[0])
 		frappe.db.commit()
-		start += batch_size

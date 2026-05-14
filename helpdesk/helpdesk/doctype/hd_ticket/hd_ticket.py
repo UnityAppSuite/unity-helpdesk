@@ -1,4 +1,5 @@
 import json
+import re
 from email.utils import parseaddr
 from functools import lru_cache
 from typing import List
@@ -38,14 +39,39 @@ def _get_ticket_type_keyword_map():
 		"HD Ticket Type",
 		filters=[["keywords", "!=", ""]],
 		fields=["name", "keywords"],
+		order_by="name asc",
 	)
-	result = {}
+	result = []
 	for row in rows:
 		kws = [k.strip().lower() for k in (row.keywords or "").split(",") if k.strip()]
 		if kws:
-			result[row.name] = kws
+			result.append((row.name, kws))
 	frappe.cache().set_value(_KEYWORD_CACHE_KEY, result, expires_in_sec=3600)
 	return result
+
+
+def _match_ticket_type_by_keywords(text, keyword_map):
+	"""Return (type_name, matched_keyword) for the longest matching keyword across all types.
+
+	Word-boundary aware: keyword "pay" does NOT match "happy" or "display".
+	Deterministic tie-break: longest keyword wins; ties broken by type name asc.
+	"""
+	if not text or not keyword_map:
+		return None
+	text_lower = text.lower()
+	best = None  # (sort_key, type_name, kw)
+	for type_name, keywords in keyword_map:
+		for kw in keywords:
+			if not kw:
+				continue
+			pattern = re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)")
+			if pattern.search(text_lower):
+				sort_key = (-len(kw), type_name)
+				if best is None or sort_key < best[0]:
+					best = (sort_key, type_name, kw)
+	if best is None:
+		return None
+	return best[1], best[2]
 
 
 class HDTicket(Document):
@@ -249,24 +275,21 @@ class HDTicket(Document):
 	def set_ticket_type(self):
 		if self.ticket_type:
 			return
-		# Keywords take priority — only fall back to the default if no keyword matches
+		# Keywords take priority; fall back to HD Settings default, then DEFAULT_TICKET_TYPE.
 		self.auto_assign_ticket_type()
 		if not self.ticket_type:
 			settings = frappe.get_doc("HD Settings")
-			if settings.default_ticket_type:
-				self.ticket_type = settings.default_ticket_type
+			self.ticket_type = settings.default_ticket_type or DEFAULT_TICKET_TYPE
 
 	def auto_assign_ticket_type(self):
 		if self.ticket_type:
 			return
-		text = f"{self.subject or ''} {self.description or ''}".lower()
+		text = f"{self.subject or ''} {self.description or ''}"
 		if not text.strip():
 			return
-		keyword_map = _get_ticket_type_keyword_map()
-		for ticket_type, keywords in keyword_map.items():
-			if any(kw in text for kw in keywords):
-				self.ticket_type = ticket_type
-				return
+		match = _match_ticket_type_by_keywords(text, _get_ticket_type_keyword_map())
+		if match:
+			self.ticket_type = match[0]
 
 	def set_raised_by(self):
 		self.raised_by = self.raised_by or frappe.session.user
