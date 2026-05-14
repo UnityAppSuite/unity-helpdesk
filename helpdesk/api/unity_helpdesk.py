@@ -2829,13 +2829,19 @@ def get_csrf_token():
 
 @frappe.whitelist()
 def enqueue_auto_assign_ticket_types():
-	"""Enqueue a background job to bulk-assign ticket types by keyword matching."""
+	"""Enqueue a background job to bulk-assign ticket types by keyword matching.
+
+	Dedupes via job_id + deduplicate=True so concurrent clicks don't queue
+	two racing workers against the same rows.
+	"""
 	frappe.only_for("System Manager")
 	frappe.enqueue(
 		"helpdesk.api.unity_helpdesk._bulk_auto_assign_ticket_types",
 		queue="long",
 		timeout=3600,
 		is_async=True,
+		job_id="auto_assign_ticket_types",
+		deduplicate=True,
 	)
 	return {"queued": True}
 
