@@ -2828,9 +2828,10 @@ def search_contacts(query):
 	return results[:15]
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist()
 def get_csrf_token():
-	"""Return the current session CSRF token. Called via GET — no CSRF needed."""
+	"""Return the current session CSRF token. Callers must be authenticated;
+	the SPA refreshes the token on 403 mid-session."""
 	return frappe.sessions.get_csrf_token()
 
 

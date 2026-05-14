@@ -439,6 +439,10 @@ from io import StringIO
 from frappe.utils import validate_email_address
 
 
+RECIPIENT_HARD_CAP = 1000
+TOTAL_ADDRESS_HARD_CAP = 1500
+
+
 @frappe.whitelist()
 def bulk_send_email(
     subject,
@@ -456,11 +460,26 @@ def bulk_send_email(
         )
 
     subject = cstr(subject or "").strip()
-    message = cstr(message or "").strip()
+    raw_message = cstr(message or "").strip()
     if not subject:
         frappe.throw(_("Subject is required"))
-    if not message:
+    if not raw_message:
         frappe.throw(_("Message is required"))
+
+    # Strip script tags, on* handlers, javascript: URLs, etc. before storing or sending.
+    from frappe.utils import sanitize_html
+    message = sanitize_html(raw_message)
+    if not cstr(message).strip():
+        frappe.throw(_("Message is required"))
+
+    # Fail fast if there's no outgoing email account — sendmail(delayed=True) would
+    # otherwise queue silently and surface the misconfiguration only in a worker.
+    from frappe.email.doctype.email_account.email_account import EmailAccount
+    if not EmailAccount.find_default_outgoing():
+        frappe.throw(
+            _("No default outgoing Email Account is configured. Please configure one before sending bulk email."),
+            frappe.OutgoingEmailError,
+        )
 
     parsed = _parse_json(recipients, [])
     raw_emails = []
@@ -485,11 +504,16 @@ def bulk_send_email(
     if not valid_emails:
         frappe.throw(_("At least one valid email address is required"))
 
-    cc_list = _split_email_list(cc)
-    bcc_list = _split_email_list(bcc)
-    # Hard cap to avoid accidental mega-sends.
-    if len(valid_emails) + len(cc_list) + len(bcc_list) > 1000:
-        frappe.throw(_("Bulk email recipients exceed the 1000 address limit"))
+    if len(valid_emails) > RECIPIENT_HARD_CAP:
+        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
+
+    cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
+    bcc_list, invalid_bcc_count = _split_email_list_with_counts(bcc)
+
+    if len(valid_emails) + len(cc_list) + len(bcc_list) > TOTAL_ADDRESS_HARD_CAP:
+        frappe.throw(
+            _("Total addresses (recipients + cc + bcc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
+        )
 
     audit_description = _bulk_email_audit_html(valid_emails, cc_list, bcc_list, message)
     payload = {
@@ -560,27 +584,41 @@ def bulk_send_email(
         "ticket": doc.name,
         "queued": queued,
         "invalid_count": invalid_count,
+        "invalid_cc_count": invalid_cc_count,
+        "invalid_bcc_count": invalid_bcc_count,
         "warning": warning,
     }
 
 
 def _split_email_list(value):
+    out, _invalid = _split_email_list_with_counts(value)
+    return out
+
+
+def _split_email_list_with_counts(value):
+    """Split a comma/semicolon-separated list (or list/tuple) of emails into
+    (valid_unique_lowercase, invalid_count). Invalid entries are dropped."""
     if not value:
-        return []
+        return [], 0
     if isinstance(value, (list, tuple)):
         items = value
     else:
         items = cstr(value).replace(";", ",").split(",")
     out = []
     seen = set()
+    invalid = 0
     for item in items:
         email = cstr(item or "").strip().lower()
-        if not email or email in seen:
+        if not email:
+            continue
+        if email in seen:
             continue
         if validate_email_address(email, throw=False):
             seen.add(email)
             out.append(email)
-    return out
+        else:
+            invalid += 1
+    return out, invalid
 
 
 def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
