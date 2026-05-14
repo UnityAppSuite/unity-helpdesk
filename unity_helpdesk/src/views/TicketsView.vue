@@ -48,7 +48,11 @@
           type="text"
           placeholder="Ticket ID, student, ref no., email, subject, mail body…"
           aria-label="Search tickets (press Ctrl+K to focus)"
-          @keyup.enter="submitSearch"
+          autocomplete="off"
+          @keydown.enter.prevent="onSearchEnter"
+          @keydown.down.prevent="moveSuggestion(1)"
+          @keydown.up.prevent="moveSuggestion(-1)"
+          @keydown.esc="closeSuggestions"
           @focus="searchFocused = true"
           @blur="onSearchBlur"
         />
@@ -94,6 +98,56 @@
             >
               ✕
             </button>
+          </li>
+        </ul>
+        <ul
+          v-if="showSuggestions"
+          class="suggestions"
+          role="listbox"
+          @mousedown.prevent
+        >
+          <li
+            v-for="(sugg, idx) in suggestions"
+            :key="sugg.name"
+            class="suggestions__item"
+            :class="{ active: idx === suggestionsActiveIdx }"
+            role="option"
+            :aria-selected="idx === suggestionsActiveIdx"
+            @mouseenter="suggestionsActiveIdx = idx"
+            @click="selectSuggestion(idx)"
+          >
+            <div class="suggestions__line">
+              <span class="suggestions__id">{{ sugg.name }}</span>
+              <span
+                class="suggestions__status badge"
+                :class="`status-${(sugg.status || '')
+                  .toLowerCase()
+                  .replace(/\\s+/g, '-')}`"
+                >{{ sugg.status }}</span
+              >
+            </div>
+            <div class="suggestions__subject">
+              <template
+                v-for="(seg, sIdx) in highlightTokens(
+                  sugg.subject,
+                  appliedSuggestionQuery
+                )"
+                :key="`${sugg.name}-s-${sIdx}`"
+              >
+                <mark v-if="seg.mark">{{ seg.text }}</mark>
+                <template v-else>{{ seg.text }}</template>
+              </template>
+            </div>
+            <div class="suggestions__meta muted">{{ sugg.raised_by }}</div>
+          </li>
+          <li
+            v-if="!suggestions.length && !suggestionsLoading"
+            class="suggestions__empty muted"
+          >
+            No matches.
+          </li>
+          <li v-if="suggestionsLoading" class="suggestions__loading muted">
+            Searching…
           </li>
         </ul>
       </div>
@@ -795,6 +849,8 @@ function endColumnResize() {
 // --- Search UX helpers ---
 const RECENT_SEARCH_KEY = "unity-helpdesk:recent-searches";
 const RECENT_SEARCH_LIMIT = 8;
+const SUGGESTION_DEBOUNCE_MS = 250;
+const SUGGESTION_MIN_LENGTH = 2;
 const isMac =
   typeof navigator !== "undefined" &&
   /Mac|iPhone|iPad/.test(navigator.platform);
@@ -803,6 +859,20 @@ const shortcutLabel = isMac ? "⌘K" : "Ctrl+K";
 const searchInput = ref(null);
 const searchFocused = ref(false);
 const recentSearches = ref([]);
+const suggestions = ref([]);
+const suggestionsLoading = ref(false);
+const suggestionsActiveIdx = ref(-1);
+const appliedSuggestionQuery = ref("");
+let suggestionsController = null;
+let suggestionsTimer = null;
+let suggestionsRequestId = 0;
+
+const showSuggestions = computed(
+  () =>
+    searchFocused.value &&
+    draftSearch.value.trim().length >= SUGGESTION_MIN_LENGTH &&
+    (suggestions.value.length > 0 || suggestionsLoading.value)
+);
 
 function loadRecentSearches() {
   try {
@@ -845,13 +915,134 @@ function removeRecentSearch(term) {
 function useRecentSearch(term) {
   draftSearch.value = term;
   searchFocused.value = false;
+  closeSuggestions();
   submitSearch();
 }
 
+// --- Live suggestions ---
+
+function closeSuggestions() {
+  if (suggestionsTimer) {
+    clearTimeout(suggestionsTimer);
+    suggestionsTimer = null;
+  }
+  suggestionsController?.abort();
+  suggestionsController = null;
+  suggestions.value = [];
+  suggestionsLoading.value = false;
+  suggestionsActiveIdx.value = -1;
+}
+
+async function fetchSuggestions(query) {
+  const requestId = ++suggestionsRequestId;
+  suggestionsController?.abort();
+  suggestionsController = new AbortController();
+  suggestionsLoading.value = true;
+  try {
+    const data = await call(
+      "helpdesk.api.unity_helpdesk.get_ticket_suggestions",
+      { search: query, view: props.view },
+      { signal: suggestionsController.signal, timeoutMs: 8000 }
+    );
+    if (requestId !== suggestionsRequestId) return;
+    suggestions.value = Array.isArray(data?.data) ? data.data : [];
+    appliedSuggestionQuery.value = query;
+    suggestionsActiveIdx.value = suggestions.value.length ? 0 : -1;
+  } catch (err) {
+    if (requestId !== suggestionsRequestId) return;
+    // Aborted / timed-out keystrokes are not user-visible errors.
+    if (err?.code !== "REQUEST_ABORTED" && err?.code !== "REQUEST_TIMEOUT") {
+      console.warn("[unity-helpdesk] suggestion fetch failed:", err);
+    }
+    suggestions.value = [];
+    suggestionsActiveIdx.value = -1;
+  } finally {
+    if (requestId === suggestionsRequestId) {
+      suggestionsLoading.value = false;
+    }
+  }
+}
+
+watch(draftSearch, (next) => {
+  const q = (next || "").trim();
+  if (suggestionsTimer) {
+    clearTimeout(suggestionsTimer);
+    suggestionsTimer = null;
+  }
+  if (q.length < SUGGESTION_MIN_LENGTH) {
+    suggestionsController?.abort();
+    suggestions.value = [];
+    suggestionsLoading.value = false;
+    suggestionsActiveIdx.value = -1;
+    return;
+  }
+  suggestionsTimer = setTimeout(
+    () => fetchSuggestions(q),
+    SUGGESTION_DEBOUNCE_MS
+  );
+});
+
+function moveSuggestion(delta) {
+  if (!suggestions.value.length) return;
+  const len = suggestions.value.length;
+  const current = suggestionsActiveIdx.value;
+  const next = (((current + delta) % len) + len) % len;
+  suggestionsActiveIdx.value = next;
+}
+
+function selectSuggestion(idx) {
+  const sugg = suggestions.value[idx];
+  if (!sugg) return;
+  closeSuggestions();
+  searchFocused.value = false;
+  openTicket(sugg.name);
+}
+
+function onSearchEnter() {
+  if (
+    suggestionsActiveIdx.value >= 0 &&
+    suggestions.value[suggestionsActiveIdx.value]
+  ) {
+    selectSuggestion(suggestionsActiveIdx.value);
+    return;
+  }
+  submitSearch();
+}
+
+// Escape highlightTokens-safe regex specials in token strings
+function _escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function highlightTokens(text, query) {
+  const raw = String(text == null ? "" : text);
+  const q = String(query == null ? "" : query).trim();
+  if (!raw || !q) return [{ text: raw, mark: false }];
+  const tokens = q.toLowerCase().match(/[a-z0-9@._-]{2,}/g) || [];
+  if (!tokens.length) return [{ text: raw, mark: false }];
+  const re = new RegExp("(" + tokens.map(_escapeRegex).join("|") + ")", "ig");
+  const out = [];
+  let last = 0;
+  let match;
+  while ((match = re.exec(raw)) !== null) {
+    if (match.index > last) {
+      out.push({ text: raw.slice(last, match.index), mark: false });
+    }
+    out.push({ text: match[0], mark: true });
+    last = match.index + match[0].length;
+    if (match.index === re.lastIndex) re.lastIndex += 1; // zero-width safety
+  }
+  if (last < raw.length) {
+    out.push({ text: raw.slice(last), mark: false });
+  }
+  return out;
+}
+
 function onSearchBlur() {
-  // Delay so click on a recent-search item registers before the dropdown closes.
+  // Delay so a click on a recent-search or suggestion item registers before the dropdown closes.
   setTimeout(() => {
     searchFocused.value = false;
+    closeSuggestions();
   }, 120);
 }
 
@@ -1010,12 +1201,14 @@ async function submitSearch() {
   appliedSearch.value = draftSearch.value.trim();
   rememberSearch(appliedSearch.value);
   searchFocused.value = false;
+  closeSuggestions();
   await replaceRouteOrReload();
 }
 
 async function clearSearch() {
   draftSearch.value = "";
   appliedSearch.value = "";
+  closeSuggestions();
   await replaceRouteOrReload();
 }
 

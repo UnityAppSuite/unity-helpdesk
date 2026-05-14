@@ -21,3 +21,4 @@ helpdesk.patches.unity_helpdesk_roles
 helpdesk.patches.unity_ticket_message_search_fields
 helpdesk.patches.unity_helpdesk_student_search_fields
 helpdesk.patches.unity_helpdesk_portal_origin_fields
+helpdesk.patches.unity_ticket_message_search_rebuild

@@ -6,6 +6,7 @@ from collections import defaultdict
 import frappe
 from frappe import _
 from frappe.desk.form.assign_to import clear as clear_all_assignments
+from frappe.query_builder import Order
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
@@ -1004,11 +1005,58 @@ def populate_ticket_student_search_fields(ticket):
 	return context
 
 
-def _truncate_search_text(text, max_chars=12000):
+SEARCH_BODY_MAX = 12000
+SEARCH_HEAD_BUDGET = 2000
+SEARCH_TAIL_BUDGET = 9500
+SEARCH_BODY_SEPARATOR = " · "
+
+
+def _truncate_search_text(text, max_chars=SEARCH_BODY_MAX):
 	text = cstr(text or "").strip()
 	if len(text) <= max_chars:
 		return text
 	return text[:max_chars].rsplit(" ", 1)[0].strip() or text[:max_chars]
+
+
+def _pack_chunks(chunks, budget):
+	"""Pack normalized text chunks into a single string, stopping when the budget
+	is hit. Returns the packed string (with single-space separators between
+	chunks). Long final chunks are clipped on a word boundary if there's room
+	for >200 chars; otherwise dropped to keep things tidy."""
+	if budget <= 0:
+		return ""
+	out = []
+	used = 0
+	for chunk in chunks:
+		chunk = cstr(chunk or "").strip()
+		if not chunk:
+			continue
+		needed = len(chunk) + (1 if out else 0)
+		if used + needed <= budget:
+			out.append(chunk)
+			used += needed
+			continue
+		# Final chunk doesn't fully fit. Clip it if there's >200 chars of room left.
+		remaining = budget - used - (1 if out else 0)
+		if remaining > 200:
+			clipped = chunk[:remaining].rsplit(" ", 1)[0].strip()
+			if clipped:
+				out.append(clipped)
+		break
+	return " ".join(out)
+
+
+def _assemble_search_body(subject, opening_parts, recent_parts):
+	"""Build the searchable body: subject + head (opening complaint, 2KB) +
+	tail (recent thread, 9.5KB newest-first). Caller is responsible for
+	ordering recent_parts newest-first."""
+	subject = cstr(subject or "").strip()
+	head = _pack_chunks(opening_parts, SEARCH_HEAD_BUDGET)
+	tail = _pack_chunks(recent_parts, SEARCH_TAIL_BUDGET)
+	pieces = [p for p in (subject, head, tail) if p]
+	if not pieces:
+		return ""
+	return _truncate_search_text(SEARCH_BODY_SEPARATOR.join(pieces))
 
 
 def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=None):
@@ -1042,25 +1090,27 @@ def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
 		communication_rows=communication_rows,
 	)
 
-	parts = []
 	subject_text = _normalize_search_text(ticket_doc.get("subject")) if ticket_doc else ""
-	if subject_text:
-		parts.append(subject_text)
+
+	# Head: the opening complaint that defines what the ticket is about.
+	# Kept in a small 2KB budget so recent replies always have room in the tail.
+	opening_parts = []
 	if primary_message_text:
-		parts.append(primary_message_text)
-	for row in communication_rows:
-		parts.append(_normalize_search_text(row.subject))
-		parts.append(_normalize_search_text(row.content))
-
-	for row in thread_components.comments:
-		parts.append(_normalize_search_text(row.content))
-
-	# Always include the ticket description so the original customer message is searchable
-	# even after communications are added to the thread.
+		opening_parts.append(primary_message_text)
 	if ticket_doc:
-		parts.append(_normalize_search_text(ticket_doc.get("description")))
+		opening_parts.append(_normalize_search_text(ticket_doc.get("description")))
 
-	combined = _truncate_search_text(" ".join(part for part in parts if part))
+	# Tail: communications + comments newest-first, packed into 9.5KB. Ensures
+	# the latest agent reply is always present in the indexed body even for
+	# long threads.
+	recent_parts = []
+	for row in reversed(communication_rows):
+		recent_parts.append(_normalize_search_text(row.subject))
+		recent_parts.append(_normalize_search_text(row.content))
+	for row in reversed(thread_components.comments):
+		recent_parts.append(_normalize_search_text(row.content))
+
+	combined = _assemble_search_body(subject_text, opening_parts, recent_parts)
 	return primary_message_html, primary_message_text, combined
 
 
@@ -1776,28 +1826,74 @@ def _search_candidate_ticket_names(base_filters, search):
 		return candidate_names
 
 	# Multi-token: each token must match in at least one searchable field
-	# (AND-of-OR). One DB query per token, then intersect.
-	per_token_sets = []
-	for token in tokens:
-		or_filters = [
-			[TICKET_DOCTYPE, field, "like", f"%{token}%"] for field in search_fields
-		]
-		rows = frappe.get_list(
-			TICKET_DOCTYPE,
-			fields=["name"],
-			filters=base_filters,
-			or_filters=or_filters,
-			order_by="modified desc",
-			page_length=MAX_SEARCH_CANDIDATES,
-		)
-		token_set = {row.name for row in rows}
-		if not token_set:
-			# Any required token with zero matches → AND-intersection is empty.
-			return set()
-		per_token_sets.append(token_set)
-
-	candidate_names = set.intersection(*per_token_sets) if per_token_sets else set()
+	# (AND-of-OR). Run as a single SQL so the LIMIT applies after the AND
+	# filter, not per token — otherwise common tokens like "the" or "and"
+	# cap their per-token result at the 400 most-recently-modified rows and
+	# silently drop older tickets that do contain all the tokens.
+	candidate_names = _multi_token_candidates(tokens, search_fields, base_filters)
 	return candidate_names
+
+
+def _multi_token_candidates(tokens, search_fields, base_filters):
+	"""Return ticket names matching ALL tokens across ANY of search_fields,
+	ordered by modified desc and capped at MAX_SEARCH_CANDIDATES — in a single
+	SQL so the LIMIT doesn't truncate older candidates per token."""
+	from pypika.terms import Criterion
+
+	if not tokens:
+		return set()
+
+	QBTicket = frappe.qb.DocType(TICKET_DOCTYPE)
+
+	# Build (field1 LIKE %tok% OR field2 LIKE %tok% OR ...) AND (... next token ...) AND ...
+	and_groups = []
+	for token in tokens:
+		pattern = f"%{token}%"
+		field_conditions = [QBTicket[field].like(pattern) for field in search_fields]
+		if field_conditions:
+			and_groups.append(Criterion.any(field_conditions))
+	if not and_groups:
+		return set()
+
+	query = (
+		frappe.qb.from_(QBTicket)
+		.select(QBTicket.name)
+		.where(Criterion.all(and_groups))
+	)
+
+	# base_filters is the same shape as the list passed to frappe.get_list — fold
+	# them into the qb query as additional WHERE clauses. We only handle the few
+	# operators _build_filters actually emits (=, in, is set/not set).
+	for filt in base_filters or []:
+		if not isinstance(filt, (list, tuple)) or len(filt) < 3:
+			continue
+		# Each filt is [doctype, field, operator, value] or [field, operator, value]
+		if len(filt) == 4:
+			_doctype, field, op, value = filt
+		else:
+			field, op, value = filt
+		col = QBTicket[field]
+		op_norm = cstr(op).strip().lower()
+		if op_norm == "=":
+			query = query.where(col == value)
+		elif op_norm == "in":
+			query = query.where(col.isin(list(value or [])))
+		elif op_norm == "not in":
+			query = query.where(col.notin(list(value or [])))
+		elif op_norm in ("is", "is not"):
+			# "is", "set" / "is", "not set"
+			if cstr(value).strip().lower() in ("set", "not set"):
+				if cstr(value).strip().lower() == "set":
+					query = query.where(col.notnull())
+				else:
+					query = query.where(col.isnull())
+		# Other operators (rare in base_filters) are skipped — base_filters always
+		# already passed into get_list elsewhere so user-permission scoping is preserved
+		# by the column-level filters above.
+
+	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
+	rows = query.run(as_dict=True)
+	return {row["name"] for row in rows}
 
 
 @frappe.whitelist()
@@ -2049,6 +2145,68 @@ def _agent_candidates():
 		order_by="full_name asc",
 		page_length=200,
 	)
+
+
+SUGGESTION_LIMIT = 8
+SUGGESTION_MIN_QUERY = 2
+SUGGESTION_CANDIDATE_CAP = 60
+
+
+@frappe.whitelist()
+def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
+	"""Lightweight as-you-type suggestions for the SPA search box.
+
+	Reuses the same candidate-resolver as get_tickets (so family-email expansion
+	and permission scoping behave consistently), but caps candidates at 60 rows
+	(vs 400 for get_tickets) and skips ranker + decoration for keystroke speed.
+	"""
+	capabilities = _require_unity_access()
+	query = cstr(search or "").strip()
+	if len(query) < SUGGESTION_MIN_QUERY:
+		return {"data": [], "query": query}
+
+	try:
+		limit = int(limit or SUGGESTION_LIMIT)
+	except (TypeError, ValueError):
+		limit = SUGGESTION_LIMIT
+	limit = max(1, min(limit, SUGGESTION_LIMIT))
+
+	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
+	list_filters = _build_filters(
+		"all",  # search reach mirrors get_tickets — permission is enforced via assigned_agent
+		None,
+		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
+	)
+	candidate_names = _search_candidate_ticket_names(list_filters, query)
+	if not candidate_names:
+		return {"data": [], "query": query, "view": effective_view}
+
+	# Pull a bounded slice with the lightweight fields the dropdown needs.
+	rows = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=["name", "subject", "raised_by", "status", "modified", "custom_is_on_hold"],
+		filters=[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		order_by="modified desc",
+		page_length=SUGGESTION_CANDIDATE_CAP,
+	)
+
+	# Cheap in-Python rank — no full ranker call.
+	q_lower = query.lower()
+	tokens = _search_tokens(query)
+
+	def _score(row):
+		name_lower = cstr(row.get("name")).lower()
+		subject_lower = cstr(row.get("subject")).lower()
+		if name_lower == q_lower:
+			return (3, row.get("modified"))
+		if subject_lower.startswith(q_lower):
+			return (2, row.get("modified"))
+		if tokens and all(t in subject_lower or t in name_lower for t in tokens):
+			return (1, row.get("modified"))
+		return (0, row.get("modified"))
+
+	rows.sort(key=_score, reverse=True)
+	return {"data": rows[:limit], "query": query, "view": effective_view}
 
 
 @frappe.whitelist()
