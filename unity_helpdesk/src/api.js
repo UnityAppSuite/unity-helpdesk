@@ -18,7 +18,9 @@ async function _refreshCsrfToken() {
       window.csrf_token = data.message;
       return true;
     }
-  } catch {}
+  } catch (err) {
+    console.warn("[unity-helpdesk] CSRF token refresh failed:", err);
+  }
   return false;
 }
 
@@ -72,7 +74,8 @@ export async function call(method, params = {}, options = {}) {
           });
           const retryPayload = await retry.json().catch(() => ({}));
           if (!retry.ok || retryPayload.exc || retryPayload._server_messages) {
-            const message = extractError(retryPayload) || `Request failed: ${method}`;
+            const message =
+              extractError(retryPayload) || `Request failed: ${method}`;
             const err = new Error(message);
             err.status = retry.status;
             err.payload = retryPayload;
@@ -120,9 +123,17 @@ export async function call(method, params = {}, options = {}) {
 // Application errors (PermissionError, ValidationError, etc — 4xx + payload.exc
 // from a 200 response) surface immediately. options.onAttempt(n) is invoked
 // before each retry so views can show a "Reloading…" indicator.
+//
+// SAFETY: retries can cause duplicate side-effects on POSTs that create or mutate
+// state (e.g. create_ticket, bulk_send_email). Callers MUST opt in by passing
+// { idempotent: true } — without that flag this behaves exactly like call().
 export async function callWithRetry(method, params = {}, options = {}) {
+  if (!options.idempotent) {
+    return call(method, params, options);
+  }
   const delays = options.delays || [1000, 3000, 7000];
-  const onAttempt = options.onAttempt || (() => {});
+  const noop = () => undefined;
+  const onAttempt = options.onAttempt || noop;
   let lastError;
   for (let attempt = 0; attempt <= delays.length; attempt += 1) {
     if (attempt > 0) onAttempt(attempt);
@@ -133,7 +144,9 @@ export async function callWithRetry(method, params = {}, options = {}) {
       if (!isRetriable(error) || attempt === delays.length) {
         throw error;
       }
-      await new Promise((resolve) => window.setTimeout(resolve, delays[attempt]));
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, delays[attempt])
+      );
     }
   }
   throw lastError;

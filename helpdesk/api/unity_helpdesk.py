@@ -411,14 +411,16 @@ def _group_by(items, key):
 
 
 def _parse_class_number(program):
-	# Program names follow the convention "<class>-<school descriptor>", e.g.
-	# "4-Walnut School at Shivane". Return just the class segment so the SPA
-	# can render "4-A-Shivane" instead of "A - 4-Walnut School at Shivane".
+	# Program names follow "<class>-<school descriptor>", e.g. "4-Walnut School at Shivane"
+	# or "PG-1-Walnut" — the class segment itself may contain hyphens. rsplit
+	# strips only the final descriptor and preserves multi-segment class labels.
 	raw = cstr(program or "").strip()
 	if not raw:
 		return None
-	head, sep, _rest = raw.partition("-")
-	return head.strip() if sep else raw
+	if "-" not in raw:
+		return raw
+	head, _sep, _rest = raw.rpartition("-")
+	return head.strip() or raw
 
 
 def _fetch_school_locations(students_by_id, enrollment_rows):
@@ -440,7 +442,7 @@ def _fetch_school_locations(students_by_id, enrollment_rows):
 			"School",
 			fields=["name", "location"],
 			filters={"name": ["in", sorted(school_ids)]},
-			page_length=0,
+			page_length=10000,
 		)
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "unity_helpdesk._fetch_school_locations")

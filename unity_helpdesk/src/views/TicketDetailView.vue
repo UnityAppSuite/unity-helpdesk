@@ -4,8 +4,22 @@
       <button class="btn secondary" @click="goBackToList">
         Back to Tickets
       </button>
-      <button v-if="prevTicketId" class="btn secondary nav-btn" title="Previous ticket" @click="goToPrevTicket">← Prev</button>
-      <button v-if="nextTicketId" class="btn secondary nav-btn" title="Next ticket" @click="goToNextTicket">Next →</button>
+      <button
+        v-if="prevTicketId"
+        class="btn secondary nav-btn"
+        title="Previous ticket"
+        @click="goToPrevTicket"
+      >
+        ← Prev
+      </button>
+      <button
+        v-if="nextTicketId"
+        class="btn secondary nav-btn"
+        title="Next ticket"
+        @click="goToNextTicket"
+      >
+        Next →
+      </button>
       <strong v-if="ticket.name">#{{ ticket.name }}</strong>
       <span
         v-if="ticket.status_indicator"
@@ -25,7 +39,9 @@
     </div>
     <div v-if="reloadPrompt" class="reload-prompt">
       <span>Couldn't load this ticket.</span>
-      <button type="button" class="btn secondary" @click="loadTicket()">Retry</button>
+      <button type="button" class="btn secondary" @click="loadTicket()">
+        Retry
+      </button>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="notice" class="warning-banner">{{ notice }}</p>
@@ -98,7 +114,8 @@
                             target="_blank"
                             rel="noopener noreferrer"
                             class="student-id-link"
-                          >{{ student.id }}</a>
+                            >{{ student.id }}</a
+                          >
                         </small>
                         <span class="student-context-pill">
                           {{ student.role }}
@@ -137,18 +154,24 @@
                   <tr v-for="g in guardianRows" :key="g.key">
                     <td>{{ g.name || "-" }}</td>
                     <td>
-                      <a v-if="g.mobile" :href="`tel:${g.mobile}`">{{ g.mobile }}</a>
+                      <a v-if="g.mobile" :href="`tel:${g.mobile}`">{{
+                        g.mobile
+                      }}</a>
                       <span v-else>-</span>
                       <small
                         v-if="g.alternate_mobile"
                         class="guardian-context-table__alt"
                       >
                         alt:
-                        <a :href="`tel:${g.alternate_mobile}`">{{ g.alternate_mobile }}</a>
+                        <a :href="`tel:${g.alternate_mobile}`">{{
+                          g.alternate_mobile
+                        }}</a>
                       </small>
                     </td>
                     <td>
-                      <a v-if="g.email" :href="`mailto:${g.email}`">{{ g.email }}</a>
+                      <a v-if="g.email" :href="`mailto:${g.email}`">{{
+                        g.email
+                      }}</a>
                       <span v-else>-</span>
                     </td>
                   </tr>
@@ -317,7 +340,10 @@
           class="detail-section bulk-audit-section"
         >
           <h3>Bulk Email — Recipients &amp; Message</h3>
-          <div class="detail-body safe-html" v-html="sanitize(ticket.description)"></div>
+          <div
+            class="detail-body safe-html"
+            v-html="sanitize(ticket.description)"
+          ></div>
         </section>
 
         <section v-if="timeline.length" class="detail-section">
@@ -348,7 +374,11 @@
                 }}</span>
               </div>
               <div
-                v-if="item._type === 'comm' && item.sent_or_received === 'Sent' && item.recipients"
+                v-if="
+                  item._type === 'comm' &&
+                  item.sent_or_received === 'Sent' &&
+                  item.recipients
+                "
                 class="chat-msg-recipients"
               >
                 <span class="chat-msg-to-label">To:</span>{{ item.recipients }}
@@ -980,7 +1010,9 @@ function goBackToList() {
 const ticketNav = computed(() => {
   try {
     return JSON.parse(sessionStorage.getItem("unity:ticket_nav") || "null");
-  } catch { return null; }
+  } catch {
+    return null;
+  }
 });
 const currentNavIdx = computed(() => {
   if (!ticketNav.value?.ids) return -1;
@@ -991,7 +1023,9 @@ const prevTicketId = computed(() =>
 );
 const nextTicketId = computed(() => {
   const nav = ticketNav.value;
-  return nav && currentNavIdx.value >= 0 && currentNavIdx.value < nav.ids.length - 1
+  return nav &&
+    currentNavIdx.value >= 0 &&
+    currentNavIdx.value < nav.ids.length - 1
     ? nav.ids[currentNavIdx.value + 1]
     : null;
 });
@@ -1326,6 +1360,7 @@ async function loadTicket() {
       { name: props.ticketId },
       {
         timeoutMs: 20000,
+        idempotent: true,
         onAttempt: () => {
           if (requestId === activeTicketRequestId) reloading.value = true;
         },

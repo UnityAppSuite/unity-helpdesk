@@ -364,6 +364,7 @@ async function load() {
         agent: selectedAgent.value || undefined,
       },
       {
+        idempotent: true,
         onAttempt: () => {
           reloading.value = true;
         },

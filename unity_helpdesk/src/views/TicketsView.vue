@@ -74,9 +74,7 @@
           ✕
         </button>
         <ul
-          v-if="
-            searchFocused && !draftSearch.trim() && recentSearches.length
-          "
+          v-if="searchFocused && !draftSearch.trim() && recentSearches.length"
           class="recent-searches"
           @mousedown.prevent
         >
@@ -225,7 +223,9 @@
       </div>
       <div v-if="reloadPrompt" class="reload-prompt">
         <span>Couldn't load tickets.</span>
-        <button type="button" class="btn secondary" @click="load()">Retry</button>
+        <button type="button" class="btn secondary" @click="load()">
+          Retry
+        </button>
       </div>
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
@@ -242,7 +242,10 @@
                 v-for="(col, colIdx) in visibleColumns"
                 :key="col.key"
                 :style="{ width: col.width + 'px', minWidth: col.width + 'px' }"
-                :class="{ 'col-dragging': colDragIdx === colIdx, 'col-draggable': !col.fixed }"
+                :class="{
+                  'col-dragging': colDragIdx === colIdx,
+                  'col-draggable': !col.fixed,
+                }"
                 :draggable="!col.fixed"
                 @dragstart="onColDragStart($event, colIdx)"
                 @dragover="onColDragOver($event, colIdx)"
@@ -257,7 +260,9 @@
                   title="Remove column"
                   type="button"
                   @click.stop="removeColumn(col.key)"
-                >×</button>
+                >
+                  ×
+                </button>
                 <span
                   v-if="!col.fixed"
                   class="col-resize-grabber"
@@ -268,7 +273,14 @@
               <!-- Add Column -->
               <th class="col-add-th">
                 <div class="col-add-wrap">
-                  <button class="col-add-btn" type="button" title="Add column" @click.stop="toggleAddColumnMenu">+</button>
+                  <button
+                    class="col-add-btn"
+                    type="button"
+                    title="Add column"
+                    @click.stop="toggleAddColumnMenu"
+                  >
+                    +
+                  </button>
                   <div v-if="showAddCol" class="col-add-dropdown">
                     <button
                       v-for="c in hiddenColumns"
@@ -276,8 +288,12 @@
                       class="col-add-item"
                       type="button"
                       @click.stop="addColumn(c.key)"
-                    >{{ c.label }}</button>
-                    <span v-if="!hiddenColumns.length" class="col-add-empty">All columns shown</span>
+                    >
+                      {{ c.label }}
+                    </button>
+                    <span v-if="!hiddenColumns.length" class="col-add-empty"
+                      >All columns shown</span
+                    >
                   </div>
                 </div>
               </th>
@@ -288,7 +304,9 @@
               v-for="ticket in tickets"
               :key="ticket.name"
               :class="{
-                'portal-ticket': ticket.custom_via_unity_portal && !ticket.custom_is_bulk_email,
+                'portal-ticket':
+                  ticket.custom_via_unity_portal &&
+                  !ticket.custom_is_bulk_email,
                 'bulk-email-ticket': ticket.custom_is_bulk_email,
               }"
               @click="openTicket(ticket.name)"
@@ -310,11 +328,18 @@
                   </button>
                 </template>
                 <template v-else-if="col.key === 'subject'">
-                  <div class="subject">{{ ticket.subject || "No subject" }}</div>
+                  <div class="subject">
+                    {{ ticket.subject || "No subject" }}
+                  </div>
                   <small class="muted">
-                    <a :href="`mailto:${ticket.raised_by}`" @click.stop>{{ ticket.raised_by }}</a>
+                    <a :href="`mailto:${ticket.raised_by}`" @click.stop>{{
+                      ticket.raised_by
+                    }}</a>
                   </small>
-                  <small v-if="ticket.custom_search_student_names" class="student-names">
+                  <small
+                    v-if="ticket.custom_search_student_names"
+                    class="student-names"
+                  >
                     {{ ticket.custom_search_student_names }}
                   </small>
                 </template>
@@ -337,9 +362,16 @@
                     <option value="">Not set</option>
                     <!-- Ensure current value is always an option even while ticketTypes loads -->
                     <option
-                      v-if="editState[ticket.name].ticket_type && !ticketTypes.find(t => t.name === editState[ticket.name].ticket_type)"
+                      v-if="
+                        editState[ticket.name].ticket_type &&
+                        !ticketTypes.find(
+                          (t) => t.name === editState[ticket.name].ticket_type
+                        )
+                      "
                       :value="editState[ticket.name].ticket_type"
-                    >{{ editState[ticket.name].ticket_type }}</option>
+                    >
+                      {{ editState[ticket.name].ticket_type }}
+                    </option>
                     <option
                       v-for="type in ticketTypes"
                       :key="type.name"
@@ -380,7 +412,11 @@
                     ]"
                     :disabled="isSaving(ticket.name)"
                     @change="
-                      quickUpdate(ticket, 'status', editState[ticket.name].status)
+                      quickUpdate(
+                        ticket,
+                        'status',
+                        editState[ticket.name].status
+                      )
                     "
                   >
                     <option>On Hold</option>
@@ -458,7 +494,15 @@
 </template>
 
 <script setup>
-import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  inject,
+  onBeforeUnmount,
+  onMounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   call,
@@ -510,9 +554,7 @@ const showColumnPanel = ref(false);
 const draftColumns = ref([]); // popover working copy: [{ key, visible, width }]
 const savingColumns = ref(false);
 
-const availableColumns = computed(
-  () => unitySession?.available_columns || []
-);
+const availableColumns = computed(() => unitySession?.available_columns || []);
 const availableColumnMap = computed(() => {
   const map = {};
   for (const col of availableColumns.value) map[col.key] = col;
@@ -737,10 +779,12 @@ function endColumnResize() {
   resizingKey.value = null;
   if (!key) return;
   // Persist new width
-  const payload = (unitySession?.settings?.column_preferences || []).map((p) => ({
-    key: p.key,
-    width: p.width,
-  }));
+  const payload = (unitySession?.settings?.column_preferences || []).map(
+    (p) => ({
+      key: p.key,
+      width: p.width,
+    })
+  );
   call("helpdesk.api.unity_helpdesk.update_column_preferences", {
     column_preferences: JSON.stringify(payload),
   }).catch(() => {
@@ -751,7 +795,9 @@ function endColumnResize() {
 // --- Search UX helpers ---
 const RECENT_SEARCH_KEY = "unity-helpdesk:recent-searches";
 const RECENT_SEARCH_LIMIT = 8;
-const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+const isMac =
+  typeof navigator !== "undefined" &&
+  /Mac|iPhone|iPad/.test(navigator.platform);
 const shortcutLabel = isMac ? "⌘K" : "Ctrl+K";
 
 const searchInput = ref(null);
@@ -763,7 +809,9 @@ function loadRecentSearches() {
     const raw = localStorage.getItem(RECENT_SEARCH_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
     recentSearches.value = Array.isArray(parsed)
-      ? parsed.filter((s) => typeof s === "string" && s.trim()).slice(0, RECENT_SEARCH_LIMIT)
+      ? parsed
+          .filter((s) => typeof s === "string" && s.trim())
+          .slice(0, RECENT_SEARCH_LIMIT)
       : [];
   } catch {
     recentSearches.value = [];
@@ -772,7 +820,10 @@ function loadRecentSearches() {
 
 function persistRecentSearches() {
   try {
-    localStorage.setItem(RECENT_SEARCH_KEY, JSON.stringify(recentSearches.value));
+    localStorage.setItem(
+      RECENT_SEARCH_KEY,
+      JSON.stringify(recentSearches.value)
+    );
   } catch {
     /* storage unavailable — ignore */
   }
@@ -1006,6 +1057,7 @@ async function load({ append = false } = {}) {
       {
         signal: activeController.signal,
         timeoutMs: appliedSearch.value.trim() ? 20000 : 30000,
+        idempotent: true,
         onAttempt: () => {
           if (requestId === activeRequestId) reloading.value = true;
         },
@@ -1120,7 +1172,11 @@ function onCellClick(event, key) {
   if (EDITABLE_COLUMN_KEYS.has(key)) event.stopPropagation();
 }
 
-const DATE_COLUMN_KEYS = new Set(["creation", "custom_hold_from", "custom_hold_to"]);
+const DATE_COLUMN_KEYS = new Set([
+  "creation",
+  "custom_hold_from",
+  "custom_hold_to",
+]);
 const DATETIME_COLUMN_KEYS = new Set([
   "modified",
   "response_by",
@@ -1156,7 +1212,10 @@ function openTicket(name) {
   // Store current list for prev/next navigation in ticket detail
   sessionStorage.setItem(
     "unity:ticket_nav",
-    JSON.stringify({ ids: tickets.value.map((t) => String(t.name)), view: props.view })
+    JSON.stringify({
+      ids: tickets.value.map((t) => String(t.name)),
+      view: props.view,
+    })
   );
   router.push({
     path: `/tickets/${name}`,
