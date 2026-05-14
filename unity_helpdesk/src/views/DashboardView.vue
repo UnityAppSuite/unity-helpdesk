@@ -44,6 +44,14 @@
       </div>
     </div>
 
+    <div v-if="reloading" class="reloading-indicator">
+      <span class="reload-spinner" aria-hidden="true"></span>
+      <span>Reloading…</span>
+    </div>
+    <div v-if="reloadPrompt" class="reload-prompt">
+      <span>Couldn't load the dashboard.</span>
+      <button type="button" class="btn secondary" @click="load()">Retry</button>
+    </div>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="loading" class="empty">Loading dashboard...</p>
 
@@ -200,7 +208,7 @@
 
 <script setup>
 import { computed, inject, onMounted, ref } from "vue";
-import { call, formatDate, getAgents } from "../api";
+import { call, callWithRetry, formatDate, getAgents } from "../api";
 
 const emit = defineEmits(["title"]);
 const unitySession = inject("unitySession", { capabilities: {} });
@@ -210,6 +218,8 @@ const customTo = ref("");
 const selectedAgent = ref("");
 const agents = ref([]);
 const loading = ref(false);
+const reloading = ref(false);
+const reloadPrompt = ref(false);
 const error = ref("");
 const summary = ref({
   cards: {},
@@ -342,14 +352,21 @@ function setRange(nextRange) {
 async function load() {
   loading.value = true;
   error.value = "";
+  reloading.value = false;
+  reloadPrompt.value = false;
   try {
-    summary.value = await call(
+    summary.value = await callWithRetry(
       "helpdesk.api.unity_helpdesk.get_dashboard_summary",
       {
         range: range.value,
         from_date: customFrom.value || undefined,
         to_date: customTo.value || undefined,
         agent: selectedAgent.value || undefined,
+      },
+      {
+        onAttempt: () => {
+          reloading.value = true;
+        },
       }
     );
     if (range.value === "custom") {
@@ -357,9 +374,14 @@ async function load() {
       customTo.value = summary.value.to_date || customTo.value;
     }
   } catch (err) {
-    error.value = err.message;
+    if (err.code === "NETWORK_ERROR" || (err.status && err.status >= 500)) {
+      reloadPrompt.value = true;
+    } else {
+      error.value = err.message;
+    }
   } finally {
     loading.value = false;
+    reloading.value = false;
   }
 }
 

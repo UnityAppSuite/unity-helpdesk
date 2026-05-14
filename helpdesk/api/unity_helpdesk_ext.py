@@ -179,16 +179,19 @@ def create_ticket(
     if not message:
         frappe.throw(_("Please enter email message"))
 
-    doc = frappe.get_doc(
-        {
-            "doctype": TICKET_DOCTYPE,
-            "subject": subject,
-            "raised_by": raised_by,
-            "description": message,
-            "priority": priority or None,
-            "ticket_type": ticket_type or None,
-        }
-    ).insert()
+    payload = {
+        "doctype": TICKET_DOCTYPE,
+        "subject": subject,
+        "raised_by": raised_by,
+        "description": message,
+        "priority": priority or None,
+        "ticket_type": ticket_type or None,
+    }
+    # Mark tickets originating from the Unity Helpdesk SPA so the list can tint
+    # them green. Field is created by patches.unity_helpdesk_portal_origin_fields.
+    if frappe.db.has_column(TICKET_DOCTYPE, "custom_via_unity_portal"):
+        payload["custom_via_unity_portal"] = 1
+    doc = frappe.get_doc(payload).insert()
 
     if assignee:
         try:
@@ -424,3 +427,199 @@ def add_comment(name, content):
     }).insert(ignore_permissions=True)
     update_ticket_message_search_index(name)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Bulk email — BCC-style mass send with a single audit-trail ticket
+# ---------------------------------------------------------------------------
+
+import csv
+from io import StringIO
+
+from frappe.utils import validate_email_address
+
+
+@frappe.whitelist()
+def bulk_send_email(
+    subject,
+    message,
+    recipients,
+    cc=None,
+    bcc=None,
+    attachments=None,
+):
+    capabilities = _require_unity_access()
+    if not capabilities.get("can_view_all_tickets"):
+        frappe.throw(
+            _("You are not allowed to send bulk emails"),
+            frappe.PermissionError,
+        )
+
+    subject = cstr(subject or "").strip()
+    message = cstr(message or "").strip()
+    if not subject:
+        frappe.throw(_("Subject is required"))
+    if not message:
+        frappe.throw(_("Message is required"))
+
+    parsed = _parse_json(recipients, [])
+    raw_emails = []
+    for item in parsed or []:
+        if isinstance(item, str):
+            raw_emails.append(item)
+        elif isinstance(item, dict):
+            raw_emails.append(item.get("email"))
+    valid_emails = []
+    invalid_count = 0
+    seen = set()
+    for value in raw_emails:
+        email = cstr(value or "").strip().lower()
+        if not email or email in seen:
+            continue
+        if not validate_email_address(email, throw=False):
+            invalid_count += 1
+            continue
+        seen.add(email)
+        valid_emails.append(email)
+
+    if not valid_emails:
+        frappe.throw(_("At least one valid email address is required"))
+
+    cc_list = _split_email_list(cc)
+    bcc_list = _split_email_list(bcc)
+    # Hard cap to avoid accidental mega-sends.
+    if len(valid_emails) + len(cc_list) + len(bcc_list) > 1000:
+        frappe.throw(_("Bulk email recipients exceed the 1000 address limit"))
+
+    audit_description = _bulk_email_audit_html(valid_emails, cc_list, bcc_list, message)
+    payload = {
+        "doctype": TICKET_DOCTYPE,
+        "subject": subject,
+        "raised_by": frappe.session.user,
+        "description": audit_description,
+        "status": "Open",
+    }
+    if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
+        payload["custom_via_unity_portal"] = 1
+    if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
+        payload["custom_is_bulk_email"] = 1
+    doc = frappe.get_doc(payload).insert(ignore_permissions=True)
+
+    attachment_list = _parse_json(attachments, []) or []
+    sendmail_attachments = [
+        {"file_url": name}
+        for name in attachment_list
+        if name and frappe.db.exists("File", name)
+    ]
+
+    # Create a Communication immediately so the sent message appears in the ticket thread.
+    # Use frappe's make() which handles linking/indexing correctly.
+    recipients_display = ", ".join(valid_emails[:5])
+    if len(valid_emails) > 5:
+        recipients_display += f" (+{len(valid_emails) - 5} more)"
+    try:
+        from frappe.core.doctype.communication.email import make as make_comm
+        make_comm(
+            doctype=TICKET_DOCTYPE,
+            name=doc.name,
+            subject=subject,
+            content=message,
+            sent_or_received="Sent",
+            sender=frappe.session.user,
+            recipients=recipients_display,
+            cc=", ".join(cc_list) if cc_list else "",
+            communication_medium="Email",
+            send_email=False,
+        )
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Unity Helpdesk bulk_send_email: Communication creation")
+
+    warning = ""
+    queued = 0
+    try:
+        # BCC all real recipients so they can't see one another.
+        frappe.sendmail(
+            recipients=[frappe.session.user],
+            cc=cc_list or None,
+            bcc=valid_emails + bcc_list,
+            subject=subject,
+            message=message,
+            attachments=sendmail_attachments,
+            delayed=True,
+        )
+        queued = len(valid_emails)
+    except Exception as exc:
+        if _is_missing_sender_error(exc):
+            warning = _("Audit-trail ticket created, but no outgoing email account is configured. No email was sent.")
+        else:
+            warning = _("Audit-trail ticket created, but the email could not be queued: {0}").format(exc)
+            frappe.log_error(frappe.get_traceback(), "Unity Helpdesk bulk_send_email")
+
+    return {
+        "ok": True,
+        "ticket": doc.name,
+        "queued": queued,
+        "invalid_count": invalid_count,
+        "warning": warning,
+    }
+
+
+def _split_email_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = value
+    else:
+        items = cstr(value).replace(";", ",").split(",")
+    out = []
+    seen = set()
+    for item in items:
+        email = cstr(item or "").strip().lower()
+        if not email or email in seen:
+            continue
+        if validate_email_address(email, throw=False):
+            seen.add(email)
+            out.append(email)
+    return out
+
+
+def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
+    # Collapsible recipient list
+    recipient_items = "".join(
+        f"<li style='font-size:12px;color:#475569'>{frappe.utils.escape_html(e)}</li>"
+        for e in recipients
+    )
+    recipient_block = (
+        f"<details style='margin:6px 0'>"
+        f"<summary style='cursor:pointer;font-weight:600;color:#3730a3'>"
+        f"📧 {len(recipients)} recipient{'s' if len(recipients) != 1 else ''} (click to expand)"
+        f"</summary>"
+        f"<ul style='margin:6px 0 0 16px;padding:0'>{recipient_items}</ul>"
+        f"</details>"
+    )
+    sections = [
+        "<p><strong>📢 Bulk Email</strong></p>",
+        recipient_block,
+    ]
+    if cc_list:
+        sections.append(f"<p><strong>CC:</strong> {', '.join(cc_list)}</p>")
+    if bcc_list:
+        sections.append(f"<p><strong>Additional BCC:</strong> {', '.join(bcc_list)}</p>")
+    sections.append("<hr style='margin:12px 0'>")
+    sections.append("<p><strong>Message sent:</strong></p>")
+    sections.append(message)
+    return "".join(sections)
+
+
+@frappe.whitelist(allow_guest=False)
+def get_bulk_email_sample_csv():
+    _require_unity_access()
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["email", "name"])
+    writer.writerow(["parent1@example.com", "Parent One"])
+    writer.writerow(["parent2@example.com", "Parent Two"])
+    writer.writerow(["guardian3@example.com", "Guardian Three"])
+    frappe.response["type"] = "csv"
+    frappe.response["doctype"] = "bulk_email_sample"
+    frappe.response["result"] = buffer.getvalue()

@@ -4,6 +4,8 @@
       <button class="btn secondary" @click="goBackToList">
         Back to Tickets
       </button>
+      <button v-if="prevTicketId" class="btn secondary nav-btn" title="Previous ticket" @click="goToPrevTicket">← Prev</button>
+      <button v-if="nextTicketId" class="btn secondary nav-btn" title="Next ticket" @click="goToNextTicket">Next →</button>
       <strong v-if="ticket.name">#{{ ticket.name }}</strong>
       <span
         v-if="ticket.status_indicator"
@@ -17,6 +19,14 @@
       </button>
     </div>
 
+    <div v-if="reloading" class="reloading-indicator">
+      <span class="reload-spinner" aria-hidden="true"></span>
+      <span>Reloading…</span>
+    </div>
+    <div v-if="reloadPrompt" class="reload-prompt">
+      <span>Couldn't load this ticket.</span>
+      <button type="button" class="btn secondary" @click="loadTicket()">Retry</button>
+    </div>
     <p v-if="error" class="error">{{ error }}</p>
     <p v-else-if="notice" class="warning-banner">{{ notice }}</p>
     <div v-else-if="loading" class="detail-skeleton" aria-hidden="true">
@@ -50,7 +60,8 @@
 
         <section
           v-if="
-            shouldRenderStructuredStudentContext || showLegacyStudentSection
+            !ticket.custom_is_bulk_email &&
+            (shouldRenderStructuredStudentContext || showLegacyStudentSection)
           "
           class="detail-section"
         >
@@ -81,7 +92,14 @@
                     >
                       <div class="student-context-table__heading">
                         <strong>{{ student.name }}</strong>
-                        <small>{{ student.id }}</small>
+                        <small>
+                          <a
+                            :href="`/app/student/${student.id}`"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            class="student-id-link"
+                          >{{ student.id }}</a>
+                        </small>
                         <span class="student-context-pill">
                           {{ student.role }}
                         </span>
@@ -293,6 +311,15 @@
           </div>
         </section>
 
+        <!-- Bulk email: always show collapsible recipients + message summary -->
+        <section
+          v-if="ticket.custom_is_bulk_email && ticket.description"
+          class="detail-section bulk-audit-section"
+        >
+          <h3>Bulk Email — Recipients &amp; Message</h3>
+          <div class="detail-body safe-html" v-html="sanitize(ticket.description)"></div>
+        </section>
+
         <section v-if="timeline.length" class="detail-section">
           <h3>Email Thread</h3>
           <div class="chat-thread">
@@ -319,6 +346,12 @@
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
+              </div>
+              <div
+                v-if="item._type === 'comm' && item.sent_or_received === 'Sent' && item.recipients"
+                class="chat-msg-recipients"
+              >
+                <span class="chat-msg-to-label">To:</span>{{ item.recipients }}
               </div>
               <div
                 class="chat-msg-body safe-html"
@@ -527,7 +560,17 @@
         </section>
 
         <section class="detail-section">
-          <h3>Assignment History</h3>
+          <div class="detail-section-heading">
+            <h3>Assignment History</h3>
+            <button
+              type="button"
+              class="link-btn"
+              title="Open HD Ticket in Desk"
+              @click="openDeskTicket(ticket.name)"
+            >
+              Open in Desk ↗
+            </button>
+          </div>
           <div class="detail-body history">
             <p v-if="!assignmentHistory.length" class="muted">
               No assignment history yet.
@@ -582,6 +625,7 @@ import { useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 import {
   call,
+  callWithRetry,
   formatDate,
   formatDateTime,
   getAgents,
@@ -603,6 +647,8 @@ const ticketTypes = ref([]);
 const communications = ref([]);
 const comments = ref([]);
 const loading = ref(false);
+const reloading = ref(false);
+const reloadPrompt = ref(false);
 const saving = ref(false);
 const error = ref(""); // page-load errors only
 const notice = ref("");
@@ -718,10 +764,6 @@ const structuredStudentRows = computed(() => {
     ["Guardian Emails", (student) => displayList(student.guardian_emails)],
     ["Payment Plan", (student) => displayPaymentPlan(student)],
     ["Fees", (student) => displayFeesDocument(student)],
-    ["Total Fees", (student) => formatMoney(student.fees?.grand_total)],
-    ["Fees Paid", (student) => formatMoney(student.fees?.paid_amount)],
-    ["Outstanding", (student) => formatMoney(student.fees?.outstanding_amount)],
-    ["Due Date", (student) => formatDate(student.fees?.due_date)],
     ["Fee Link", (student) => displayFeeLink(student)],
     [
       "Next Payment Plan",
@@ -848,10 +890,23 @@ function studentRoleLabel(student) {
 }
 
 function displayClassCell(student) {
-  const className = displayValue(student.class_program);
-  if (className === "-") return displayValue(student.division);
+  const classNumber = cleanText(String(student?.class_number || ""));
   const division = cleanText(String(student?.division || ""));
-  return division ? `${division} - ${className}` : className;
+  const location = cleanText(String(student?.school_location || ""));
+  const school = cleanText(String(student?.school || ""));
+
+  if (classNumber && division) {
+    // "8-E-Shivane"
+    return [classNumber, division, location].filter(Boolean).join("-");
+  }
+  if (classNumber) {
+    // "Nursery-Baby Walnut Shivane" — use full school name, fall back to location
+    return [classNumber, school || location].filter(Boolean).join("-");
+  }
+  // No class_number — use full class_program (e.g. "Nursery-Baby Walnut Shivane")
+  const program = displayValue(student?.class_program);
+  if (program !== "-") return program;
+  return school || location || "-";
 }
 
 function displayPEDocumentStatus(student) {
@@ -919,6 +974,35 @@ function goBackToList() {
     path: `/tickets/${listView}`,
     query: { ...route.query, list_view: undefined },
   });
+}
+
+// Prev / Next ticket navigation
+const ticketNav = computed(() => {
+  try {
+    return JSON.parse(sessionStorage.getItem("unity:ticket_nav") || "null");
+  } catch { return null; }
+});
+const currentNavIdx = computed(() => {
+  if (!ticketNav.value?.ids) return -1;
+  return ticketNav.value.ids.indexOf(String(props.ticketId));
+});
+const prevTicketId = computed(() =>
+  currentNavIdx.value > 0 ? ticketNav.value.ids[currentNavIdx.value - 1] : null
+);
+const nextTicketId = computed(() => {
+  const nav = ticketNav.value;
+  return nav && currentNavIdx.value >= 0 && currentNavIdx.value < nav.ids.length - 1
+    ? nav.ids[currentNavIdx.value + 1]
+    : null;
+});
+
+function goToPrevTicket() {
+  if (prevTicketId.value)
+    router.push({ path: `/tickets/${prevTicketId.value}`, query: route.query });
+}
+function goToNextTicket() {
+  if (nextTicketId.value)
+    router.push({ path: `/tickets/${nextTicketId.value}`, query: route.query });
 }
 
 function formatMoney(value) {
@@ -1230,15 +1314,22 @@ async function loadTicket() {
   activeTicketRequestId = requestId;
   loading.value = true;
   error.value = "";
+  reloading.value = false;
+  reloadPrompt.value = false;
   notice.value = sessionStorage.getItem(TICKET_NOTICE_KEY) || "";
   if (notice.value) {
     sessionStorage.removeItem(TICKET_NOTICE_KEY);
   }
   try {
-    const detail = await call(
+    const detail = await callWithRetry(
       "helpdesk.api.unity_helpdesk_ext.get_ticket_detail",
       { name: props.ticketId },
-      { timeoutMs: 20000 }
+      {
+        timeoutMs: 20000,
+        onAttempt: () => {
+          if (requestId === activeTicketRequestId) reloading.value = true;
+        },
+      }
     );
     if (requestId !== activeTicketRequestId) return;
     ticket.value = detail;
@@ -1255,11 +1346,16 @@ async function loadTicket() {
     });
   } catch (err) {
     if (requestId === activeTicketRequestId) {
-      error.value = err.message;
+      if (err.code === "NETWORK_ERROR" || (err.status && err.status >= 500)) {
+        reloadPrompt.value = true;
+      } else {
+        error.value = err.message;
+      }
     }
   } finally {
     if (requestId === activeTicketRequestId) {
       loading.value = false;
+      reloading.value = false;
     }
   }
 }

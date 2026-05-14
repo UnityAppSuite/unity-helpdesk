@@ -27,6 +27,26 @@ from helpdesk.utils import capture_event, get_customer, is_agent, publish_event
 from ..hd_notification.utils import clear as clear_notifications
 from ..hd_service_level_agreement.utils import get_sla
 
+_KEYWORD_CACHE_KEY = "hd_ticket_type_keywords"
+
+
+def _get_ticket_type_keyword_map():
+	cached = frappe.cache().get_value(_KEYWORD_CACHE_KEY)
+	if cached is not None:
+		return cached
+	rows = frappe.get_all(
+		"HD Ticket Type",
+		filters=[["keywords", "!=", ""]],
+		fields=["name", "keywords"],
+	)
+	result = {}
+	for row in rows:
+		kws = [k.strip().lower() for k in (row.keywords or "").split(",") if k.strip()]
+		if kws:
+			result[row.name] = kws
+	frappe.cache().set_value(_KEYWORD_CACHE_KEY, result, expires_in_sec=3600)
+	return result
+
 
 class HDTicket(Document):
 	@staticmethod
@@ -229,9 +249,24 @@ class HDTicket(Document):
 	def set_ticket_type(self):
 		if self.ticket_type:
 			return
-		settings = frappe.get_doc("HD Settings")
-		ticket_type = settings.default_ticket_type or DEFAULT_TICKET_TYPE
-		self.ticket_type = ticket_type
+		# Keywords take priority — only fall back to the default if no keyword matches
+		self.auto_assign_ticket_type()
+		if not self.ticket_type:
+			settings = frappe.get_doc("HD Settings")
+			if settings.default_ticket_type:
+				self.ticket_type = settings.default_ticket_type
+
+	def auto_assign_ticket_type(self):
+		if self.ticket_type:
+			return
+		text = f"{self.subject or ''} {self.description or ''}".lower()
+		if not text.strip():
+			return
+		keyword_map = _get_ticket_type_keyword_map()
+		for ticket_type, keywords in keyword_map.items():
+			if any(kw in text for kw in keywords):
+				self.ticket_type = ticket_type
+				return
 
 	def set_raised_by(self):
 		self.raised_by = self.raised_by or frappe.session.user

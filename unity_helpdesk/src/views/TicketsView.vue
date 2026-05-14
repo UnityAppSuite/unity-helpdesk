@@ -113,6 +113,82 @@
       >
         Refresh
       </button>
+      <button
+        class="btn secondary toolbar-columns"
+        type="button"
+        title="Customize columns"
+        @click="openColumnPanel"
+      >
+        Columns
+      </button>
+    </div>
+
+    <div
+      v-if="showColumnPanel"
+      class="modal-backdrop"
+      @click.self="closeColumnPanel"
+    >
+      <section class="modal-card column-panel">
+        <div class="modal-header">
+          <div>
+            <strong>Customize columns</strong>
+            <span>Show, hide, reorder and resize ticket columns.</span>
+          </div>
+          <button class="btn secondary" @click="closeColumnPanel">Close</button>
+        </div>
+        <div class="modal-body stack">
+          <ol class="column-list">
+            <li
+              v-for="(col, index) in draftColumns"
+              :key="col.key"
+              class="column-list-item"
+              draggable="true"
+              :class="{ dragging: dragIndex === index }"
+              @dragstart="onDragStart(index)"
+              @dragover="onDragOver($event, index)"
+              @dragend="onDragEnd"
+            >
+              <span class="drag-handle" title="Drag to reorder">⠿</span>
+              <label class="column-list-toggle">
+                <input
+                  type="checkbox"
+                  :checked="col.visible"
+                  :disabled="col.fixed"
+                  @change="toggleDraftColumn(index)"
+                />
+                <span>{{ col.label }}</span>
+                <small v-if="col.fixed" class="muted">(always shown)</small>
+              </label>
+              <input
+                type="number"
+                class="column-list-width"
+                min="60"
+                max="600"
+                step="10"
+                :value="col.width"
+                title="Width (px)"
+                @input="col.width = clampColumnWidth($event.target.value)"
+              />
+            </li>
+          </ol>
+        </div>
+        <div class="modal-footer">
+          <button
+            type="button"
+            class="btn secondary"
+            @click="resetDraftColumns"
+          >
+            Reset to defaults
+          </button>
+          <button
+            class="btn"
+            :disabled="savingColumns"
+            @click="saveColumnPreferences"
+          >
+            {{ savingColumns ? "Saving…" : "Save" }}
+          </button>
+        </div>
+      </section>
     </div>
 
     <div class="metrics">
@@ -143,6 +219,14 @@
         <strong>{{ title }}</strong>
         <span>{{ result.total_count || 0 }} tickets</span>
       </div>
+      <div v-if="reloading" class="reloading-indicator">
+        <span class="reload-spinner" aria-hidden="true"></span>
+        <span>Reloading…</span>
+      </div>
+      <div v-if="reloadPrompt" class="reload-prompt">
+        <span>Couldn't load tickets.</span>
+        <button type="button" class="btn secondary" @click="load()">Retry</button>
+      </div>
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
       <p v-else-if="!tickets.length && appliedSearch" class="empty">
@@ -154,147 +238,209 @@
         <table class="ticket-table">
           <thead>
             <tr>
-              <th>Ticket ID</th>
-              <th>Subject</th>
-              <th>Ticket Type</th>
-              <th>Priority</th>
-              <th>Status</th>
-              <th>Assigned To</th>
-              <th>Created On</th>
-              <th>Issues On Hold</th>
-              <th>Reason Of Hold</th>
+              <th
+                v-for="(col, colIdx) in visibleColumns"
+                :key="col.key"
+                :style="{ width: col.width + 'px', minWidth: col.width + 'px' }"
+                :class="{ 'col-dragging': colDragIdx === colIdx, 'col-draggable': !col.fixed }"
+                :draggable="!col.fixed"
+                @dragstart="onColDragStart($event, colIdx)"
+                @dragover="onColDragOver($event, colIdx)"
+                @dragend="onColDragEnd"
+                @drop.prevent
+              >
+                <span v-if="!col.fixed" class="col-drag-handle">⠿</span>
+                {{ col.label }}
+                <button
+                  v-if="!col.fixed"
+                  class="col-remove-btn"
+                  title="Remove column"
+                  type="button"
+                  @click.stop="removeColumn(col.key)"
+                >×</button>
+                <span
+                  v-if="!col.fixed"
+                  class="col-resize-grabber"
+                  title="Drag to resize"
+                  @mousedown="startColumnResize($event, col)"
+                ></span>
+              </th>
+              <!-- Add Column -->
+              <th class="col-add-th">
+                <div class="col-add-wrap">
+                  <button class="col-add-btn" type="button" title="Add column" @click.stop="toggleAddColumnMenu">+</button>
+                  <div v-if="showAddCol" class="col-add-dropdown">
+                    <button
+                      v-for="c in hiddenColumns"
+                      :key="c.key"
+                      class="col-add-item"
+                      type="button"
+                      @click.stop="addColumn(c.key)"
+                    >{{ c.label }}</button>
+                    <span v-if="!hiddenColumns.length" class="col-add-empty">All columns shown</span>
+                  </div>
+                </div>
+              </th>
             </tr>
           </thead>
           <tbody>
             <tr
               v-for="ticket in tickets"
               :key="ticket.name"
+              :class="{
+                'portal-ticket': ticket.custom_via_unity_portal && !ticket.custom_is_bulk_email,
+                'bulk-email-ticket': ticket.custom_is_bulk_email,
+              }"
               @click="openTicket(ticket.name)"
             >
-              <td>
-                <button
-                  class="link-btn"
-                  type="button"
-                  @click.stop="openDeskTicket(ticket.name)"
-                >
-                  #{{ ticket.name }}
-                </button>
-              </td>
-              <td>
-                <div class="subject">{{ ticket.subject || "No subject" }}</div>
-                <small class="muted">{{ ticket.raised_by }}</small>
-              </td>
-              <td class="cell-edit" @click.stop>
-                <select
-                  v-model="editState[ticket.name].ticket_type"
-                  :class="[
-                    'select-chip',
-                    ticketTypeClass(editState[ticket.name].ticket_type),
-                  ]"
-                  :disabled="isSaving(ticket.name)"
-                  @change="
-                    quickUpdate(
-                      ticket,
-                      'ticket_type',
-                      editState[ticket.name].ticket_type
-                    )
-                  "
-                >
-                  <option value="">Not set</option>
-                  <option
-                    v-for="type in ticketTypes"
-                    :key="type.name"
-                    :value="type.name"
+              <td
+                v-for="col in visibleColumns"
+                :key="col.key"
+                :class="{ 'cell-edit': isEditableColumn(col.key) }"
+                :style="{ minWidth: col.width + 'px' }"
+                @click="onCellClick($event, col.key)"
+              >
+                <template v-if="col.key === 'name'">
+                  <button
+                    class="link-btn"
+                    type="button"
+                    @click.stop="openTicket(ticket.name)"
                   >
-                    {{ type.name }}
-                  </option>
-                </select>
-              </td>
-              <td class="cell-edit" @click.stop>
-                <select
-                  v-model="editState[ticket.name].priority"
-                  :class="[
-                    'select-chip',
-                    priorityClass(editState[ticket.name].priority),
-                  ]"
-                  :disabled="isSaving(ticket.name)"
-                  @change="
-                    quickUpdate(
-                      ticket,
-                      'priority',
-                      editState[ticket.name].priority
-                    )
-                  "
-                >
-                  <option value="">Not set</option>
-                  <option>High</option>
-                  <option>Medium</option>
-                  <option>Low</option>
-                </select>
-              </td>
-              <td class="cell-edit" @click.stop>
-                <select
-                  v-model="editState[ticket.name].status"
-                  :class="[
-                    'select-chip',
-                    statusClass(ticket, editState[ticket.name].status),
-                  ]"
-                  :disabled="isSaving(ticket.name)"
-                  @change="
-                    quickUpdate(ticket, 'status', editState[ticket.name].status)
-                  "
-                >
-                  <option>On Hold</option>
-                  <option>Open</option>
-                  <option>Replied</option>
-                  <option>Resolved</option>
-                  <option>Closed</option>
-                </select>
-              </td>
-              <td class="cell-edit" @click.stop>
-                <select
-                  v-model="editState[ticket.name].assignee"
-                  :class="[
-                    'select-chip',
-                    assignmentClass(editState[ticket.name].assignee),
-                  ]"
-                  :disabled="isSaving(ticket.name)"
-                  @change="
-                    quickUpdate(
-                      ticket,
-                      'assignee',
-                      editState[ticket.name].assignee
-                    )
-                  "
-                >
-                  <option value="">Unassigned</option>
-                  <option
-                    v-for="agent in agents"
-                    :key="agent.name"
-                    :value="agent.name"
+                    #{{ ticket.name }}
+                  </button>
+                </template>
+                <template v-else-if="col.key === 'subject'">
+                  <div class="subject">{{ ticket.subject || "No subject" }}</div>
+                  <small class="muted">
+                    <a :href="`mailto:${ticket.raised_by}`" @click.stop>{{ ticket.raised_by }}</a>
+                  </small>
+                  <small v-if="ticket.custom_search_student_names" class="student-names">
+                    {{ ticket.custom_search_student_names }}
+                  </small>
+                </template>
+                <template v-else-if="col.key === 'ticket_type'">
+                  <select
+                    v-model="editState[ticket.name].ticket_type"
+                    :class="[
+                      'select-chip',
+                      ticketTypeClass(editState[ticket.name].ticket_type),
+                    ]"
+                    :disabled="isSaving(ticket.name)"
+                    @change="
+                      quickUpdate(
+                        ticket,
+                        'ticket_type',
+                        editState[ticket.name].ticket_type
+                      )
+                    "
                   >
-                    {{ agent.full_name || agent.name }}
-                  </option>
-                </select>
+                    <option value="">Not set</option>
+                    <!-- Ensure current value is always an option even while ticketTypes loads -->
+                    <option
+                      v-if="editState[ticket.name].ticket_type && !ticketTypes.find(t => t.name === editState[ticket.name].ticket_type)"
+                      :value="editState[ticket.name].ticket_type"
+                    >{{ editState[ticket.name].ticket_type }}</option>
+                    <option
+                      v-for="type in ticketTypes"
+                      :key="type.name"
+                      :value="type.name"
+                    >
+                      {{ type.name }}
+                    </option>
+                  </select>
+                </template>
+                <template v-else-if="col.key === 'priority'">
+                  <select
+                    v-model="editState[ticket.name].priority"
+                    :class="[
+                      'select-chip',
+                      priorityClass(editState[ticket.name].priority),
+                    ]"
+                    :disabled="isSaving(ticket.name)"
+                    @change="
+                      quickUpdate(
+                        ticket,
+                        'priority',
+                        editState[ticket.name].priority
+                      )
+                    "
+                  >
+                    <option value="">Not set</option>
+                    <option>High</option>
+                    <option>Medium</option>
+                    <option>Low</option>
+                  </select>
+                </template>
+                <template v-else-if="col.key === 'status'">
+                  <select
+                    v-model="editState[ticket.name].status"
+                    :class="[
+                      'select-chip',
+                      statusClass(ticket, editState[ticket.name].status),
+                    ]"
+                    :disabled="isSaving(ticket.name)"
+                    @change="
+                      quickUpdate(ticket, 'status', editState[ticket.name].status)
+                    "
+                  >
+                    <option>On Hold</option>
+                    <option>Open</option>
+                    <option>Replied</option>
+                    <option>Resolved</option>
+                    <option>Closed</option>
+                  </select>
+                </template>
+                <template v-else-if="col.key === '_assign'">
+                  <select
+                    v-model="editState[ticket.name].assignee"
+                    :class="[
+                      'select-chip',
+                      assignmentClass(editState[ticket.name].assignee),
+                    ]"
+                    :disabled="isSaving(ticket.name)"
+                    @change="
+                      quickUpdate(
+                        ticket,
+                        'assignee',
+                        editState[ticket.name].assignee
+                      )
+                    "
+                  >
+                    <option value="">Unassigned</option>
+                    <option
+                      v-for="agent in agents"
+                      :key="agent.name"
+                      :value="agent.name"
+                    >
+                      {{ agent.full_name || agent.name }}
+                    </option>
+                  </select>
+                </template>
+                <template v-else-if="col.key === 'creation'">
+                  {{ formatDate(ticket.creation) }}
+                </template>
+                <template v-else-if="col.key === 'custom_is_on_hold'">
+                  <span v-if="ticket.custom_is_on_hold">
+                    {{ formatHoldWindow(ticket) }}
+                  </span>
+                  <span v-else class="muted">-</span>
+                </template>
+                <template v-else-if="col.key === 'custom_hold_reason'">
+                  <input
+                    v-model="editState[ticket.name].hold_reason"
+                    class="table-input"
+                    type="text"
+                    :disabled="isSaving(ticket.name)"
+                    placeholder="Add hold reason"
+                    @blur="saveHoldReason(ticket)"
+                    @keyup.enter="saveHoldReason(ticket)"
+                  />
+                </template>
+                <template v-else>
+                  <span>{{ formatCellValue(ticket, col.key) }}</span>
+                </template>
               </td>
-              <td>{{ formatDate(ticket.creation) }}</td>
-              <td>
-                <span v-if="ticket.custom_is_on_hold">
-                  {{ formatHoldWindow(ticket) }}
-                </span>
-                <span v-else class="muted">-</span>
-              </td>
-              <td class="cell-edit" @click.stop>
-                <input
-                  v-model="editState[ticket.name].hold_reason"
-                  class="table-input"
-                  type="text"
-                  :disabled="isSaving(ticket.name)"
-                  placeholder="Add hold reason"
-                  @blur="saveHoldReason(ticket)"
-                  @keyup.enter="saveHoldReason(ticket)"
-                />
-              </td>
+              <td class="col-add-td"></td>
             </tr>
           </tbody>
         </table>
@@ -312,25 +458,30 @@
 </template>
 
 <script setup>
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, inject, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   call,
+  callWithRetry,
   formatDate,
+  formatDateTime,
   getAgents,
   getTicketTypes,
-  openDeskPath,
 } from "../api";
 
 const props = defineProps({ view: { type: String, default: "my" } });
 const emit = defineEmits(["title"]);
 const route = useRoute();
 const router = useRouter();
+const unitySession = inject("unitySession", null);
+const refreshUnitySession = inject("refreshUnitySession", null);
 
 const draftSearch = ref("");
 const appliedSearch = ref("");
 const loading = ref(false);
 const loadingMore = ref(false);
+const reloading = ref(false);
+const reloadPrompt = ref(false);
 const error = ref("");
 const emptyMessage = ref("No tickets found.");
 const agents = ref([]);
@@ -353,6 +504,249 @@ const filters = reactive({
 });
 let activeController = null;
 let activeRequestId = 0;
+
+// --- Column customization ---
+const showColumnPanel = ref(false);
+const draftColumns = ref([]); // popover working copy: [{ key, visible, width }]
+const savingColumns = ref(false);
+
+const availableColumns = computed(
+  () => unitySession?.available_columns || []
+);
+const availableColumnMap = computed(() => {
+  const map = {};
+  for (const col of availableColumns.value) map[col.key] = col;
+  return map;
+});
+const visibleColumns = computed(() => {
+  const prefs =
+    (unitySession?.settings?.column_preferences || []).filter(
+      (p) => availableColumnMap.value[p.key]
+    ) || [];
+  return prefs.map((p) => ({
+    ...availableColumnMap.value[p.key],
+    width: p.width,
+  }));
+});
+
+function buildDraftColumns() {
+  const prefs = unitySession?.settings?.column_preferences || [];
+  const selectedSet = new Set(prefs.map((p) => p.key));
+  // Selected first (preserves user order), unselected appended at the bottom.
+  const draft = prefs
+    .map((p) => {
+      const def = availableColumnMap.value[p.key];
+      if (!def) return null;
+      return {
+        key: p.key,
+        label: def.label,
+        fixed: def.fixed,
+        width: p.width || def.width || 140,
+        visible: true,
+      };
+    })
+    .filter(Boolean);
+  for (const col of availableColumns.value) {
+    if (selectedSet.has(col.key)) continue;
+    draft.push({
+      key: col.key,
+      label: col.label,
+      fixed: col.fixed,
+      width: col.width || 140,
+      visible: false,
+    });
+  }
+  return draft;
+}
+
+function openColumnPanel() {
+  draftColumns.value = buildDraftColumns();
+  showColumnPanel.value = true;
+}
+
+function closeColumnPanel() {
+  showColumnPanel.value = false;
+}
+
+const dragIndex = ref(null);
+
+function onDragStart(index) {
+  dragIndex.value = index;
+}
+function onDragOver(e, index) {
+  e.preventDefault();
+  if (dragIndex.value === null || dragIndex.value === index) return;
+  const arr = draftColumns.value.slice();
+  const [item] = arr.splice(dragIndex.value, 1);
+  arr.splice(index, 0, item);
+  draftColumns.value = arr;
+  dragIndex.value = index;
+}
+function onDragEnd() {
+  dragIndex.value = null;
+}
+
+function toggleDraftColumn(index) {
+  const col = draftColumns.value[index];
+  if (col.fixed) return;
+  draftColumns.value = draftColumns.value.map((c, i) =>
+    i === index ? { ...c, visible: !c.visible } : c
+  );
+}
+
+function resetDraftColumns() {
+  draftColumns.value = (availableColumns.value || []).map((col) => ({
+    key: col.key,
+    label: col.label,
+    fixed: col.fixed,
+    width: col.width || 140,
+    visible: !!col.default,
+  }));
+}
+
+async function saveColumnPreferences() {
+  const payload = draftColumns.value
+    .filter((c) => c.visible)
+    .map((c) => ({ key: c.key, width: clampColumnWidth(c.width) }));
+  savingColumns.value = true;
+  try {
+    await call("helpdesk.api.unity_helpdesk.update_column_preferences", {
+      column_preferences: JSON.stringify(payload),
+    });
+    if (refreshUnitySession) await refreshUnitySession();
+    showColumnPanel.value = false;
+    await load();
+  } catch (err) {
+    error.value = err.message;
+  } finally {
+    savingColumns.value = false;
+  }
+}
+
+// Shared helper: persist a raw prefs array and refresh
+async function persistColumnPrefs(prefs) {
+  try {
+    await call("helpdesk.api.unity_helpdesk.update_column_preferences", {
+      column_preferences: JSON.stringify(prefs),
+    });
+    if (refreshUnitySession) await refreshUnitySession();
+    await load();
+  } catch (err) {
+    error.value = err.message;
+  }
+}
+
+// Inline column management (header drag / remove / add)
+const colDragIdx = ref(null);
+const showAddCol = ref(false);
+
+const hiddenColumns = computed(() => {
+  const visible = new Set(
+    (unitySession?.settings?.column_preferences || []).map((p) => p.key)
+  );
+  return (availableColumns.value || []).filter((c) => !visible.has(c.key));
+});
+
+function toggleAddColumnMenu() {
+  showAddCol.value = !showAddCol.value;
+}
+
+function onColDragStart(e, idx) {
+  colDragIdx.value = idx;
+  e.dataTransfer.effectAllowed = "move";
+}
+
+function onColDragOver(e, idx) {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "move";
+  if (colDragIdx.value === null || colDragIdx.value === idx) return;
+  const prefs = (unitySession?.settings?.column_preferences || []).slice();
+  const [moved] = prefs.splice(colDragIdx.value, 1);
+  prefs.splice(idx, 0, moved);
+  if (unitySession) unitySession.settings.column_preferences = prefs;
+  colDragIdx.value = idx;
+}
+
+async function onColDragEnd() {
+  colDragIdx.value = null;
+  await persistColumnPrefs(unitySession?.settings?.column_preferences || []);
+}
+
+async function removeColumn(key) {
+  const prefs = (unitySession?.settings?.column_preferences || []).filter(
+    (p) => p.key !== key
+  );
+  await persistColumnPrefs(prefs);
+}
+
+async function addColumn(key) {
+  const def = availableColumnMap.value[key];
+  if (!def) return;
+  const prefs = [
+    ...(unitySession?.settings?.column_preferences || []),
+    { key, width: def.width || 140 },
+  ];
+  showAddCol.value = false;
+  await persistColumnPrefs(prefs);
+}
+
+// Close add-column dropdown on outside click
+function onDocClick() {
+  showAddCol.value = false;
+}
+onMounted(() => document.addEventListener("click", onDocClick));
+onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
+
+function clampColumnWidth(width) {
+  const n = Number.parseInt(width, 10);
+  if (Number.isNaN(n)) return 140;
+  return Math.min(600, Math.max(60, n));
+}
+
+// Column resize (drag right edge of <th>)
+const resizingKey = ref(null);
+let resizeStartX = 0;
+let resizeStartWidth = 0;
+
+function startColumnResize(event, col) {
+  if (!col || col.fixed === undefined) return;
+  resizingKey.value = col.key;
+  resizeStartX = event.clientX;
+  resizeStartWidth = col.width || 140;
+  document.body.classList.add("col-resizing");
+  window.addEventListener("mousemove", handleColumnResize);
+  window.addEventListener("mouseup", endColumnResize, { once: true });
+  event.preventDefault();
+  event.stopPropagation();
+}
+
+function handleColumnResize(event) {
+  if (!resizingKey.value) return;
+  const delta = event.clientX - resizeStartX;
+  const next = clampColumnWidth(resizeStartWidth + delta);
+  const prefs = (unitySession?.settings?.column_preferences || []).map((p) =>
+    p.key === resizingKey.value ? { ...p, width: next } : p
+  );
+  if (unitySession) unitySession.settings.column_preferences = prefs;
+}
+
+function endColumnResize() {
+  window.removeEventListener("mousemove", handleColumnResize);
+  document.body.classList.remove("col-resizing");
+  const key = resizingKey.value;
+  resizingKey.value = null;
+  if (!key) return;
+  // Persist new width
+  const payload = (unitySession?.settings?.column_preferences || []).map((p) => ({
+    key: p.key,
+    width: p.width,
+  }));
+  call("helpdesk.api.unity_helpdesk.update_column_preferences", {
+    column_preferences: JSON.stringify(payload),
+  }).catch(() => {
+    /* width is best-effort; ignore transient failures */
+  });
+}
 
 // --- Search UX helpers ---
 const RECENT_SEARCH_KEY = "unity-helpdesk:recent-searches";
@@ -596,9 +990,11 @@ async function load({ append = false } = {}) {
     loading.value = true;
   }
   error.value = "";
+  reloading.value = false;
+  reloadPrompt.value = false;
   emptyMessage.value = "No tickets found.";
   try {
-    const data = await call(
+    const data = await callWithRetry(
       "helpdesk.api.unity_helpdesk.get_tickets",
       {
         view: props.view,
@@ -610,6 +1006,9 @@ async function load({ append = false } = {}) {
       {
         signal: activeController.signal,
         timeoutMs: appliedSearch.value.trim() ? 20000 : 30000,
+        onAttempt: () => {
+          if (requestId === activeRequestId) reloading.value = true;
+        },
       }
     );
     if (requestId !== activeRequestId) return;
@@ -634,7 +1033,13 @@ async function load({ append = false } = {}) {
         : "Loading timed out. Please refresh and try again.";
       return;
     }
-    error.value = err.message;
+    // Network/5xx exhausted retries → unobtrusive reload prompt.
+    if (err.code === "NETWORK_ERROR" || (err.status && err.status >= 500)) {
+      reloadPrompt.value = true;
+    } else {
+      // Real 4xx / app error — surface message.
+      error.value = err.message;
+    }
   } finally {
     if (requestId === activeRequestId) {
       if (append) {
@@ -642,6 +1047,7 @@ async function load({ append = false } = {}) {
       } else {
         loading.value = false;
       }
+      reloading.value = false;
       activeController = null;
     }
   }
@@ -697,6 +1103,43 @@ function todayString() {
   return new Date().toISOString().slice(0, 10);
 }
 
+// --- Cell rendering helpers (used by the dynamic <td v-for> in the table) ---
+const EDITABLE_COLUMN_KEYS = new Set([
+  "ticket_type",
+  "priority",
+  "status",
+  "_assign",
+  "custom_hold_reason",
+]);
+
+function isEditableColumn(key) {
+  return EDITABLE_COLUMN_KEYS.has(key);
+}
+
+function onCellClick(event, key) {
+  if (EDITABLE_COLUMN_KEYS.has(key)) event.stopPropagation();
+}
+
+const DATE_COLUMN_KEYS = new Set(["creation", "custom_hold_from", "custom_hold_to"]);
+const DATETIME_COLUMN_KEYS = new Set([
+  "modified",
+  "response_by",
+  "resolution_by",
+  "first_responded_on",
+  "resolution_date",
+]);
+
+function formatCellValue(ticket, key) {
+  const raw = ticket?.[key];
+  if (raw == null || raw === "") return "-";
+  if (DATE_COLUMN_KEYS.has(key)) return formatDate(raw);
+  if (DATETIME_COLUMN_KEYS.has(key)) return formatDateTime(raw);
+  if (key === "_assign") {
+    return ticket.assignee || "Unassigned";
+  }
+  return String(raw);
+}
+
 function formatHoldWindow(ticket) {
   if (!ticket.custom_hold_from && !ticket.custom_hold_to) {
     return "On hold";
@@ -710,6 +1153,11 @@ function formatHoldWindow(ticket) {
 }
 
 function openTicket(name) {
+  // Store current list for prev/next navigation in ticket detail
+  sessionStorage.setItem(
+    "unity:ticket_nav",
+    JSON.stringify({ ids: tickets.value.map((t) => String(t.name)), view: props.view })
+  );
   router.push({
     path: `/tickets/${name}`,
     query: {
@@ -717,10 +1165,6 @@ function openTicket(name) {
       list_view: props.view,
     },
   });
-}
-
-function openDeskTicket(name) {
-  openDeskPath(`/app/hd-ticket/${name}`);
 }
 
 function assignmentClass(assignee) {

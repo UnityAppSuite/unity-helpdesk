@@ -7,6 +7,21 @@ export function sanitize(html) {
   });
 }
 
+async function _refreshCsrfToken() {
+  try {
+    const r = await fetch(
+      "/api/method/helpdesk.api.unity_helpdesk.get_csrf_token",
+      { method: "GET", credentials: "same-origin", cache: "no-store" }
+    );
+    const data = await r.json().catch(() => null);
+    if (data?.message) {
+      window.csrf_token = data.message;
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
 export async function call(method, params = {}, options = {}) {
   const controller = new AbortController();
   const timeoutMs = Number(options.timeoutMs || 0);
@@ -41,8 +56,39 @@ export async function call(method, params = {}, options = {}) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.exc || payload._server_messages) {
+      // CSRF token expired — fetch a fresh one and retry exactly once
+      if (response.status === 403 && payload?.exc_type === "CSRFTokenError") {
+        const refreshed = await _refreshCsrfToken();
+        if (refreshed) {
+          const retry = await fetch(`/api/method/${method}`, {
+            method: "POST",
+            cache: "no-store",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Frappe-CSRF-Token": window.csrf_token || "",
+            },
+            body: JSON.stringify(params),
+            credentials: "same-origin",
+          });
+          const retryPayload = await retry.json().catch(() => ({}));
+          if (!retry.ok || retryPayload.exc || retryPayload._server_messages) {
+            const message = extractError(retryPayload) || `Request failed: ${method}`;
+            const err = new Error(message);
+            err.status = retry.status;
+            err.payload = retryPayload;
+            throw err;
+          }
+          return retryPayload.message;
+        }
+        // Refresh failed — reload so the page gets a fresh token from server
+        window.location.reload();
+        return;
+      }
       const message = extractError(payload) || `Request failed: ${method}`;
-      throw new Error(message);
+      const err = new Error(message);
+      err.status = response.status;
+      err.payload = payload;
+      throw err;
     }
     return payload.message;
   } catch (error) {
@@ -56,6 +102,9 @@ export async function call(method, params = {}, options = {}) {
       wrapped.code = isTimeout ? "REQUEST_TIMEOUT" : "REQUEST_ABORTED";
       throw wrapped;
     }
+    if (error?.name === "TypeError") {
+      error.code = "NETWORK_ERROR";
+    }
     throw error;
   } finally {
     if (timeoutId) {
@@ -65,6 +114,37 @@ export async function call(method, params = {}, options = {}) {
       upstreamSignal.removeEventListener("abort", upstreamAbort);
     }
   }
+}
+
+// Retry transient network/5xx failures up to 3 attempts with backoff (1s, 3s, 7s).
+// Application errors (PermissionError, ValidationError, etc — 4xx + payload.exc
+// from a 200 response) surface immediately. options.onAttempt(n) is invoked
+// before each retry so views can show a "Reloading…" indicator.
+export async function callWithRetry(method, params = {}, options = {}) {
+  const delays = options.delays || [1000, 3000, 7000];
+  const onAttempt = options.onAttempt || (() => {});
+  let lastError;
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+    if (attempt > 0) onAttempt(attempt);
+    try {
+      return await call(method, params, options);
+    } catch (error) {
+      lastError = error;
+      if (!isRetriable(error) || attempt === delays.length) {
+        throw error;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, delays[attempt]));
+    }
+  }
+  throw lastError;
+}
+
+function isRetriable(error) {
+  if (!error) return false;
+  if (error.code === "NETWORK_ERROR") return true;
+  if (typeof error.status === "number" && error.status >= 500) return true;
+  // AbortError from a timeout is user-visible; don't loop on it.
+  return false;
 }
 
 export async function uploadAttachment(file, doctype, docname) {

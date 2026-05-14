@@ -47,12 +47,14 @@ def ensure_unity_custom_fields():
 	(both are idempotent, and their backfill loops are no-ops on a fresh
 	site that has no tickets yet)."""
 	from helpdesk.patches import (
+		unity_helpdesk_portal_origin_fields,
 		unity_helpdesk_student_search_fields,
 		unity_ticket_message_search_fields,
 	)
 
 	unity_helpdesk_student_search_fields.execute()
 	unity_ticket_message_search_fields.execute()
+	unity_helpdesk_portal_origin_fields.execute()
 
 
 def add_support_redirect_to_tickets():
