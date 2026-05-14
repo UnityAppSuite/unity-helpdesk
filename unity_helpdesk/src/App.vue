@@ -60,6 +60,13 @@
         </div>
         <div class="topbar-actions">
           <button class="btn" @click="openComposer = true">New Ticket</button>
+          <button
+            v-if="canViewAllTickets"
+            class="btn secondary"
+            @click="openBulkEmail = true"
+          >
+            Bulk Email
+          </button>
 
           <!-- Avatar with dropdown -->
           <div class="avatar-wrap" @click="profileMenuOpen = !profileMenuOpen">
@@ -268,6 +275,195 @@
         </div>
       </section>
     </div>
+
+    <!-- Bulk Email modal -->
+    <div
+      v-if="openBulkEmail"
+      class="modal-backdrop"
+      @click.self="closeBulkEmail"
+    >
+      <section class="modal-card">
+        <div class="modal-header">
+          <div>
+            <strong>Send Bulk Email</strong>
+            <span
+              >Compose one email and BCC many recipients. A single audit
+              ticket is created.</span
+            >
+          </div>
+          <button class="btn secondary" @click="closeBulkEmail">Close</button>
+        </div>
+        <div class="modal-body stack">
+          <p v-if="bulkEmailError" class="error">{{ bulkEmailError }}</p>
+          <p v-else-if="bulkEmailWarning" class="warning-banner">
+            {{ bulkEmailWarning }}
+          </p>
+
+          <label>
+            Recipients
+            <div class="recipient-multiselect" @click="focusRecipientInput">
+              <span
+                v-for="r in bulkEmail.recipients"
+                :key="r.email"
+                class="recipient-chip"
+              >
+                <span class="recipient-chip-label" :title="r.email">{{ r.label || r.email }}</span>
+                <button type="button" class="recipient-chip-remove" @click.stop="removeRecipient(r.email)">×</button>
+              </span>
+              <div class="recipient-input-wrap">
+                <input
+                  ref="recipientInputRef"
+                  v-model="recipientSearchQuery"
+                  type="text"
+                  class="recipient-input"
+                  placeholder="Type name or email…"
+                  autocomplete="off"
+                  @input="onRecipientSearch"
+                  @keydown.enter.prevent="addRecipientFromInput"
+                  @keydown.backspace="onRecipientBackspace"
+                  @keydown.escape="recipientResults = []"
+                  @focus="onRecipientSearch"
+                />
+                <div v-if="recipientResults.length" class="recipient-dropdown">
+                  <button
+                    v-for="r in recipientResults"
+                    :key="r.email"
+                    type="button"
+                    class="recipient-dropdown-item"
+                    @mousedown.prevent="selectRecipient(r)"
+                  >
+                    <span class="rd-name">{{ r.name }}</span>
+                    <span class="rd-email">{{ r.email }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="composer-attachment-actions" style="margin-top:6px">
+              <button
+                type="button"
+                class="btn secondary"
+                :disabled="bulkEmailUploading"
+                @click="bulkEmailCsvInput?.click()"
+              >
+                Import CSV
+              </button>
+              <input
+                ref="bulkEmailCsvInput"
+                type="file"
+                accept=".csv,text/csv"
+                class="hidden-file-input"
+                @change="handleBulkEmailCsv"
+              />
+              <a
+                href="/api/method/helpdesk.api.unity_helpdesk_ext.get_bulk_email_sample_csv"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="btn secondary"
+              >
+                Sample CSV
+              </a>
+              <span class="muted" style="margin-left: auto">
+                {{ bulkEmailRecipientCount }} recipient{{ bulkEmailRecipientCount === 1 ? "" : "s" }}
+              </span>
+            </div>
+          </label>
+
+          <label>
+            Subject
+            <input
+              v-model="bulkEmail.subject"
+              type="text"
+              placeholder="Email subject"
+            />
+          </label>
+          <label>
+            CC (optional)
+            <input
+              v-model="bulkEmail.cc"
+              type="text"
+              placeholder="cc1@example.com, cc2@example.com"
+            />
+          </label>
+          <label>
+            BCC (optional)
+            <input
+              v-model="bulkEmail.bcc"
+              type="text"
+              placeholder="bcc1@example.com"
+            />
+          </label>
+          <label>
+            Message
+            <TinyMceEditor
+              v-model="bulkEmail.message"
+              :min-height="240"
+              placeholder="Compose the email message"
+            />
+          </label>
+          <label>
+            Attachments
+            <div class="composer-attachment-actions">
+              <button
+                type="button"
+                class="btn secondary"
+                :disabled="bulkEmailUploading"
+                @click="bulkEmailAttachmentInput?.click()"
+              >
+                {{ bulkEmailUploading ? "Uploading..." : "Add Attachments" }}
+              </button>
+              <input
+                ref="bulkEmailAttachmentInput"
+                type="file"
+                class="hidden-file-input"
+                multiple
+                @change="handleBulkEmailAttachments"
+              />
+            </div>
+            <div
+              v-if="bulkEmail.attachments.length"
+              class="attachment-list attachment-list-modal"
+            >
+              <div
+                v-for="attachment in bulkEmail.attachments"
+                :key="attachment.name"
+                class="attachment-item"
+              >
+                <a
+                  :href="attachment.file_url"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {{ attachment.file_name || attachment.name }}
+                </a>
+                <button
+                  type="button"
+                  class="link-btn danger-link"
+                  @click="removeBulkEmailAttachment(attachment.name)"
+                >
+                  Remove
+                </button>
+              </div>
+            </div>
+          </label>
+        </div>
+        <div class="modal-footer">
+          <button class="btn secondary" @click="closeBulkEmail">Cancel</button>
+          <button
+            class="btn"
+            :disabled="bulkEmailSending || !bulkEmailRecipientCount"
+            @click="sendBulkEmail"
+          >
+            {{
+              bulkEmailSending
+                ? "Sending..."
+                : `Send to ${bulkEmailRecipientCount} recipient${
+                    bulkEmailRecipientCount === 1 ? "" : "s"
+                  }`
+            }}
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
@@ -313,7 +509,9 @@ const session = reactive({
   capabilities: {},
   settings: {
     unity_email_thread_layout: "Classic",
+    column_preferences: [],
   },
+  available_columns: [],
 });
 let suggestTimeout = null;
 const composer = reactive({
@@ -325,6 +523,27 @@ const composer = reactive({
   assignee: "",
   attachments: [],
 });
+
+// --- Bulk email state ---
+const openBulkEmail = ref(false);
+const bulkEmailSending = ref(false);
+const bulkEmailUploading = ref(false);
+const bulkEmailError = ref("");
+const bulkEmailWarning = ref("");
+const bulkEmailCsvInput = ref(null);
+const bulkEmailAttachmentInput = ref(null);
+const bulkEmail = reactive({
+  recipients: [],   // [{email, name, label}]
+  subject: "",
+  message: "",
+  cc: "",
+  bcc: "",
+  attachments: [],
+});
+const recipientInputRef = ref(null);
+const recipientSearchQuery = ref("");
+const recipientResults = ref([]);
+let _recipientSearchTimer = null;
 
 provide("unitySession", session);
 provide("refreshUnitySession", loadSession);
@@ -380,7 +599,13 @@ async function loadSession() {
     session.settings = {
       unity_email_thread_layout:
         data.settings?.unity_email_thread_layout || "Classic",
+      column_preferences: Array.isArray(data.settings?.column_preferences)
+        ? data.settings.column_preferences
+        : [],
     };
+    session.available_columns = Array.isArray(data.available_columns)
+      ? data.available_columns
+      : [];
     enforceRouteAccess();
   } catch (err) {
     composerError.value = err.message;
@@ -504,6 +729,179 @@ async function createTicket() {
     composerError.value = err.message;
   } finally {
     composerSaving.value = false;
+  }
+}
+
+// --- Bulk email ---
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseBulkRecipients(raw) {
+  return (raw || "")
+    .split(/[\s,;]+/)
+    .map((value) => value.trim())
+    .filter((value) => EMAIL_REGEX.test(value));
+}
+
+const bulkEmailRecipientCount = computed(() => bulkEmail.recipients.length);
+
+function focusRecipientInput() {
+  recipientInputRef.value?.focus();
+}
+
+function removeRecipient(email) {
+  bulkEmail.recipients = bulkEmail.recipients.filter((r) => r.email !== email);
+}
+
+function selectRecipient(r) {
+  const email = (r.email || "").toLowerCase().trim();
+  if (!email || bulkEmail.recipients.find((x) => x.email === email)) return;
+  bulkEmail.recipients.push({ email, name: r.name || email, label: r.name ? `${r.name}` : email });
+  recipientSearchQuery.value = "";
+  recipientResults.value = [];
+  recipientInputRef.value?.focus();
+}
+
+function addRecipientFromInput() {
+  const val = recipientSearchQuery.value.trim();
+  if (EMAIL_REGEX.test(val)) {
+    selectRecipient({ email: val, name: val });
+  }
+}
+
+function onRecipientBackspace() {
+  if (!recipientSearchQuery.value && bulkEmail.recipients.length) {
+    bulkEmail.recipients.pop();
+  }
+}
+
+function onRecipientSearch() {
+  clearTimeout(_recipientSearchTimer);
+  const q = recipientSearchQuery.value.trim();
+  if (q.length < 2) { recipientResults.value = []; return; }
+  _recipientSearchTimer = window.setTimeout(async () => {
+    try {
+      const results = await call("helpdesk.api.unity_helpdesk.search_contacts", { query: q });
+      recipientResults.value = results || [];
+    } catch { recipientResults.value = []; }
+  }, 280);
+}
+
+function closeBulkEmail() {
+  openBulkEmail.value = false;
+  bulkEmailSending.value = false;
+  bulkEmailUploading.value = false;
+  bulkEmailError.value = "";
+  bulkEmailWarning.value = "";
+  bulkEmail.recipients = [];
+  recipientSearchQuery.value = "";
+  recipientResults.value = [];
+  bulkEmail.subject = "";
+  bulkEmail.message = "";
+  bulkEmail.cc = "";
+  bulkEmail.bcc = "";
+  bulkEmail.attachments = [];
+}
+
+async function handleBulkEmailCsv(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  bulkEmailError.value = "";
+  try {
+    const text = await file.text();
+    const lines = text.split(/\r?\n/);
+    let startIdx = 0;
+    if (lines.length && /\bemail\b/i.test(lines[0])) startIdx = 1;
+    const existing = new Set(bulkEmail.recipients.map((r) => r.email));
+    for (let i = startIdx; i < lines.length; i += 1) {
+      const cell = (lines[i] || "").split(",")[0].trim();
+      if (cell && EMAIL_REGEX.test(cell) && !existing.has(cell.toLowerCase())) {
+        bulkEmail.recipients.push({ email: cell.toLowerCase(), name: cell, label: cell });
+        existing.add(cell.toLowerCase());
+      }
+    }
+    if (!bulkEmail.recipients.length) {
+      bulkEmailError.value = "No valid emails found in CSV. Use a single 'email' column.";
+    }
+  } finally {
+    if (bulkEmailCsvInput.value) bulkEmailCsvInput.value.value = "";
+  }
+}
+
+async function handleBulkEmailAttachments(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) return;
+  bulkEmailUploading.value = true;
+  bulkEmailError.value = "";
+  try {
+    for (const file of files) {
+      const uploaded = await uploadAttachment(file);
+      bulkEmail.attachments.push(uploaded);
+    }
+  } catch (err) {
+    bulkEmailError.value = err.message;
+  } finally {
+    bulkEmailUploading.value = false;
+    if (bulkEmailAttachmentInput.value) {
+      bulkEmailAttachmentInput.value.value = "";
+    }
+  }
+}
+
+function removeBulkEmailAttachment(name) {
+  bulkEmail.attachments = bulkEmail.attachments.filter(
+    (attachment) => attachment.name !== name
+  );
+}
+
+async function sendBulkEmail() {
+  bulkEmailError.value = "";
+  bulkEmailWarning.value = "";
+  const recipients = bulkEmail.recipients.map((r) => r.email);
+  if (!recipients.length) {
+    bulkEmailError.value = "Enter at least one valid recipient email.";
+    return;
+  }
+  if (!bulkEmail.subject.trim()) {
+    bulkEmailError.value = "Subject is required.";
+    return;
+  }
+  if (!bulkEmail.message.trim()) {
+    bulkEmailError.value = "Message is required.";
+    return;
+  }
+  bulkEmailSending.value = true;
+  try {
+    const result = await call(
+      "helpdesk.api.unity_helpdesk_ext.bulk_send_email",
+      {
+        subject: bulkEmail.subject,
+        message: bulkEmail.message,
+        recipients: JSON.stringify(recipients),
+        cc: bulkEmail.cc || null,
+        bcc: bulkEmail.bcc || null,
+        attachments: JSON.stringify(
+          bulkEmail.attachments.map((attachment) => attachment.name)
+        ),
+      }
+    );
+    if (result?.warning) {
+      bulkEmailWarning.value = result.warning;
+      return;
+    }
+    const message = result?.invalid_count
+      ? `Sent to ${result.queued} recipients. ${result.invalid_count} invalid email(s) were skipped.`
+      : `Sent to ${result?.queued || 0} recipients.`;
+    if (result?.ticket) {
+      sessionStorage.setItem(TICKET_NOTICE_KEY, message);
+    }
+    closeBulkEmail();
+    if (result?.ticket) {
+      router.push(`/tickets/${result.ticket}`);
+    }
+  } catch (err) {
+    bulkEmailError.value = err.message;
+  } finally {
+    bulkEmailSending.value = false;
   }
 }
 </script>

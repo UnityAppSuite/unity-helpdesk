@@ -1,4 +1,5 @@
 import json
+import re
 from email.utils import parseaddr
 from functools import lru_cache
 from typing import List
@@ -26,6 +27,51 @@ from helpdesk.utils import capture_event, get_customer, is_agent, publish_event
 
 from ..hd_notification.utils import clear as clear_notifications
 from ..hd_service_level_agreement.utils import get_sla
+
+_KEYWORD_CACHE_KEY = "hd_ticket_type_keywords"
+
+
+def _get_ticket_type_keyword_map():
+	cached = frappe.cache().get_value(_KEYWORD_CACHE_KEY)
+	if cached is not None:
+		return cached
+	rows = frappe.get_all(
+		"HD Ticket Type",
+		filters=[["keywords", "!=", ""]],
+		fields=["name", "keywords"],
+		order_by="name asc",
+	)
+	result = []
+	for row in rows:
+		kws = [k.strip().lower() for k in (row.keywords or "").split(",") if k.strip()]
+		if kws:
+			result.append((row.name, kws))
+	frappe.cache().set_value(_KEYWORD_CACHE_KEY, result, expires_in_sec=3600)
+	return result
+
+
+def _match_ticket_type_by_keywords(text, keyword_map):
+	"""Return (type_name, matched_keyword) for the longest matching keyword across all types.
+
+	Word-boundary aware: keyword "pay" does NOT match "happy" or "display".
+	Deterministic tie-break: longest keyword wins; ties broken by type name asc.
+	"""
+	if not text or not keyword_map:
+		return None
+	text_lower = text.lower()
+	best = None  # (sort_key, type_name, kw)
+	for type_name, keywords in keyword_map:
+		for kw in keywords:
+			if not kw:
+				continue
+			pattern = re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)")
+			if pattern.search(text_lower):
+				sort_key = (-len(kw), type_name)
+				if best is None or sort_key < best[0]:
+					best = (sort_key, type_name, kw)
+	if best is None:
+		return None
+	return best[1], best[2]
 
 
 class HDTicket(Document):
@@ -229,9 +275,21 @@ class HDTicket(Document):
 	def set_ticket_type(self):
 		if self.ticket_type:
 			return
-		settings = frappe.get_doc("HD Settings")
-		ticket_type = settings.default_ticket_type or DEFAULT_TICKET_TYPE
-		self.ticket_type = ticket_type
+		# Keywords take priority; fall back to HD Settings default, then DEFAULT_TICKET_TYPE.
+		self.auto_assign_ticket_type()
+		if not self.ticket_type:
+			settings = frappe.get_doc("HD Settings")
+			self.ticket_type = settings.default_ticket_type or DEFAULT_TICKET_TYPE
+
+	def auto_assign_ticket_type(self):
+		if self.ticket_type:
+			return
+		text = f"{self.subject or ''} {self.description or ''}"
+		if not text.strip():
+			return
+		match = _match_ticket_type_by_keywords(text, _get_ticket_type_keyword_map())
+		if match:
+			self.ticket_type = match[0]
 
 	def set_raised_by(self):
 		self.raised_by = self.raised_by or frappe.session.user

@@ -58,6 +58,9 @@ OPTIONAL_TICKET_FIELDS = [
 	"custom_primary_message_html",
 	"custom_primary_message_text",
 	"custom_search_message_body",
+	# Set by helpdesk.api.unity_helpdesk_ext.create_ticket; SPA tints these rows green
+	"custom_via_unity_portal",
+	"custom_is_bulk_email",
 ]
 
 
@@ -168,12 +171,113 @@ def _has_field(doctype, fieldname):
 	return frappe.get_meta(doctype).has_field(fieldname)
 
 
-def _ticket_fields():
+def _ticket_fields(extra=None):
 	fields = list(UNITY_TICKET_FIELDS)
+	seen = set(fields)
 	for field in OPTIONAL_TICKET_FIELDS:
-		if _has_field(TICKET_DOCTYPE, field):
+		if field not in seen and _has_field(TICKET_DOCTYPE, field):
 			fields.append(field)
+			seen.add(field)
+	for field in extra or []:
+		key = cstr(field or "").strip()
+		if not key or key in seen:
+			continue
+		if _has_field(TICKET_DOCTYPE, key):
+			fields.append(key)
+			seen.add(key)
 	return fields
+
+
+# Columns the user can show/hide/reorder/resize in the Unity Helpdesk tickets list.
+# `key` is the HD Ticket field name (or a virtual key handled by the SPA, e.g.
+# "hold_summary"). `fixed: True` columns are always visible and can't be removed.
+AVAILABLE_TICKET_COLUMNS = [
+	{"key": "name", "label": "Ticket ID", "default": True, "fixed": True, "width": 110},
+	{"key": "subject", "label": "Subject", "default": True, "fixed": True, "width": 280},
+	{"key": "ticket_type", "label": "Ticket Type", "default": True, "fixed": False, "width": 150},
+	{"key": "priority", "label": "Priority", "default": True, "fixed": False, "width": 130},
+	{"key": "status", "label": "Status", "default": True, "fixed": False, "width": 140},
+	{"key": "_assign", "label": "Assigned To", "default": True, "fixed": False, "width": 170},
+	{"key": "creation", "label": "Created On", "default": True, "fixed": False, "width": 130},
+	{"key": "custom_is_on_hold", "label": "Issues On Hold", "default": True, "fixed": False, "width": 140},
+	{"key": "custom_hold_reason", "label": "Reason Of Hold", "default": True, "fixed": False, "width": 200},
+	{"key": "raised_by", "label": "Raised By", "default": False, "fixed": False, "width": 220},
+	{"key": "agent_group", "label": "Agent Group", "default": False, "fixed": False, "width": 150},
+	{"key": "modified", "label": "Last Updated", "default": False, "fixed": False, "width": 130},
+	{"key": "response_by", "label": "Response Due", "default": False, "fixed": False, "width": 140},
+	{"key": "resolution_by", "label": "Resolution Due", "default": False, "fixed": False, "width": 150},
+	{"key": "agreement_status", "label": "SLA Status", "default": False, "fixed": False, "width": 130},
+	{"key": "first_responded_on", "label": "First Responded On", "default": False, "fixed": False, "width": 160},
+	{"key": "resolution_date", "label": "Resolved On", "default": False, "fixed": False, "width": 140},
+	{"key": "custom_hold_from", "label": "Hold From", "default": False, "fixed": False, "width": 130},
+	{"key": "custom_hold_to", "label": "Hold To", "default": False, "fixed": False, "width": 130},
+]
+AVAILABLE_TICKET_COLUMN_KEYS = {c["key"] for c in AVAILABLE_TICKET_COLUMNS}
+COLUMN_PREFS_DEFAULT_KEY = "unity_helpdesk_columns"
+COLUMN_WIDTH_MIN = 60
+COLUMN_WIDTH_MAX = 600
+COLUMN_PREFS_MAX_ITEMS = 100
+
+
+def _localized_available_columns():
+	return [{**col, "label": _(col["label"])} for col in AVAILABLE_TICKET_COLUMNS]
+
+
+def _default_column_preferences():
+	return [
+		{"key": col["key"], "width": col["width"]}
+		for col in AVAILABLE_TICKET_COLUMNS
+		if col["default"]
+	]
+
+
+def _load_column_preferences():
+	raw = frappe.db.get_default(COLUMN_PREFS_DEFAULT_KEY, frappe.session.user)
+	if not raw:
+		return _default_column_preferences()
+	# Older Frappe versions can wrap a single value in a 1-element list — unwrap.
+	if isinstance(raw, list | tuple) and len(raw) == 1:
+		raw = raw[0]
+	try:
+		stored = json.loads(raw) if isinstance(raw, str) else raw
+	except (TypeError, ValueError):
+		return _default_column_preferences()
+	if not isinstance(stored, list):
+		return _default_column_preferences()
+	cleaned = []
+	seen = set()
+	for item in stored:
+		if not isinstance(item, dict):
+			continue
+		key = cstr(item.get("key") or "").strip()
+		if not key or key in seen or key not in AVAILABLE_TICKET_COLUMN_KEYS:
+			continue
+		seen.add(key)
+		try:
+			width = int(item.get("width") or 0)
+		except (TypeError, ValueError):
+			width = 0
+		if width < COLUMN_WIDTH_MIN or width > COLUMN_WIDTH_MAX:
+			width = next(
+				(c["width"] for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key),
+				140,
+			)
+		cleaned.append({"key": key, "width": width})
+	# Ensure fixed columns are always present (at the front, in defined order)
+	fixed_keys = [c["key"] for c in AVAILABLE_TICKET_COLUMNS if c["fixed"]]
+	for key in reversed(fixed_keys):
+		if key in seen:
+			continue
+		width = next(c["width"] for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key)
+		cleaned.insert(0, {"key": key, "width": width})
+		seen.add(key)
+	return cleaned or _default_column_preferences()
+
+
+def _selected_column_fields():
+	# Returns the HD Ticket fieldnames a user's column choice depends on, so
+	# get_tickets() can fetch them. Virtual keys (none currently) are skipped.
+	return [pref["key"] for pref in _load_column_preferences()]
 
 
 def _assignee_from_assign(assign_value, ticket_name=None):
@@ -304,6 +408,46 @@ def _group_by(items, key):
 	for item in items:
 		grouped[cstr(item.get(key) or "").strip()].append(frappe._dict(item))
 	return grouped
+
+
+def _parse_class_number(program):
+	# Program names follow "<class>-<school descriptor>", e.g. "4-Walnut School at Shivane"
+	# or "PG-1-Walnut" — the class segment itself may contain hyphens. rsplit
+	# strips only the final descriptor and preserves multi-segment class labels.
+	raw = cstr(program or "").strip()
+	if not raw:
+		return None
+	if "-" not in raw:
+		return raw
+	head, _sep, _rest = raw.rpartition("-")
+	return head.strip() or raw
+
+
+def _fetch_school_locations(students_by_id, enrollment_rows):
+	if not _has_doctype("School"):
+		return {}
+	school_ids = set()
+	for student in (students_by_id or {}).values():
+		sid = cstr(student.get("school") or "").strip()
+		if sid:
+			school_ids.add(sid)
+	for row in enrollment_rows or []:
+		sid = cstr(row.get("custom_school") or "").strip()
+		if sid:
+			school_ids.add(sid)
+	if not school_ids:
+		return {}
+	try:
+		rows = frappe.get_all(
+			"School",
+			fields=["name", "location"],
+			filters={"name": ["in", sorted(school_ids)]},
+			page_length=10000,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "unity_helpdesk._fetch_school_locations")
+		return {}
+	return {row.get("name"): cstr(row.get("location") or "").strip() or None for row in rows}
 
 
 def _pick_program_enrollment(rows):
@@ -648,6 +792,11 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 	)
 	payment_schedule_by_fee = _group_by(payment_schedule_rows, "parent")
 
+	# Map of School name -> location. Used to render "<class>-<section>-<location>"
+	# in the SPA's student-context sidebar. Best-effort: silently skips if the
+	# School doctype is unavailable (e.g. edu_quality not installed).
+	school_locations = _fetch_school_locations(students_by_id, enrollment_rows)
+
 	student_cards = []
 	for student_id in all_student_ids:
 		student = students_by_id.get(student_id)
@@ -714,6 +863,10 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 		next_schedule = _next_payment_schedule(
 			payment_schedule_by_fee.get(selected_fee.get("name"), []) if selected_fee else []
 		)
+		resolved_school = (
+			(selected_enrollment.get("custom_school") if selected_enrollment else None)
+			or student.get("school")
+		)
 		student_cards.append(
 			{
 				"student_id": student_id,
@@ -721,7 +874,9 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"is_primary_match": student_id in primary_student_ids,
 				"is_sibling": student_id not in primary_student_ids,
 				"school": student.get("school"),
+				"school_location": school_locations.get(resolved_school) if resolved_school else None,
 				"class_program": student.get("program"),
+				"class_number": _parse_class_number(student.get("program")),
 				"division": student.get("custom_division"),
 				"student_status": student.get("student_status"),
 				"student_mobile_number": student.get("student_mobile_number"),
@@ -1908,7 +2063,7 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 		filters,
 		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
 	)
-	fields = _ticket_fields()
+	fields = _ticket_fields(extra=_selected_column_fields())
 	search_candidate_names = None
 	search_family_terms = None
 	if search:
@@ -2553,8 +2708,54 @@ def get_profile():
 		"capabilities": capabilities,
 		"settings": {
 			"unity_email_thread_layout": _default_thread_layout(),
+			"column_preferences": _load_column_preferences(),
 		},
+		"available_columns": _localized_available_columns(),
 	}
+
+
+@frappe.whitelist()
+def update_column_preferences(column_preferences):
+	# Per-user; gated on basic Unity access (not super-admin).
+	_require_unity_access()
+	try:
+		parsed = json.loads(column_preferences) if isinstance(column_preferences, str) else column_preferences
+	except (TypeError, ValueError):
+		frappe.throw(_("Invalid column preferences payload"))
+	if not isinstance(parsed, list):
+		frappe.throw(_("Invalid column preferences payload"))
+	if len(parsed) > COLUMN_PREFS_MAX_ITEMS:
+		frappe.throw(_("Too many column preferences (max {0})").format(COLUMN_PREFS_MAX_ITEMS))
+	cleaned = []
+	seen = set()
+	for item in parsed:
+		if not isinstance(item, dict):
+			continue
+		key = cstr(item.get("key") or "").strip()
+		if not key or key in seen or key not in AVAILABLE_TICKET_COLUMN_KEYS:
+			continue
+		seen.add(key)
+		try:
+			width = int(item.get("width") or 0)
+		except (TypeError, ValueError):
+			width = 0
+		if width < COLUMN_WIDTH_MIN:
+			width = COLUMN_WIDTH_MIN
+		elif width > COLUMN_WIDTH_MAX:
+			width = COLUMN_WIDTH_MAX
+		cleaned.append({"key": key, "width": width})
+	# Force fixed columns to be present.
+	fixed_keys = [c["key"] for c in AVAILABLE_TICKET_COLUMNS if c["fixed"]]
+	for key in reversed(fixed_keys):
+		if key in seen:
+			continue
+		width = next(c["width"] for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key)
+		cleaned.insert(0, {"key": key, "width": width})
+		seen.add(key)
+	if not cleaned:
+		cleaned = _default_column_preferences()
+	frappe.defaults.set_user_default(COLUMN_PREFS_DEFAULT_KEY, json.dumps(cleaned))
+	return {"column_preferences": cleaned}
 
 
 @frappe.whitelist()
@@ -2571,3 +2772,120 @@ def update_unity_settings(unity_email_thread_layout=None):
 	settings.unity_email_thread_layout = layout
 	settings.save(ignore_permissions=True)
 	return {"unity_email_thread_layout": settings.unity_email_thread_layout}
+
+
+@frappe.whitelist()
+def search_contacts(query):
+	"""Search guardians/contacts by name or email for bulk email recipient picker."""
+	import re as _re
+	q = cstr(query or "").strip()
+	if len(q) < 2:
+		return []
+	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+	results = []
+	seen = set()
+
+	def _add(email, name):
+		e = cstr(email or "").strip().lower()
+		if e and _email_re.match(e) and e not in seen:
+			seen.add(e)
+			results.append({"email": e, "name": name or e})
+
+	# Search Guardian (parents) by name
+	for g in frappe.get_all(
+		"Guardian",
+		filters=[["guardian_name", "like", f"%{q}%"]],
+		fields=["guardian_name", "email_address"],
+		limit_page_length=10,
+	):
+		_add(g.email_address, g.guardian_name)
+
+	# Search Guardian by email
+	for g in frappe.get_all(
+		"Guardian",
+		filters=[["email_address", "like", f"%{q}%"]],
+		fields=["guardian_name", "email_address"],
+		limit_page_length=5,
+	):
+		_add(g.email_address, g.guardian_name)
+
+	# Search Contact by name
+	for c in frappe.get_all(
+		"Contact",
+		filters=[["full_name", "like", f"%{q}%"]],
+		fields=["full_name", "email_id"],
+		limit_page_length=8,
+	):
+		_add(c.email_id, c.full_name)
+
+	# Search Contact by email
+	for c in frappe.get_all(
+		"Contact",
+		filters=[["email_id", "like", f"%{q}%"]],
+		fields=["full_name", "email_id"],
+		limit_page_length=5,
+	):
+		_add(c.email_id, c.full_name)
+
+	return results[:15]
+
+
+@frappe.whitelist()
+def get_csrf_token():
+	"""Return the current session CSRF token. Callers must be authenticated;
+	the SPA refreshes the token on 403 mid-session."""
+	return frappe.sessions.get_csrf_token()
+
+
+@frappe.whitelist()
+def enqueue_auto_assign_ticket_types():
+	"""Enqueue a background job to bulk-assign ticket types by keyword matching.
+
+	Dedupes via job_id + deduplicate=True so concurrent clicks don't queue
+	two racing workers against the same rows.
+	"""
+	frappe.only_for("System Manager")
+	frappe.enqueue(
+		"helpdesk.api.unity_helpdesk._bulk_auto_assign_ticket_types",
+		queue="long",
+		timeout=3600,
+		is_async=True,
+		job_id="auto_assign_ticket_types",
+		deduplicate=True,
+	)
+	return {"queued": True}
+
+
+def _bulk_auto_assign_ticket_types():
+	"""Process tickets with empty/Unspecified ticket_type. Snapshot names upfront so
+	matched rows leaving the filter set don't shift pagination and skip unmatched ones."""
+	from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import (
+		_get_ticket_type_keyword_map,
+		_match_ticket_type_by_keywords,
+	)
+
+	keyword_map = _get_ticket_type_keyword_map()
+	if not keyword_map:
+		return
+
+	names = frappe.get_all(
+		"HD Ticket",
+		filters=[["ticket_type", "in", ["", "Unspecified"]]],
+		pluck="name",
+		order_by="creation asc",
+	)
+
+	batch_size = 200
+	for i in range(0, len(names), batch_size):
+		batch = names[i : i + batch_size]
+		rows = frappe.get_all(
+			"HD Ticket",
+			filters=[["name", "in", batch]],
+			fields=["name", "subject", "description"],
+		)
+		for t in rows:
+			text = f"{t.subject or ''} {t.description or ''}"
+			match = _match_ticket_type_by_keywords(text, keyword_map)
+			if match:
+				frappe.db.set_value("HD Ticket", t.name, "ticket_type", match[0])
+		frappe.db.commit()

@@ -262,6 +262,107 @@ nav a.router-link-active {
   margin-left: 8px;
 }
 
+.nav-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* ── Recipient multiselect ──────────────────────────────────────────────── */
+
+.recipient-multiselect {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fbff;
+  min-height: 48px;
+  padding: 6px 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  cursor: text;
+  position: relative;
+  transition: border-color 0.15s;
+}
+.recipient-multiselect:focus-within {
+  border-color: var(--accent);
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(79, 110, 245, 0.12);
+}
+
+.recipient-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 20px;
+  padding: 2px 8px 2px 10px;
+  font-size: 12px;
+  color: #3730a3;
+  max-width: 220px;
+}
+.recipient-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.recipient-chip-remove {
+  background: none;
+  border: none;
+  color: #6366f1;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  flex-shrink: 0;
+}
+.recipient-chip-remove:hover { color: #ef4444; }
+
+.recipient-input-wrap {
+  position: relative;
+  flex: 1 1 160px;
+  min-width: 120px;
+}
+.recipient-input {
+  width: 100%;
+  border: none !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 4px 6px !important;
+  font-size: 13px;
+  outline: none;
+  border-radius: 0 !important;
+}
+
+.recipient-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  z-index: 300;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.recipient-dropdown-item {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  padding: 7px 10px;
+  cursor: pointer;
+  gap: 1px;
+}
+.recipient-dropdown-item:hover { background: #f1f5f9; }
+.rd-name { font-size: 13px; color: var(--text); font-weight: 500; }
+.rd-email { font-size: 11px; color: var(--muted); }
+
 .toolbar-search {
   min-width: 88px;
 }
@@ -784,7 +885,8 @@ textarea:focus {
 .metric:nth-child(1) { border-left: 4px solid var(--accent); }
 .metric:nth-child(2) { border-left: 4px solid #f59e0b; }
 .metric:nth-child(3) { border-left: 4px solid #ca8a04; }
-.metric:nth-child(4) { border-left: 4px solid #16a34a; }
+.metric:nth-child(4) { border-left: 4px solid #15803d; }
+.metric:nth-child(4) b { color: #15803d; }
 .metric:nth-child(5) { border-left: 4px solid #64748b; }
 
 .metric b {
@@ -878,6 +980,23 @@ tbody tr:hover {
   background: #f8f9fe;
 }
 
+tbody tr.portal-ticket {
+  background-color: #ecfdf5;
+}
+
+tbody tr.portal-ticket:hover {
+  background-color: #d1fae5;
+}
+
+tbody tr.bulk-email-ticket {
+  background-color: #eff6ff;
+  border-left: 3px solid #3b82f6;
+}
+
+tbody tr.bulk-email-ticket:hover {
+  background-color: #dbeafe;
+}
+
 .cell-edit select {
   width: 100%;
   min-width: 154px;
@@ -936,6 +1055,13 @@ tbody tr:hover {
 
 .muted {
   color: var(--muted);
+}
+
+.student-names {
+  display: block;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
 }
 
 .badge,
@@ -1140,6 +1266,33 @@ tbody tr:hover {
   font-weight: 600;
 }
 
+.detail-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-section-heading h3 {
+  border-bottom: none;
+  flex: 1;
+}
+
+.detail-section-heading .link-btn {
+  margin-right: 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent, #4f46e5);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 4px 6px;
+}
+
+.detail-section-heading .link-btn:hover {
+  text-decoration: underline;
+}
+
 .section-toggle {
   width: 100%;
   border: 0;
@@ -1303,6 +1456,13 @@ tbody tr:hover {
   color: var(--muted);
   font-weight: 500;
 }
+
+.student-id-link {
+  color: var(--accent);
+  text-decoration: underline;
+  font-weight: 600;
+}
+.student-id-link:hover { color: #3730a3; }
 
 .student-context-banner {
   display: flex;
@@ -1624,6 +1784,17 @@ tbody tr:hover {
   font-size: 11px;
   color: var(--light);
 }
+.chat-msg-recipients {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 2px 14px 4px;
+}
+.chat-msg-to-label {
+  font-weight: 600;
+  color: var(--text);
+  margin-right: 4px;
+}
+
 .chat-msg-body {
   font-size: 13px;
   line-height: 1.65;
@@ -1974,6 +2145,220 @@ tbody tr:hover {
 
 .error {
   color: var(--danger);
+}
+
+.reloading-indicator {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 16px;
+  color: var(--muted);
+  font-size: 13px;
+  background: #f8f9fe;
+  border-bottom: 1px solid var(--border);
+}
+
+.reload-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #d4d8ea;
+  border-top-color: var(--accent, #4f46e5);
+  border-radius: 50%;
+  animation: reload-spin 0.8s linear infinite;
+}
+
+@keyframes reload-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.reload-prompt {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  margin: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  background: #fafbff;
+}
+
+/* ── Inline column management (header drag / remove / add) ──────────────── */
+
+th.col-draggable { cursor: grab; }
+th.col-dragging { opacity: 0.45; background: #eef2ff; }
+
+.col-drag-handle {
+  color: #94a3b8;
+  font-size: 12px;
+  cursor: grab;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.col-remove-btn {
+  display: none;
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  margin-left: 2px;
+  vertical-align: middle;
+  border-radius: 3px;
+}
+.col-remove-btn:hover { background: #fee2e2; }
+th:hover .col-remove-btn { display: inline; }
+
+.col-add-th {
+  width: 36px;
+  min-width: 36px;
+  text-align: center;
+  background: transparent;
+  border-left: 1px dashed var(--border);
+}
+.col-add-td { width: 36px; min-width: 36px; }
+
+.col-add-wrap {
+  position: relative;
+  display: inline-block;
+}
+
+.col-add-btn {
+  background: none;
+  border: 1px dashed #94a3b8;
+  border-radius: 6px;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 2px 7px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.col-add-btn:hover { background: #eef2ff; border-color: var(--accent); }
+
+.col-add-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  min-width: 170px;
+  padding: 4px;
+  z-index: 200;
+}
+
+.col-add-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 5px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 7px 10px;
+}
+.col-add-item:hover { background: #f1f5f9; }
+
+.col-add-empty {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+/* ── Column customization panel & resize grabber ─────────────────────────── */
+
+.col-resize-grabber {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  user-select: none;
+}
+
+.col-resize-grabber:hover {
+  background: rgba(99, 102, 241, 0.25);
+}
+
+th {
+  position: relative;
+}
+
+body.col-resizing {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+.column-panel {
+  max-width: 560px;
+}
+
+.column-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.column-list-item {
+  display: grid;
+  grid-template-columns: auto 1fr 90px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #fafbff;
+  cursor: grab;
+}
+
+.column-list-item.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.drag-handle {
+  color: var(--muted);
+  font-size: 14px;
+  cursor: grab;
+  user-select: none;
+}
+
+.column-list-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.column-list-toggle .muted {
+  font-size: 11px;
+}
+
+.column-list-width {
+  width: 80px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  text-align: right;
 }
 
 /* ── Avatar dropdown ─────────────────────────────────────────────────────── */
