@@ -1004,6 +1004,23 @@ textarea:focus {
   font-size: 12px;
 }
 
+.page-size-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted, #6b7280);
+  margin-right: auto;
+}
+
+.page-size-control select {
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: #fff;
+}
+
 .link-btn {
   border: none;
   background: none;
@@ -1075,7 +1092,22 @@ tbody tr.bulk-email-ticket:hover {
 
 .cell-edit select {
   width: 100%;
-  min-width: 154px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.ticket-table td,
+.ticket-table th {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ticket-table td > .select-chip,
+.ticket-table td > select {
+  display: block;
+  width: 100%;
+  min-width: 0;
 }
 
 .select-chip {
@@ -1249,6 +1281,7 @@ tbody tr.bulk-email-ticket:hover {
   min-width: 0;
 }
 
+
 .email-hero {
   background: linear-gradient(135deg, var(--accent) 0%, #1e40af 100%);
   color: #fff;
@@ -1400,6 +1433,329 @@ tbody tr.bulk-email-ticket:hover {
   color: var(--accent);
   font-size: 12px;
   font-weight: 600;
+}
+
+/* Right-chevron variant: title on the left, chevron pushed to the right edge.
+   Used by Student Details so the dropdown affordance lines up with the
+   existing "Show/Hide" buttons on neighbouring sections (Previous Tickets etc.). */
+.section-toggle--right {
+  gap: 10px;
+  padding: 13px 16px;
+  display: flex;
+  align-items: center;
+}
+
+.section-toggle--right h3 {
+  margin: 0;
+  padding: 0;
+  border-bottom: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--muted, #6b7280);
+  letter-spacing: 0.04em;
+  flex: 1;
+  text-align: left;
+}
+
+.section-toggle--right .section-toggle__chevron {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  color: var(--accent, #4f46e5);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  border-radius: 6px;
+  background: rgba(79, 70, 229, 0.1);
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.section-toggle--right:hover .section-toggle__chevron {
+  background: rgba(79, 70, 229, 0.2);
+}
+
+/* Count / annotation text in the right-chevron toggle header — sits between
+   the title and the chevron pill (e.g. "30 of 30 previous tickets"). */
+.section-toggle--right small {
+  color: var(--muted, #6b7280);
+  font-size: 12px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  flex: 0 0 auto;
+}
+
+/* Created-date range filter: single button → popover with from/to inputs. */
+.date-range-trigger {
+  position: relative;
+  display: inline-flex;
+}
+
+.date-range-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.date-range-btn:hover {
+  border-color: #c7d2fe;
+}
+
+.date-range-btn.has-value {
+  border-color: #6366f1;
+  background: var(--accent-soft, #eef2ff);
+  color: #3730a3;
+  font-weight: 600;
+}
+
+.date-range-icon {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.date-range-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.15);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 320px;
+}
+
+.date-range-pop-row {
+  display: flex;
+  gap: 10px;
+}
+
+.date-range-field {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.date-range-field input[type="date"] {
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+  min-width: 0;
+}
+
+.date-range-pop-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+/* Mail Body preview cell — shows the first ~140 chars of the customer's
+   primary message. Wider column with a small italic preview look. Hovering
+   the cell reveals the full text via the native title tooltip. */
+.cell-mail-body {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  font-size: 12.5px;
+  color: var(--text, #374151);
+  line-height: 1.4;
+}
+
+/* Previous Ticket Details: cap the body height so the section doesn't grow
+   to fit 30+ rows. The table area scrolls vertically inside a fixed window. */
+.previous-ticket-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: auto;
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: 8px;
+}
+
+/* Sticky thead so column labels stay in view while scrolling the table. */
+.previous-ticket-scroll table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-2, #f3f4f6);
+  z-index: 1;
+}
+
+/* ── Settings page cards ───────────────────────────────────────────────── */
+/* These are NOT scoped because SettingsCard is rendered via Vue's h() render
+   function, which doesn't get the parent component's data-v scope attribute,
+   so scoped CSS would never match the elements. */
+
+.settings-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  border-radius: var(--radius, 12px);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.settings-card .settings-card__header {
+  all: unset;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--panel, #fff);
+  border-bottom: 1px solid transparent;
+  text-align: left;
+  width: 100%;
+  box-sizing: border-box;
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+.settings-card .settings-card__header:hover {
+  background: rgba(79, 70, 229, 0.04);
+}
+
+.settings-card .settings-card__header[aria-expanded="true"] {
+  border-bottom-color: var(--border, #e5e7eb);
+}
+
+.settings-card .settings-card__heading {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+  text-align: left;
+}
+
+/* Override the global .detail-section h3 banner-style — inside a settings
+   card the title should be inline-left, not a full-width underlined banner. */
+.settings-card .settings-card__heading h3 {
+  margin: 0;
+  padding: 0;
+  border-bottom: none;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted, #6b7280);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: left;
+}
+
+.settings-card .settings-card__subtitle {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted, #6b7280);
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+  text-align: left;
+}
+
+.settings-card .settings-card__chevron {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  background: rgba(79, 70, 229, 0.1);
+  color: var(--accent, #4f46e5);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  transition: background-color 120ms ease;
+}
+
+.settings-card .settings-card__header:hover .settings-card__chevron {
+  background: rgba(79, 70, 229, 0.2);
+}
+
+.settings-card .settings-card__body {
+  padding: 16px;
+}
+
+/* Inline-edit / small action buttons reused by Settings tables */
+
+.color-swatch {
+  display: inline-block;
+  width: 22px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  vertical-align: middle;
+}
+
+.color-swatch-input {
+  width: 36px;
+  height: 30px;
+  padding: 0;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.actions-cell {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+}
+
+.btn.danger {
+  background: #ef4444;
+  color: #fff;
+  border-color: #ef4444;
+}
+
+.btn.danger:hover {
+  background: #dc2626;
+  border-color: #dc2626;
+}
+
+.template-form {
+  border: 1px dashed var(--border, #cbd5e1);
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(79, 70, 229, 0.03);
+}
+
+.template-form h4 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text, #111827);
 }
 
 .detail-body {
@@ -2356,18 +2712,37 @@ th:hover .col-remove-btn { display: inline; }
 
 /* ── Column customization panel & resize grabber ─────────────────────────── */
 
+/* Wide invisible hit-zone for easy grabbing, with a thin visible rule centered inside.
+   The wider hit-zone makes the handle easy to target; the rule keeps the column
+   boundary visible at rest. */
 .col-resize-grabber {
   position: absolute;
   top: 0;
-  right: 0;
-  width: 6px;
+  right: -7px; /* center the 14px-wide grabber over the column boundary */
+  width: 14px;
   height: 100%;
   cursor: col-resize;
   user-select: none;
+  z-index: 3;
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
-.col-resize-grabber:hover {
-  background: rgba(99, 102, 241, 0.25);
+.col-resize-grabber::after {
+  content: "";
+  width: 2px;
+  height: 60%;
+  background: var(--border, #e2e8f0);
+  border-radius: 1px;
+  transition: background 120ms ease;
+}
+
+.col-resize-grabber:hover::after,
+body.col-resizing .col-resize-grabber::after {
+  background: #6366f1;
+  width: 3px;
+  height: 100%;
 }
 
 th {
@@ -2377,6 +2752,10 @@ th {
 body.col-resizing {
   cursor: col-resize !important;
   user-select: none !important;
+}
+
+body.col-resizing .ticket-table * {
+  cursor: col-resize !important;
 }
 
 .column-panel {
@@ -2639,4 +3018,163 @@ body.col-resizing {
     width: 100%;
     min-width: 0;
   }
+}
+
+/* ----- Bulk edit: action bar, row checkbox column, dialog ----- */
+.bulk-action-bar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  background: var(--accent-soft, #eef2ff);
+  border-bottom: 1px solid var(--border);
+}
+
+.bulk-action-count {
+  font-size: 14px;
+  color: var(--text);
+  margin-right: auto;
+}
+
+.bulk-action-count strong {
+  margin-right: 4px;
+}
+
+.ticket-table th.checkbox-cell,
+.ticket-table td.checkbox-cell {
+  width: 36px;
+  min-width: 36px;
+  max-width: 36px;
+  padding: 0 6px;
+  text-align: center;
+}
+
+.ticket-table th.checkbox-cell {
+  background: var(--panel-strong, #f8fafc);
+}
+
+.ticket-table tr.row-selected td.checkbox-cell {
+  background: var(--accent-soft, #eef2ff);
+}
+
+.ticket-table td.checkbox-cell input[type="checkbox"],
+.ticket-table th.checkbox-cell input[type="checkbox"] {
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+}
+
+.ticket-table tr.row-selected > td {
+  background: var(--accent-soft, #eef2ff);
+}
+
+.bulk-modal {
+  width: min(480px, 100%);
+}
+
+.bulk-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.bulk-field select {
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+}
+
+.bulk-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--accent-soft, #eef2ff);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.bulk-error {
+  margin: 0;
+  font-size: 13px;
+  color: #b91c1c;
+  background: #fef2f2;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.bulk-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bulk-progress-bar {
+  width: 100%;
+  height: 8px;
+  background: var(--border, #e2e8f0);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.bulk-progress-fill {
+  height: 100%;
+  background: #6366f1;
+  transition: width 200ms ease-out;
+}
+
+.bulk-progress-label {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: right;
+}
+
+/* ----- Filtering banner + dimmed-table while a reload is in flight ----- */
+.filtering-banner {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #3730a3;
+  background: var(--accent-soft, #eef2ff);
+  border-bottom: 1px solid var(--border);
+}
+
+.filtering-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid #c7d2fe;
+  border-top-color: #6366f1;
+  animation: filtering-spin 700ms linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes filtering-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.table-dimmed {
+  opacity: 0.45;
+  pointer-events: none;
+  transition: opacity 150ms ease-out;
+}
+
+.metrics-stale .metric b {
+  color: var(--muted);
+  transition: color 150ms ease-out;
 }

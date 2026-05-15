@@ -335,6 +335,24 @@ export async function deleteReplyTemplate(name) {
   return call("helpdesk.api.reply_templates.delete_reply_template", { name });
 }
 
+export async function bulkUpdateTickets(names, field, value) {
+  return call("helpdesk.api.unity_helpdesk.bulk_update_tickets", {
+    names,
+    field,
+    value: value ?? "",
+  });
+}
+
+export async function listAgentGroups() {
+  const rows = await call("frappe.client.get_list", {
+    doctype: "HD Team",
+    fields: ["name"],
+    page_length: 200,
+    order_by: "name asc",
+  });
+  return rows || [];
+}
+
 // Fetch a single template with its full body (the list endpoint only returns a preview)
 export async function getReplyTemplateDoc(name) {
   return call("frappe.client.get", {

@@ -34,11 +34,46 @@
         </option>
       </select>
       <span v-else class="badge blue">Assigned to me</span>
-      <input
-        v-model="filters.created_from"
-        type="date"
-        @change="applyFiltersAndReload"
-      />
+      <div ref="dateRangeRef" class="date-range-trigger">
+        <button
+          type="button"
+          class="date-range-btn"
+          :class="{ 'has-value': filters.created_from || filters.created_to }"
+          :title="dateRangeLabel"
+          @click="toggleDateRange"
+        >
+          <span class="date-range-icon" aria-hidden="true">📅</span>
+          <span class="date-range-label">{{ dateRangeLabel }}</span>
+        </button>
+        <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
+          <div class="date-range-pop-row">
+            <label class="date-range-field">
+              <span>From</span>
+              <input
+                v-model="dateRangeDraft.from"
+                type="date"
+                :max="dateRangeDraft.to || undefined"
+              />
+            </label>
+            <label class="date-range-field">
+              <span>To</span>
+              <input
+                v-model="dateRangeDraft.to"
+                type="date"
+                :min="dateRangeDraft.from || undefined"
+              />
+            </label>
+          </div>
+          <div class="date-range-pop-actions">
+            <button type="button" class="btn secondary" @click="clearDateRange">
+              Clear
+            </button>
+            <button type="button" class="btn" @click="applyDateRange">
+              Apply
+            </button>
+          </div>
+        </div>
+      </div>
       <div class="search-wrapper">
         <span class="search-icon">🔍</span>
         <input
@@ -211,16 +246,16 @@
                 <span>{{ col.label }}</span>
                 <small v-if="col.fixed" class="muted">(always shown)</small>
               </label>
-              <input
-                type="number"
+              <select
                 class="column-list-width"
-                min="60"
-                max="600"
-                step="10"
-                :value="col.width"
-                title="Width (px)"
-                @input="col.width = clampColumnWidth($event.target.value)"
-              />
+                :value="pxToScale(col.width)"
+                title="Column width: 1 = narrow, 10 = very wide"
+                @change="col.width = scaleToPx($event.target.value)"
+              >
+                <option v-for="step in 10" :key="step" :value="step">
+                  {{ step }}
+                </option>
+              </select>
             </li>
           </ol>
         </div>
@@ -243,25 +278,166 @@
       </section>
     </div>
 
-    <div class="metrics">
+    <div
+      v-if="bulkModalOpen"
+      class="modal-backdrop"
+      @click.self="closeBulkModal"
+    >
+      <section class="modal-card bulk-modal">
+        <div class="modal-header">
+          <div>
+            <strong
+              >Bulk edit {{ selectionCount }} ticket{{
+                selectionCount === 1 ? "" : "s"
+              }}</strong
+            >
+            <span>Apply one field change to every selected ticket.</span>
+          </div>
+          <button class="btn secondary" @click="closeBulkModal">Close</button>
+        </div>
+        <div class="modal-body stack">
+          <label class="bulk-field">
+            <span>Field</span>
+            <select v-model="bulkField" @change="onBulkFieldChange">
+              <option
+                v-for="(label, key) in BULK_FIELD_LABELS"
+                :key="key"
+                :value="key"
+              >
+                {{ label }}
+              </option>
+            </select>
+          </label>
+          <label class="bulk-field">
+            <span>New value</span>
+            <select v-if="bulkField === 'status'" v-model="bulkValue">
+              <option value="Open">Open</option>
+              <option value="Replied">Replied</option>
+              <option value="Resolved">Resolved</option>
+              <option value="Closed">Closed</option>
+              <option value="On Hold">On Hold</option>
+            </select>
+            <select v-else-if="bulkField === 'priority'" v-model="bulkValue">
+              <option value="">— Clear —</option>
+              <option value="High">High</option>
+              <option value="Medium">Medium</option>
+              <option value="Low">Low</option>
+            </select>
+            <select v-else-if="bulkField === '_assign'" v-model="bulkValue">
+              <option value="">— Unassign —</option>
+              <option
+                v-for="agent in agents"
+                :key="agent.name"
+                :value="agent.user || agent.email || agent.name"
+              >
+                {{
+                  agent.full_name ||
+                  agent.agent_name ||
+                  agent.user ||
+                  agent.name
+                }}
+              </option>
+            </select>
+            <select v-else-if="bulkField === 'ticket_type'" v-model="bulkValue">
+              <option value="">— Clear —</option>
+              <option
+                v-for="type in ticketTypes"
+                :key="type.name"
+                :value="type.name"
+              >
+                {{ type.name }}
+              </option>
+            </select>
+            <select v-else-if="bulkField === 'agent_group'" v-model="bulkValue">
+              <option value="">— Clear —</option>
+              <option
+                v-for="grp in agentGroups"
+                :key="grp.name"
+                :value="grp.name"
+              >
+                {{ grp.name }}
+              </option>
+            </select>
+          </label>
+          <p v-if="bulkField === '_assign' && bulkValue" class="bulk-note">
+            Assignee will be <strong>replaced</strong> on each selected ticket
+            (existing assignees are cleared first).
+          </p>
+          <p
+            v-if="bulkResult && bulkResult.failed && bulkResult.failed.length"
+            class="bulk-error"
+          >
+            {{ bulkResult.failed.length }} ticket{{
+              bulkResult.failed.length === 1 ? "" : "s"
+            }}
+            failed ({{ bulkResult.updated.length }} updated). First failure:
+            <em>{{ bulkResult.failed[0].name }}</em
+            >{{
+              bulkResult.failed[0].reason
+                ? ` — ${bulkResult.failed[0].reason}`
+                : ""
+            }}
+          </p>
+          <div v-if="bulkSaving" class="bulk-progress">
+            <div class="bulk-progress-bar">
+              <div
+                class="bulk-progress-fill"
+                :style="{
+                  width:
+                    (bulkProgress.total
+                      ? (bulkProgress.done / bulkProgress.total) * 100
+                      : 0) + '%',
+                }"
+              ></div>
+            </div>
+            <span class="bulk-progress-label">
+              {{ bulkProgress.done }} / {{ bulkProgress.total }} applied
+            </span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button
+            type="button"
+            class="btn secondary"
+            :disabled="bulkSaving"
+            @click="closeBulkModal"
+          >
+            Cancel
+          </button>
+          <button
+            class="btn"
+            :disabled="bulkSaving || !selectionCount"
+            @click="applyBulkUpdate"
+          >
+            {{
+              bulkSaving
+                ? `Applying ${bulkProgress.done}/${bulkProgress.total}…`
+                : `Apply to ${selectionCount}`
+            }}
+          </button>
+        </div>
+      </section>
+    </div>
+
+    <div class="metrics" :class="{ 'metrics-stale': showFilteringBanner }">
       <div class="metric">
-        <b>{{ result.total_count || 0 }}</b>
+        <b>{{ showFilteringBanner ? "…" : result.total_count || 0 }}</b>
         <span>Total Tickets</span>
       </div>
       <div class="metric">
-        <b>{{ cards.pending || 0 }}</b>
+        <b>{{ showFilteringBanner ? "…" : cards.pending || 0 }}</b>
         <span>Pending</span>
       </div>
       <div class="metric">
-        <b>{{ cards.on_hold || 0 }}</b>
+        <b>{{ showFilteringBanner ? "…" : cards.on_hold || 0 }}</b>
         <span>On Hold</span>
       </div>
       <div class="metric">
-        <b>{{ cards.resolved || 0 }}</b>
+        <b>{{ showFilteringBanner ? "…" : cards.resolved || 0 }}</b>
         <span>Resolved</span>
       </div>
       <div class="metric">
-        <b>{{ cards.closed || 0 }}</b>
+        <b>{{ showFilteringBanner ? "…" : cards.closed || 0 }}</b>
         <span>Closed</span>
       </div>
     </div>
@@ -269,11 +445,29 @@
     <div class="table-shell">
       <div class="table-header">
         <strong>{{ title }}</strong>
-        <span>{{ result.total_count || 0 }} tickets</span>
+        <span>{{
+          showFilteringBanner ? "…" : `${result.total_count || 0} tickets`
+        }}</span>
       </div>
-      <div v-if="reloading" class="reloading-indicator">
-        <span class="reload-spinner" aria-hidden="true"></span>
-        <span>Reloading…</span>
+      <div v-if="selectionCount > 0" class="bulk-action-bar">
+        <span class="bulk-action-count">
+          <strong>{{ selectionCount }}</strong> selected
+        </span>
+        <button type="button" class="btn" @click="openBulkModal">
+          Bulk edit
+        </button>
+        <button type="button" class="btn secondary" @click="clearSelection">
+          Clear
+        </button>
+      </div>
+      <div
+        v-if="showFilteringBanner && tickets.length"
+        class="filtering-banner"
+      >
+        <span class="filtering-spinner" aria-hidden="true"></span>
+        <span
+          >Filtering tickets… results below are from the previous request.</span
+        >
       </div>
       <div v-if="reloadPrompt" class="reload-prompt">
         <span>Couldn't load tickets.</span>
@@ -288,10 +482,26 @@
         shorter or different term.
       </p>
       <p v-else-if="!tickets.length" class="empty">{{ emptyMessage }}</p>
-      <div v-else class="scroll-x">
+      <div
+        v-else
+        class="scroll-x"
+        :class="{ 'table-dimmed': showFilteringBanner }"
+      >
         <table class="ticket-table">
           <thead>
             <tr>
+              <th
+                class="checkbox-cell"
+                :title="
+                  allOnPageSelected ? 'Clear all on page' : 'Select all on page'
+                "
+              >
+                <input
+                  type="checkbox"
+                  :checked="allOnPageSelected"
+                  @click.stop="toggleAllOnPage"
+                />
+              </th>
               <th
                 v-for="(col, colIdx) in visibleColumns"
                 :key="col.key"
@@ -362,14 +572,26 @@
                   ticket.custom_via_unity_portal &&
                   !ticket.custom_is_bulk_email,
                 'bulk-email-ticket': ticket.custom_is_bulk_email,
+                'row-selected': isSelected(ticket.name),
               }"
               @click="openTicket(ticket.name)"
             >
+              <td class="checkbox-cell" @click.stop>
+                <input
+                  type="checkbox"
+                  :checked="isSelected(ticket.name)"
+                  @click.stop="toggleRow(ticket.name)"
+                />
+              </td>
               <td
                 v-for="col in visibleColumns"
                 :key="col.key"
                 :class="{ 'cell-edit': isEditableColumn(col.key) }"
-                :style="{ minWidth: col.width + 'px' }"
+                :style="{
+                  minWidth: col.width + 'px',
+                  maxWidth: col.width + 'px',
+                  width: col.width + 'px',
+                }"
                 @click="onCellClick($event, col.key)"
               >
                 <template v-if="col.key === 'name'">
@@ -385,11 +607,7 @@
                   <div class="subject">
                     {{ ticket.subject || "No subject" }}
                   </div>
-                  <small class="muted">
-                    <a :href="`mailto:${ticket.raised_by}`" @click.stop>{{
-                      ticket.raised_by
-                    }}</a>
-                  </small>
+                  <small class="muted">{{ ticket.raised_by }}</small>
                   <small
                     v-if="ticket.custom_search_student_names"
                     class="student-names"
@@ -526,6 +744,16 @@
                     @keyup.enter="saveHoldReason(ticket)"
                   />
                 </template>
+                <template v-else-if="col.key === 'custom_primary_message_text'">
+                  <span
+                    v-if="ticket.custom_primary_message_text"
+                    class="cell-mail-body"
+                    :title="ticket.custom_primary_message_text"
+                  >
+                    {{ truncateBody(ticket.custom_primary_message_text) }}
+                  </span>
+                  <span v-else class="muted">-</span>
+                </template>
                 <template v-else>
                   <span>{{ formatCellValue(ticket, col.key) }}</span>
                 </template>
@@ -536,6 +764,14 @@
         </table>
       </div>
       <div class="table-header">
+        <label class="page-size-control" title="Rows fetched per request">
+          Rows per page
+          <select v-model.number="result.page_length" @change="reload">
+            <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">
+              {{ size }}
+            </option>
+          </select>
+        </label>
         <span
           >Showing {{ tickets.length }} of {{ result.total_count || 0 }}</span
         >
@@ -559,12 +795,14 @@ import {
 } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
+  bulkUpdateTickets,
   call,
   callWithRetry,
   formatDate,
   formatDateTime,
   getAgents,
   getTicketTypes,
+  listAgentGroups,
 } from "../api";
 
 const props = defineProps({ view: { type: String, default: "my" } });
@@ -591,14 +829,41 @@ const result = reactive({
   total_count: 0,
   cards: {},
   start: 0,
-  page_length: 20,
+  page_length: 100,
 });
+const PAGE_SIZE_OPTIONS = [100, 500, 1000, 2500, 5000];
+// Bulk-edit selection + dialog state.
+const selectedIds = ref(new Set());
+const bulkModalOpen = ref(false);
+const bulkField = ref("status");
+const bulkValue = ref("");
+const bulkSaving = ref(false);
+const bulkResult = ref(null); // { updated: [...], failed: [...] }
+const bulkProgress = ref({ done: 0, total: 0 });
+const BULK_CHUNK_SIZE = 100;
+const agentGroups = ref([]);
+const BULK_FIELD_LABELS = {
+  status: "Status",
+  priority: "Priority",
+  _assign: "Assignee",
+  ticket_type: "Ticket Type",
+  agent_group: "Agent Group",
+};
+const dateRangeOpen = ref(false);
+const dateRangeRef = ref(null);
+const dateRangeDraft = reactive({ from: "", to: "" });
+// Debounced "is something loading" flag for the table-dim + filtering banner.
+// Goes true only after ~120ms of continuous loading so quick (<120ms) loads
+// don't flicker the UI on top of fast post-index responses.
+const showFilteringBanner = ref(false);
+let filteringBannerTimer = null;
 const filters = reactive({
   status: "",
   priority: "",
   ticket_type: "",
   assigned_to: "",
   created_from: "",
+  created_to: "",
 });
 let activeController = null;
 let activeRequestId = 0;
@@ -793,10 +1058,44 @@ function onDocClick() {
 onMounted(() => document.addEventListener("click", onDocClick));
 onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
 
+// Column widths are stored as pixel values but presented to the user on a
+// friendly 1-10 scale. Each scale step maps to a fixed pixel width below.
+// Step 10 (1400px) is wide enough for the Mail Body preview to show 1-2
+// full lines of text without wrapping; step 1 (80px) is for icon-only columns.
+const COLUMN_WIDTH_SCALE_PX = [
+  80, 140, 200, 280, 380, 500, 660, 860, 1100, 1400,
+];
+const COLUMN_WIDTH_MIN_PX = COLUMN_WIDTH_SCALE_PX[0];
+const COLUMN_WIDTH_MAX_PX =
+  COLUMN_WIDTH_SCALE_PX[COLUMN_WIDTH_SCALE_PX.length - 1];
+
+function pxToScale(width) {
+  const px = Number(width) || 0;
+  let bestIdx = 0;
+  let bestDelta = Infinity;
+  for (let i = 0; i < COLUMN_WIDTH_SCALE_PX.length; i += 1) {
+    const delta = Math.abs(COLUMN_WIDTH_SCALE_PX[i] - px);
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      bestIdx = i;
+    }
+  }
+  return bestIdx + 1;
+}
+
+function scaleToPx(scale) {
+  const idx =
+    Math.min(
+      COLUMN_WIDTH_SCALE_PX.length,
+      Math.max(1, Number.parseInt(scale, 10) || 1)
+    ) - 1;
+  return COLUMN_WIDTH_SCALE_PX[idx];
+}
+
 function clampColumnWidth(width) {
   const n = Number.parseInt(width, 10);
-  if (Number.isNaN(n)) return 140;
-  return Math.min(600, Math.max(60, n));
+  if (Number.isNaN(n)) return 280;
+  return Math.min(COLUMN_WIDTH_MAX_PX, Math.max(COLUMN_WIDTH_MIN_PX, n));
 }
 
 // Column resize (drag right edge of <th>)
@@ -804,11 +1103,15 @@ const resizingKey = ref(null);
 let resizeStartX = 0;
 let resizeStartWidth = 0;
 
+let pendingResizeX = 0;
+let resizeRaf = 0;
+
 function startColumnResize(event, col) {
   if (!col || col.fixed === undefined) return;
   resizingKey.value = col.key;
   resizeStartX = event.clientX;
   resizeStartWidth = col.width || 140;
+  pendingResizeX = event.clientX;
   document.body.classList.add("col-resizing");
   window.addEventListener("mousemove", handleColumnResize);
   window.addEventListener("mouseup", endColumnResize, { once: true });
@@ -816,9 +1119,10 @@ function startColumnResize(event, col) {
   event.stopPropagation();
 }
 
-function handleColumnResize(event) {
+function applyResizeFrame() {
+  resizeRaf = 0;
   if (!resizingKey.value) return;
-  const delta = event.clientX - resizeStartX;
+  const delta = pendingResizeX - resizeStartX;
   const next = clampColumnWidth(resizeStartWidth + delta);
   const prefs = (unitySession?.settings?.column_preferences || []).map((p) =>
     p.key === resizingKey.value ? { ...p, width: next } : p
@@ -826,9 +1130,25 @@ function handleColumnResize(event) {
   if (unitySession) unitySession.settings.column_preferences = prefs;
 }
 
+function handleColumnResize(event) {
+  if (!resizingKey.value) return;
+  pendingResizeX = event.clientX;
+  // Coalesce mousemove updates into one paint per frame — keeps the table
+  // from re-rendering 100+ rows per pixel of mouse travel.
+  if (!resizeRaf) {
+    resizeRaf = requestAnimationFrame(applyResizeFrame);
+  }
+}
+
 function endColumnResize() {
   window.removeEventListener("mousemove", handleColumnResize);
   document.body.classList.remove("col-resizing");
+  if (resizeRaf) {
+    cancelAnimationFrame(resizeRaf);
+    resizeRaf = 0;
+    // Flush any final pending position so the released width matches the cursor.
+    applyResizeFrame();
+  }
   const key = resizingKey.value;
   resizingKey.value = null;
   if (!key) return;
@@ -1093,6 +1413,27 @@ watch(
   { immediate: true }
 );
 
+// Show the "Filtering…" banner only after a brief delay so fast loads don't
+// flash it on/off and create visual noise.
+watch(
+  () => loading.value || reloading.value,
+  (isLoading) => {
+    if (isLoading) {
+      if (filteringBannerTimer) return;
+      filteringBannerTimer = setTimeout(() => {
+        showFilteringBanner.value = true;
+        filteringBannerTimer = null;
+      }, 120);
+    } else {
+      if (filteringBannerTimer) {
+        clearTimeout(filteringBannerTimer);
+        filteringBannerTimer = null;
+      }
+      showFilteringBanner.value = false;
+    }
+  }
+);
+
 onMounted(async () => {
   applyRouteState();
   loadRecentSearches();
@@ -1105,6 +1446,11 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   if (typeof window !== "undefined") {
     window.removeEventListener("keydown", onGlobalKeydown);
+  }
+  document.removeEventListener("mousedown", onDateRangeOutsideClick);
+  if (filteringBannerTimer) {
+    clearTimeout(filteringBannerTimer);
+    filteringBannerTimer = null;
   }
 });
 
@@ -1119,6 +1465,7 @@ function applyRouteState() {
   filters.ticket_type = String(route.query.ticket_type || "");
   filters.assigned_to = String(route.query.assigned_to || "");
   filters.created_from = String(route.query.created_from || "");
+  filters.created_to = String(route.query.created_to || "");
 }
 
 function syncEditState(rows) {
@@ -1154,6 +1501,159 @@ function cleanFilters() {
   );
 }
 
+// --- Date range picker helpers ---
+function formatShortDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
+}
+const dateRangeLabel = computed(() => {
+  const from = filters.created_from;
+  const to = filters.created_to;
+  if (!from && !to) return "Ticket created";
+  if (from && to)
+    return `Created: ${formatShortDate(from)} → ${formatShortDate(to)}`;
+  if (from) return `Created: from ${formatShortDate(from)}`;
+  return `Created: until ${formatShortDate(to)}`;
+});
+function toggleDateRange() {
+  if (dateRangeOpen.value) {
+    closeDateRange();
+    return;
+  }
+  dateRangeDraft.from = filters.created_from || "";
+  dateRangeDraft.to = filters.created_to || "";
+  dateRangeOpen.value = true;
+  // Defer the listener attach so the click that opened the popover doesn't
+  // immediately match the outside-click handler and close it.
+  setTimeout(() => {
+    document.addEventListener("mousedown", onDateRangeOutsideClick);
+  }, 0);
+}
+function closeDateRange() {
+  dateRangeOpen.value = false;
+  document.removeEventListener("mousedown", onDateRangeOutsideClick);
+}
+function onDateRangeOutsideClick(event) {
+  if (!dateRangeRef.value) return;
+  if (!dateRangeRef.value.contains(event.target)) {
+    closeDateRange();
+  }
+}
+async function applyDateRange() {
+  filters.created_from = dateRangeDraft.from || "";
+  filters.created_to = dateRangeDraft.to || "";
+  closeDateRange();
+  await applyFiltersAndReload();
+}
+async function clearDateRange() {
+  dateRangeDraft.from = "";
+  dateRangeDraft.to = "";
+  filters.created_from = "";
+  filters.created_to = "";
+  closeDateRange();
+  await applyFiltersAndReload();
+}
+
+// --- Bulk edit helpers ---
+const selectionCount = computed(() => selectedIds.value.size);
+const allOnPageSelected = computed(() => {
+  const rows = tickets.value;
+  if (!rows.length) return false;
+  return rows.every((t) => selectedIds.value.has(t.name));
+});
+function toggleRow(name) {
+  // Re-assign the ref so reactivity picks up Set mutations.
+  const next = new Set(selectedIds.value);
+  if (next.has(name)) next.delete(name);
+  else next.add(name);
+  selectedIds.value = next;
+}
+function isSelected(name) {
+  return selectedIds.value.has(name);
+}
+function toggleAllOnPage() {
+  const next = new Set(selectedIds.value);
+  if (allOnPageSelected.value) {
+    for (const t of tickets.value) next.delete(t.name);
+  } else {
+    for (const t of tickets.value) next.add(t.name);
+  }
+  selectedIds.value = next;
+}
+function clearSelection() {
+  selectedIds.value = new Set();
+}
+function defaultBulkValueFor(field) {
+  if (field === "status") return "Open";
+  if (field === "priority") return "Medium";
+  return "";
+}
+async function openBulkModal() {
+  bulkResult.value = null;
+  bulkField.value = "status";
+  bulkValue.value = defaultBulkValueFor(bulkField.value);
+  bulkModalOpen.value = true;
+  // Lazy-load agent groups the first time the dialog opens.
+  if (!agentGroups.value.length) {
+    try {
+      agentGroups.value = await listAgentGroups();
+    } catch (e) {
+      // Non-fatal — the field stays empty.
+      agentGroups.value = [];
+    }
+  }
+}
+function closeBulkModal() {
+  bulkModalOpen.value = false;
+}
+function onBulkFieldChange() {
+  bulkValue.value = defaultBulkValueFor(bulkField.value);
+}
+async function applyBulkUpdate() {
+  if (!selectedIds.value.size) return;
+  bulkSaving.value = true;
+  bulkResult.value = null;
+  const allNames = Array.from(selectedIds.value);
+  bulkProgress.value = { done: 0, total: allNames.length };
+  const updated = [];
+  const failed = [];
+  try {
+    // Chunk so the user sees progress and a single chunk-timeout doesn't lose
+    // the whole batch. Server-side fast path makes each chunk cheap.
+    for (let i = 0; i < allNames.length; i += BULK_CHUNK_SIZE) {
+      const chunk = allNames.slice(i, i + BULK_CHUNK_SIZE);
+      try {
+        const res = await bulkUpdateTickets(
+          chunk,
+          bulkField.value,
+          bulkValue.value
+        );
+        updated.push(...(res.updated || []));
+        failed.push(...(res.failed || []));
+      } catch (err) {
+        // Whole chunk blew up — record each row as failed and continue.
+        for (const name of chunk) {
+          failed.push({ name, reason: err.message || "request failed" });
+        }
+      }
+      bulkProgress.value = {
+        done: Math.min(i + chunk.length, allNames.length),
+        total: allNames.length,
+      };
+    }
+    bulkResult.value = { updated, failed };
+    if (!failed.length) {
+      closeBulkModal();
+      clearSelection();
+    }
+    await reload();
+  } finally {
+    bulkSaving.value = false;
+  }
+}
+
 async function reload() {
   result.start = 0;
   await load({ append: false });
@@ -1168,6 +1668,7 @@ function routeQueryFromState() {
     ticket_type: filters.ticket_type || undefined,
     assigned_to: filters.assigned_to || undefined,
     created_from: filters.created_from || undefined,
+    created_to: filters.created_to || undefined,
     search: appliedSearch.value.trim() || undefined,
   };
 }
@@ -1262,9 +1763,13 @@ async function load({ append = false } = {}) {
       result.total_count = data.total_count || 0;
       result.cards = data.cards || {};
       result.start = data.start || result.start;
-      result.page_length = data.page_length || result.page_length;
+      // Do not overwrite result.page_length — user selection is source of truth.
     } else {
-      Object.assign(result, data);
+      result.data = data.data || [];
+      result.total_count = data.total_count || 0;
+      result.cards = data.cards || {};
+      result.start = data.start || 0;
+      // Do not overwrite result.page_length — user selection is source of truth.
     }
     syncEditState(data.data || []);
   } catch (err) {
@@ -1377,6 +1882,16 @@ const DATETIME_COLUMN_KEYS = new Set([
   "first_responded_on",
   "resolution_date",
 ]);
+
+const MAIL_BODY_PREVIEW_CHARS = 140;
+
+function truncateBody(text) {
+  const value = String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (value.length <= MAIL_BODY_PREVIEW_CHARS) return value;
+  return value.slice(0, MAIL_BODY_PREVIEW_CHARS).trim() + "…";
+}
 
 function formatCellValue(ticket, key) {
   const raw = ticket?.[key];

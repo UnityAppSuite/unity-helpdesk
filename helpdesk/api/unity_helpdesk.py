@@ -6,7 +6,8 @@ from collections import defaultdict
 import frappe
 from frappe import _
 from frappe.desk.form.assign_to import clear as clear_all_assignments
-from frappe.query_builder import Order
+from frappe.query_builder import Case, Order
+from frappe.query_builder.functions import Count, Sum
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
@@ -212,11 +213,12 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "resolution_date", "label": "Resolved On", "default": False, "fixed": False, "width": 140},
 	{"key": "custom_hold_from", "label": "Hold From", "default": False, "fixed": False, "width": 130},
 	{"key": "custom_hold_to", "label": "Hold To", "default": False, "fixed": False, "width": 130},
+	{"key": "custom_primary_message_text", "label": "Mail Body", "default": False, "fixed": False, "width": 320},
 ]
 AVAILABLE_TICKET_COLUMN_KEYS = {c["key"] for c in AVAILABLE_TICKET_COLUMNS}
 COLUMN_PREFS_DEFAULT_KEY = "unity_helpdesk_columns"
 COLUMN_WIDTH_MIN = 60
-COLUMN_WIDTH_MAX = 600
+COLUMN_WIDTH_MAX = 1400
 COLUMN_PREFS_MAX_ITEMS = 100
 
 
@@ -2025,7 +2027,13 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 	if filters.get("created_from"):
 		res.append([TICKET_DOCTYPE, "creation", ">=", filters.created_from])
 	if filters.get("created_to"):
-		res.append([TICKET_DOCTYPE, "creation", "<=", filters.created_to])
+		# Expand a date-only "to" filter to end-of-day so tickets created at
+		# any time on the selected day are included. If the caller passes a
+		# full datetime string we leave it as-is.
+		to_value = cstr(filters.created_to).strip()
+		if len(to_value) == 10:  # bare YYYY-MM-DD from the SPA date input
+			to_value = f"{to_value} 23:59:59"
+		res.append([TICKET_DOCTYPE, "creation", "<=", to_value])
 
 	if _has_field(TICKET_DOCTYPE, "custom_hold_from") and filters.get("hold_from"):
 		res.append([TICKET_DOCTYPE, "custom_hold_from", ">=", filters.hold_from])
@@ -2046,7 +2054,83 @@ def _count(filters=None, or_filters=None):
 	return int((row[0].total_count if row else 0) or 0)
 
 
+def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
+	"""Apply a Unity-style filter list (list of `[doctype, field, op, value]`)
+	to a `frappe.qb` SELECT query. Supports the operators we actually produce
+	in `_build_filters`: `=`, `!=`, `like`, `in`, `not in`, `>=`, `<=`, `>`, `<`."""
+	if not filters_list:
+		return query
+	for entry in filters_list:
+		if not entry or len(entry) < 4:
+			continue
+		_, field, op, value = entry[0], entry[1], entry[2], entry[3]
+		col = doctype_ref[field]
+		op_norm = (op or "=").lower()
+		if op_norm == "=":
+			query = query.where(col == value)
+		elif op_norm == "!=":
+			query = query.where(col != value)
+		elif op_norm == "like":
+			query = query.where(col.like(value))
+		elif op_norm == "not like":
+			query = query.where(col.not_like(value))
+		elif op_norm == "in":
+			query = query.where(col.isin(value if isinstance(value, (list, tuple)) else [value]))
+		elif op_norm == "not in":
+			query = query.where(col.notin(value if isinstance(value, (list, tuple)) else [value]))
+		elif op_norm == ">=":
+			query = query.where(col >= value)
+		elif op_norm == "<=":
+			query = query.where(col <= value)
+		elif op_norm == ">":
+			query = query.where(col > value)
+		elif op_norm == "<":
+			query = query.where(col < value)
+		else:
+			# Unknown op — fall back to equality so we don't silently drop a filter.
+			query = query.where(col == value)
+	return query
+
+
 def _dashboard_cards_for_filters(filters=None):
+	"""Compute dashboard card counts in a single SQL query.
+
+	Was 6 sequential `COUNT(*)` scans on a ~90K-row table; rewritten as one
+	`SELECT COUNT(*), SUM(CASE WHEN ...)` aggregate to keep the list page
+	responsive."""
+	has_on_hold = _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
+	HDT = frappe.qb.DocType(TICKET_DOCTYPE)
+	q = frappe.qb.from_(HDT).select(
+		Count(HDT.name).as_("total"),
+		Sum(Case().when(HDT.status == "Replied", 1).else_(0)).as_("replied"),
+		Sum(Case().when(HDT.status == "Resolved", 1).else_(0)).as_("resolved"),
+		Sum(Case().when(HDT.status == "Closed", 1).else_(0)).as_("closed"),
+		Sum(Case().when(HDT.status.isin(OPEN_STATUSES), 1).else_(0)).as_("pending"),
+	)
+	if has_on_hold:
+		q = q.select(Sum(Case().when(HDT.custom_is_on_hold == 1, 1).else_(0)).as_("on_hold"))
+	q = _apply_ticket_filters_to_query(q, HDT, filters)
+	try:
+		rows = q.run(as_dict=True)
+	except Exception:
+		frappe.log_error("unity dashboard cards aggregate failed; falling back")
+		return _dashboard_cards_for_filters_legacy(filters)
+	row = rows[0] if rows else {}
+	total = int(row.get("total") or 0)
+	return {
+		"total": total,
+		"created": total,
+		"pending": int(row.get("pending") or 0),
+		"on_hold": int(row.get("on_hold") or 0) if has_on_hold else 0,
+		"resolved": int(row.get("resolved") or 0),
+		"closed": int(row.get("closed") or 0),
+		"replied": int(row.get("replied") or 0),
+	}
+
+
+def _dashboard_cards_for_filters_legacy(filters=None):
+	"""Original per-card-count implementation. Kept as a safe fallback if the
+	aggregate query ever fails (e.g. dialect mismatch on a non-MariaDB site)."""
 	total = _count(filters)
 	on_hold = (
 		_count(_merge_filters(filters, [[TICKET_DOCTYPE, "custom_is_on_hold", "=", 1]]))
@@ -2298,8 +2382,10 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 			limit_start=start,
 			page_length=page_length,
 		)
-		total_count = _count(list_filters)
 		cards = _dashboard_cards_for_filters(list_filters)
+		# `cards["total"]` is the same COUNT(*) the list page wants — re-use it
+		# instead of running another COUNT query.
+		total_count = int(cards.get("total") or 0)
 
 	return {
 		"data": [_decorate_ticket(row) for row in rows],
@@ -2781,6 +2867,90 @@ def update_ticket(
 		_log_hold_reason(name, hold_reason)
 	row = frappe.get_list(TICKET_DOCTYPE, fields=_ticket_fields(), filters={"name": name}, page_length=1)
 	return _decorate_ticket(row[0]) if row else {}
+
+
+ALLOWED_BULK_FIELDS = {"status", "priority", "_assign", "ticket_type", "agent_group"}
+# Fields whose changes don't trigger controller side effects (activity log,
+# search index rebuild, SLA recalculation). We can skip `doc.save()` for these
+# and do a raw column update — orders of magnitude faster at bulk scale.
+BULK_FAST_PATH_FIELDS = {"priority", "ticket_type", "agent_group"}
+BULK_UPDATE_MAX = 500
+
+
+@frappe.whitelist()
+def bulk_update_tickets(names, field, value=None):
+	"""Apply a single-field update to many HD Tickets in one request.
+
+	Matches the ergonomics of Frappe's bulk-edit but tailored for the Unity
+	SPA: synchronous up to `BULK_UPDATE_MAX`, returns structured
+	`{updated, failed}` so the UI can render an exact result count instead of
+	leaving the user with a `msgprint`.
+
+	For fields in `BULK_FAST_PATH_FIELDS` we issue a raw `db.set_value` per
+	ticket — skipping `doc.save()` avoids the per-row search-index rebuild
+	(see `HDTicket.on_update`), which is the dominant cost at 500-row scale."""
+	capabilities = _require_unity_access()
+	field_name = cstr(field or "").strip()
+	if field_name not in ALLOWED_BULK_FIELDS:
+		frappe.throw(_("Field {0} is not allowed for bulk edit").format(field_name or "<empty>"))
+	if isinstance(names, str):
+		names = _parse_json(names, [])
+	if not isinstance(names, list) or not names:
+		frappe.throw(_("Select at least one ticket"))
+	if len(names) > BULK_UPDATE_MAX:
+		frappe.throw(_("Bulk edit supports up to {0} tickets at a time").format(BULK_UPDATE_MAX))
+
+	if field_name == "status":
+		# Allow "On Hold" as a virtual status — mirrors `update_ticket`.
+		if value and value not in STATUS_OPTIONS and value != "On Hold":
+			frappe.throw(_("Invalid ticket status"))
+
+	clean_value = value if value not in ("",) else None
+	updated, failed = [], []
+	for name in names:
+		try:
+			_require_ticket_access(name, capabilities)
+			# `_require_ticket_access` only verifies existence for non-admins;
+			# admins get an early-return. Verify here so the fast-path
+			# `frappe.db.set_value` (which silently no-ops on missing rows)
+			# can't mask a bad ticket name as a success.
+			if not frappe.db.exists(TICKET_DOCTYPE, name):
+				raise frappe.DoesNotExistError(_("Ticket not found"))
+			if field_name == "_assign":
+				if clean_value:
+					assign_ticket_to_agent(name, clean_value)
+				else:
+					clear_all_assignments(TICKET_DOCTYPE, name)
+			elif field_name == "status":
+				ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+				if clean_value == "On Hold":
+					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+						ticket.custom_is_on_hold = 1
+					if ticket.status in FINAL_STATUSES or not ticket.status:
+						ticket.status = "Open"
+				else:
+					ticket.status = clean_value
+					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+						ticket.custom_is_on_hold = 0
+				ticket.save()
+			elif field_name in BULK_FAST_PATH_FIELDS:
+				# Raw column update — bypasses `on_update` which rebuilds the
+				# search index on every save. None of these fields participate
+				# in search/SLA, so it's safe to skip the controller.
+				frappe.db.set_value(TICKET_DOCTYPE, name, field_name, clean_value)
+			else:
+				ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+				ticket.set(field_name, clean_value)
+				ticket.save()
+			updated.append(name)
+		except frappe.PermissionError:
+			failed.append({"name": name, "reason": "permission_denied"})
+		except Exception as exc:
+			frappe.log_error(f"bulk_update_tickets failed for {name}: {exc}", "bulk_update_tickets")
+			failed.append({"name": name, "reason": cstr(exc)[:200] or "error"})
+
+	frappe.db.commit()
+	return {"updated": updated, "failed": failed}
 
 
 @frappe.whitelist()
