@@ -1,0 +1,10 @@
+# Generated Vite bundles — minified, single-line, megabytes of output.
+# Running eslint over these takes effectively forever and changes nothing.
+helpdesk/public/**
+**/dist/**
+**/node_modules/**
+
+# Build manifests / sourcemaps
+*.min.js
+*.bundle.js
+*.map
