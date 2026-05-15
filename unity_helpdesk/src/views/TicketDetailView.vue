@@ -28,7 +28,12 @@
       >
         {{ ticket.status_indicator.label }}
       </span>
-      <button class="btn" :disabled="saving" @click="markClosed">
+      <button
+        v-if="ticket.status !== 'Closed'"
+        class="btn"
+        :disabled="saving"
+        @click="markClosed"
+      >
         Mark Closed
       </button>
     </div>
@@ -81,9 +86,19 @@
           "
           class="detail-section"
         >
-          <h3>Student Details</h3>
+          <button
+            class="section-toggle section-toggle--right"
+            type="button"
+            :aria-expanded="studentDetailsOpen"
+            @click="studentDetailsOpen = !studentDetailsOpen"
+          >
+            <h3>Student Details</h3>
+            <span class="section-toggle__chevron" aria-hidden="true">
+              {{ studentDetailsOpen ? "▲" : "▼" }}
+            </span>
+          </button>
           <div
-            v-if="shouldRenderStructuredStudentContext"
+            v-if="studentDetailsOpen && shouldRenderStructuredStudentContext"
             class="detail-body stack"
           >
             <div
@@ -179,7 +194,10 @@
               </table>
             </div>
           </div>
-          <div v-else-if="studentRows.length" class="detail-body compact-body">
+          <div
+            v-else-if="studentDetailsOpen && studentRows.length"
+            class="detail-body compact-body"
+          >
             <div class="scroll-x">
               <table class="compact-info-table">
                 <thead>
@@ -207,7 +225,7 @@
             </div>
           </div>
           <div
-            v-else
+            v-else-if="studentDetailsOpen"
             class="detail-body safe-html compact-html"
             v-html="sanitize(ticket.custom_list_of_student)"
           ></div>
@@ -251,18 +269,24 @@
 
         <section v-if="hasAdditionalDetails" class="detail-section">
           <button
-            class="section-toggle"
+            class="section-toggle section-toggle--right"
             type="button"
+            :aria-expanded="additionalOpen"
             @click="additionalOpen = !additionalOpen"
           >
-            <span>Previous Ticket Details</span>
+            <h3>Previous Ticket Details</h3>
             <small>
               {{ visiblePreviousTickets.length }} of
               {{ previousTicketRows.length }} previous tickets
             </small>
-            <strong>{{ additionalOpen ? "Hide" : "Show" }}</strong>
+            <span class="section-toggle__chevron" aria-hidden="true">
+              {{ additionalOpen ? "▲" : "▼" }}
+            </span>
           </button>
-          <div class="detail-body stack">
+          <div
+            v-if="additionalOpen"
+            class="detail-body stack previous-tickets-body"
+          >
             <div class="thread-filters thread-filters-compact">
               <label>
                 Created From
@@ -282,11 +306,14 @@
             </div>
             <div class="stack">
               <div
-                v-if="ticket.custom_student_remark && additionalOpen"
+                v-if="ticket.custom_student_remark"
                 class="safe-html compact-html"
                 v-html="sanitize(ticket.custom_student_remark)"
               ></div>
-              <div v-if="previousTicketRows.length" class="scroll-x">
+              <div
+                v-if="previousTicketRows.length"
+                class="scroll-x previous-ticket-scroll"
+              >
                 <table class="compact-info-table previous-ticket-table">
                   <thead>
                     <tr>
@@ -326,7 +353,7 @@
                 v-html="sanitize(previousTicketsHtml)"
               ></div>
               <div
-                v-if="ticket.custom_previous_ticket_details && additionalOpen"
+                v-if="ticket.custom_previous_ticket_details"
                 class="safe-html compact-html"
                 v-html="sanitize(ticket.custom_previous_ticket_details)"
               ></div>
@@ -454,6 +481,7 @@
               ref="editorRef"
               v-model="composerHtml"
               :min-height="260"
+              :ticket-name="props.ticketId"
               :placeholder="
                 composeMode === 'reply'
                   ? 'Type your reply to the customer...'
@@ -689,7 +717,8 @@ const composerAttachments = ref([]);
 const editorRef = ref(null);
 const attachmentInput = ref(null);
 const uploadingAttachment = ref(false);
-const additionalOpen = ref(false);
+const additionalOpen = ref(true);
+const studentDetailsOpen = ref(true);
 const previousTicketRows = ref([]);
 let activeTicketRequestId = 0;
 const parsedDescription = ref({

@@ -1,12 +1,20 @@
 <template>
-  <Editor
-    v-model="content"
-    :api-key="apiKey"
-    :disabled="disabled"
-    :init="editorConfig"
-    @on-init="handleInit"
-    @blur="$emit('blur')"
-  />
+  <div class="tinymce-editor-wrap">
+    <Editor
+      v-model="content"
+      :api-key="apiKey"
+      :disabled="disabled"
+      :init="editorConfig"
+      @on-init="handleInit"
+      @blur="$emit('blur')"
+    />
+    <TemplatePicker
+      v-if="pickerOpen"
+      :ticket-name="ticketName"
+      @close="pickerOpen = false"
+      @select="onTemplateSelected"
+    />
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -24,28 +32,33 @@ import "tinymce/plugins/table";
 import "tinymce/themes/silver";
 import "tinymce/skins/ui/oxide/skin.min.css";
 import "tinymce/skins/content/default/content.min.css";
+import TemplatePicker from "./TemplatePicker.vue";
 
 interface Props {
   modelValue: string;
   placeholder?: string;
   disabled?: boolean;
   minHeight?: number;
+  ticketName?: string | null;
 }
 
 interface Emits {
   (event: "update:modelValue", value: string): void;
   (event: "blur"): void;
+  (event: "template-subject", value: string): void;
 }
 
 const props = withDefaults(defineProps<Props>(), {
   placeholder: "",
   disabled: false,
   minHeight: 240,
+  ticketName: null,
 });
 
 const emit = defineEmits<Emits>();
 const content = ref(props.modelValue || "");
 const editorInstance = ref<any>(null);
+const pickerOpen = ref(false);
 const apiKey = "no-api-key";
 
 const editorConfig = computed(() => ({
@@ -59,7 +72,7 @@ const editorConfig = computed(() => ({
   content_css: false,
   statusbar: false,
   toolbar:
-    "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code",
+    "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code | templates",
   placeholder: props.placeholder,
   content_style: `
     body {
@@ -77,6 +90,15 @@ const editorConfig = computed(() => ({
       color: #475569;
     }
   `,
+  setup: (editor: any) => {
+    editor.ui.registry.addButton("templates", {
+      text: "Templates",
+      tooltip: "Insert saved reply template",
+      onAction: () => {
+        pickerOpen.value = true;
+      },
+    });
+  },
 }));
 
 watch(
@@ -117,6 +139,27 @@ function insertContent(value = "") {
   content.value = editorInstance.value.getContent();
 }
 
+interface Rendered {
+  name: string;
+  title: string;
+  subject: string;
+  body: string;
+  warnings: string[];
+}
+
+function onTemplateSelected(rendered: Rendered) {
+  if (rendered.body) {
+    insertContent(rendered.body);
+  }
+  if (rendered.subject) {
+    emit("template-subject", rendered.subject);
+  }
+  if (rendered.warnings && rendered.warnings.length) {
+    console.warn("[template-picker] warnings:", rendered.warnings);
+  }
+  pickerOpen.value = false;
+}
+
 function focus() {
   editorInstance.value?.focus();
 }
@@ -151,3 +194,9 @@ defineExpose({
   },
 });
 </script>
+
+<style scoped>
+.tinymce-editor-wrap {
+  position: relative;
+}
+</style>

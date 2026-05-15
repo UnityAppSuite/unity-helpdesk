@@ -287,6 +287,62 @@ export async function updateUnitySettings(params) {
   return call("helpdesk.api.unity_helpdesk.update_unity_settings", params);
 }
 
+// --- Reply templates (HD Canned Response) admin CRUD ---
+
+export async function listReplyTemplateCategoriesAdmin() {
+  return call("helpdesk.api.reply_templates.get_reply_template_categories", {
+    include_inactive: 1,
+  });
+}
+
+export async function listReplyTemplatesAdmin(params = {}) {
+  return call("helpdesk.api.reply_templates.list_reply_templates", {
+    limit: 200,
+    include_inactive: 1,
+    ...params,
+  });
+}
+
+export async function createReplyTemplateCategory(params) {
+  return call(
+    "helpdesk.api.reply_templates.create_reply_template_category",
+    params
+  );
+}
+
+export async function updateReplyTemplateCategory(params) {
+  return call(
+    "helpdesk.api.reply_templates.update_reply_template_category",
+    params
+  );
+}
+
+export async function deleteReplyTemplateCategory(name) {
+  return call("helpdesk.api.reply_templates.delete_reply_template_category", {
+    name,
+  });
+}
+
+export async function createReplyTemplate(params) {
+  return call("helpdesk.api.reply_templates.create_reply_template", params);
+}
+
+export async function updateReplyTemplate(params) {
+  return call("helpdesk.api.reply_templates.update_reply_template", params);
+}
+
+export async function deleteReplyTemplate(name) {
+  return call("helpdesk.api.reply_templates.delete_reply_template", { name });
+}
+
+// Fetch a single template with its full body (the list endpoint only returns a preview)
+export async function getReplyTemplateDoc(name) {
+  return call("frappe.client.get", {
+    doctype: "HD Canned Response",
+    name,
+  });
+}
+
 export async function searchUsers(query) {
   if (!query || query.length < 2) return [];
   const rows = await call("frappe.client.get_list", {
