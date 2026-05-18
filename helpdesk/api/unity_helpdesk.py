@@ -6,6 +6,8 @@ from collections import defaultdict
 import frappe
 from frappe import _
 from frappe.desk.form.assign_to import clear as clear_all_assignments
+from frappe.query_builder import Case, Order
+from frappe.query_builder.functions import Count, Sum
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
@@ -211,11 +213,12 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "resolution_date", "label": "Resolved On", "default": False, "fixed": False, "width": 140},
 	{"key": "custom_hold_from", "label": "Hold From", "default": False, "fixed": False, "width": 130},
 	{"key": "custom_hold_to", "label": "Hold To", "default": False, "fixed": False, "width": 130},
+	{"key": "custom_primary_message_text", "label": "Mail Body", "default": False, "fixed": False, "width": 320},
 ]
 AVAILABLE_TICKET_COLUMN_KEYS = {c["key"] for c in AVAILABLE_TICKET_COLUMNS}
 COLUMN_PREFS_DEFAULT_KEY = "unity_helpdesk_columns"
 COLUMN_WIDTH_MIN = 60
-COLUMN_WIDTH_MAX = 600
+COLUMN_WIDTH_MAX = 1400
 COLUMN_PREFS_MAX_ITEMS = 100
 
 
@@ -1004,11 +1007,58 @@ def populate_ticket_student_search_fields(ticket):
 	return context
 
 
-def _truncate_search_text(text, max_chars=12000):
+SEARCH_BODY_MAX = 12000
+SEARCH_HEAD_BUDGET = 2000
+SEARCH_TAIL_BUDGET = 9500
+SEARCH_BODY_SEPARATOR = " · "
+
+
+def _truncate_search_text(text, max_chars=SEARCH_BODY_MAX):
 	text = cstr(text or "").strip()
 	if len(text) <= max_chars:
 		return text
 	return text[:max_chars].rsplit(" ", 1)[0].strip() or text[:max_chars]
+
+
+def _pack_chunks(chunks, budget):
+	"""Pack normalized text chunks into a single string, stopping when the budget
+	is hit. Returns the packed string (with single-space separators between
+	chunks). Long final chunks are clipped on a word boundary if there's room
+	for >200 chars; otherwise dropped to keep things tidy."""
+	if budget <= 0:
+		return ""
+	out = []
+	used = 0
+	for chunk in chunks:
+		chunk = cstr(chunk or "").strip()
+		if not chunk:
+			continue
+		needed = len(chunk) + (1 if out else 0)
+		if used + needed <= budget:
+			out.append(chunk)
+			used += needed
+			continue
+		# Final chunk doesn't fully fit. Clip it if there's >200 chars of room left.
+		remaining = budget - used - (1 if out else 0)
+		if remaining > 200:
+			clipped = chunk[:remaining].rsplit(" ", 1)[0].strip()
+			if clipped:
+				out.append(clipped)
+		break
+	return " ".join(out)
+
+
+def _assemble_search_body(subject, opening_parts, recent_parts):
+	"""Build the searchable body: subject + head (opening complaint, 2KB) +
+	tail (recent thread, 9.5KB newest-first). Caller is responsible for
+	ordering recent_parts newest-first."""
+	subject = cstr(subject or "").strip()
+	head = _pack_chunks(opening_parts, SEARCH_HEAD_BUDGET)
+	tail = _pack_chunks(recent_parts, SEARCH_TAIL_BUDGET)
+	pieces = [p for p in (subject, head, tail) if p]
+	if not pieces:
+		return ""
+	return _truncate_search_text(SEARCH_BODY_SEPARATOR.join(pieces))
 
 
 def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=None):
@@ -1042,25 +1092,27 @@ def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
 		communication_rows=communication_rows,
 	)
 
-	parts = []
 	subject_text = _normalize_search_text(ticket_doc.get("subject")) if ticket_doc else ""
-	if subject_text:
-		parts.append(subject_text)
+
+	# Head: the opening complaint that defines what the ticket is about.
+	# Kept in a small 2KB budget so recent replies always have room in the tail.
+	opening_parts = []
 	if primary_message_text:
-		parts.append(primary_message_text)
-	for row in communication_rows:
-		parts.append(_normalize_search_text(row.subject))
-		parts.append(_normalize_search_text(row.content))
-
-	for row in thread_components.comments:
-		parts.append(_normalize_search_text(row.content))
-
-	# Always include the ticket description so the original customer message is searchable
-	# even after communications are added to the thread.
+		opening_parts.append(primary_message_text)
 	if ticket_doc:
-		parts.append(_normalize_search_text(ticket_doc.get("description")))
+		opening_parts.append(_normalize_search_text(ticket_doc.get("description")))
 
-	combined = _truncate_search_text(" ".join(part for part in parts if part))
+	# Tail: communications + comments newest-first, packed into 9.5KB. Ensures
+	# the latest agent reply is always present in the indexed body even for
+	# long threads.
+	recent_parts = []
+	for row in reversed(communication_rows):
+		recent_parts.append(_normalize_search_text(row.subject))
+		recent_parts.append(_normalize_search_text(row.content))
+	for row in reversed(thread_components.comments):
+		recent_parts.append(_normalize_search_text(row.content))
+
+	combined = _assemble_search_body(subject_text, opening_parts, recent_parts)
 	return primary_message_html, primary_message_text, combined
 
 
@@ -1776,28 +1828,74 @@ def _search_candidate_ticket_names(base_filters, search):
 		return candidate_names
 
 	# Multi-token: each token must match in at least one searchable field
-	# (AND-of-OR). One DB query per token, then intersect.
-	per_token_sets = []
-	for token in tokens:
-		or_filters = [
-			[TICKET_DOCTYPE, field, "like", f"%{token}%"] for field in search_fields
-		]
-		rows = frappe.get_list(
-			TICKET_DOCTYPE,
-			fields=["name"],
-			filters=base_filters,
-			or_filters=or_filters,
-			order_by="modified desc",
-			page_length=MAX_SEARCH_CANDIDATES,
-		)
-		token_set = {row.name for row in rows}
-		if not token_set:
-			# Any required token with zero matches → AND-intersection is empty.
-			return set()
-		per_token_sets.append(token_set)
-
-	candidate_names = set.intersection(*per_token_sets) if per_token_sets else set()
+	# (AND-of-OR). Run as a single SQL so the LIMIT applies after the AND
+	# filter, not per token — otherwise common tokens like "the" or "and"
+	# cap their per-token result at the 400 most-recently-modified rows and
+	# silently drop older tickets that do contain all the tokens.
+	candidate_names = _multi_token_candidates(tokens, search_fields, base_filters)
 	return candidate_names
+
+
+def _multi_token_candidates(tokens, search_fields, base_filters):
+	"""Return ticket names matching ALL tokens across ANY of search_fields,
+	ordered by modified desc and capped at MAX_SEARCH_CANDIDATES — in a single
+	SQL so the LIMIT doesn't truncate older candidates per token."""
+	from pypika.terms import Criterion
+
+	if not tokens:
+		return set()
+
+	QBTicket = frappe.qb.DocType(TICKET_DOCTYPE)
+
+	# Build (field1 LIKE %tok% OR field2 LIKE %tok% OR ...) AND (... next token ...) AND ...
+	and_groups = []
+	for token in tokens:
+		pattern = f"%{token}%"
+		field_conditions = [QBTicket[field].like(pattern) for field in search_fields]
+		if field_conditions:
+			and_groups.append(Criterion.any(field_conditions))
+	if not and_groups:
+		return set()
+
+	query = (
+		frappe.qb.from_(QBTicket)
+		.select(QBTicket.name)
+		.where(Criterion.all(and_groups))
+	)
+
+	# base_filters is the same shape as the list passed to frappe.get_list — fold
+	# them into the qb query as additional WHERE clauses. We only handle the few
+	# operators _build_filters actually emits (=, in, is set/not set).
+	for filt in base_filters or []:
+		if not isinstance(filt, (list, tuple)) or len(filt) < 3:
+			continue
+		# Each filt is [doctype, field, operator, value] or [field, operator, value]
+		if len(filt) == 4:
+			_doctype, field, op, value = filt
+		else:
+			field, op, value = filt
+		col = QBTicket[field]
+		op_norm = cstr(op).strip().lower()
+		if op_norm == "=":
+			query = query.where(col == value)
+		elif op_norm == "in":
+			query = query.where(col.isin(list(value or [])))
+		elif op_norm == "not in":
+			query = query.where(col.notin(list(value or [])))
+		elif op_norm in ("is", "is not"):
+			# "is", "set" / "is", "not set"
+			if cstr(value).strip().lower() in ("set", "not set"):
+				if cstr(value).strip().lower() == "set":
+					query = query.where(col.notnull())
+				else:
+					query = query.where(col.isnull())
+		# Other operators (rare in base_filters) are skipped — base_filters always
+		# already passed into get_list elsewhere so user-permission scoping is preserved
+		# by the column-level filters above.
+
+	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
+	rows = query.run(as_dict=True)
+	return {row["name"] for row in rows}
 
 
 @frappe.whitelist()
@@ -1929,7 +2027,13 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 	if filters.get("created_from"):
 		res.append([TICKET_DOCTYPE, "creation", ">=", filters.created_from])
 	if filters.get("created_to"):
-		res.append([TICKET_DOCTYPE, "creation", "<=", filters.created_to])
+		# Expand a date-only "to" filter to end-of-day so tickets created at
+		# any time on the selected day are included. If the caller passes a
+		# full datetime string we leave it as-is.
+		to_value = cstr(filters.created_to).strip()
+		if len(to_value) == 10:  # bare YYYY-MM-DD from the SPA date input
+			to_value = f"{to_value} 23:59:59"
+		res.append([TICKET_DOCTYPE, "creation", "<=", to_value])
 
 	if _has_field(TICKET_DOCTYPE, "custom_hold_from") and filters.get("hold_from"):
 		res.append([TICKET_DOCTYPE, "custom_hold_from", ">=", filters.hold_from])
@@ -1950,7 +2054,83 @@ def _count(filters=None, or_filters=None):
 	return int((row[0].total_count if row else 0) or 0)
 
 
+def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
+	"""Apply a Unity-style filter list (list of `[doctype, field, op, value]`)
+	to a `frappe.qb` SELECT query. Supports the operators we actually produce
+	in `_build_filters`: `=`, `!=`, `like`, `in`, `not in`, `>=`, `<=`, `>`, `<`."""
+	if not filters_list:
+		return query
+	for entry in filters_list:
+		if not entry or len(entry) < 4:
+			continue
+		_, field, op, value = entry[0], entry[1], entry[2], entry[3]
+		col = doctype_ref[field]
+		op_norm = (op or "=").lower()
+		if op_norm == "=":
+			query = query.where(col == value)
+		elif op_norm == "!=":
+			query = query.where(col != value)
+		elif op_norm == "like":
+			query = query.where(col.like(value))
+		elif op_norm == "not like":
+			query = query.where(col.not_like(value))
+		elif op_norm == "in":
+			query = query.where(col.isin(value if isinstance(value, (list, tuple)) else [value]))
+		elif op_norm == "not in":
+			query = query.where(col.notin(value if isinstance(value, (list, tuple)) else [value]))
+		elif op_norm == ">=":
+			query = query.where(col >= value)
+		elif op_norm == "<=":
+			query = query.where(col <= value)
+		elif op_norm == ">":
+			query = query.where(col > value)
+		elif op_norm == "<":
+			query = query.where(col < value)
+		else:
+			# Unknown op — fall back to equality so we don't silently drop a filter.
+			query = query.where(col == value)
+	return query
+
+
 def _dashboard_cards_for_filters(filters=None):
+	"""Compute dashboard card counts in a single SQL query.
+
+	Was 6 sequential `COUNT(*)` scans on a ~90K-row table; rewritten as one
+	`SELECT COUNT(*), SUM(CASE WHEN ...)` aggregate to keep the list page
+	responsive."""
+	has_on_hold = _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
+	HDT = frappe.qb.DocType(TICKET_DOCTYPE)
+	q = frappe.qb.from_(HDT).select(
+		Count(HDT.name).as_("total"),
+		Sum(Case().when(HDT.status == "Replied", 1).else_(0)).as_("replied"),
+		Sum(Case().when(HDT.status == "Resolved", 1).else_(0)).as_("resolved"),
+		Sum(Case().when(HDT.status == "Closed", 1).else_(0)).as_("closed"),
+		Sum(Case().when(HDT.status.isin(OPEN_STATUSES), 1).else_(0)).as_("pending"),
+	)
+	if has_on_hold:
+		q = q.select(Sum(Case().when(HDT.custom_is_on_hold == 1, 1).else_(0)).as_("on_hold"))
+	q = _apply_ticket_filters_to_query(q, HDT, filters)
+	try:
+		rows = q.run(as_dict=True)
+	except Exception:
+		frappe.log_error("unity dashboard cards aggregate failed; falling back")
+		return _dashboard_cards_for_filters_legacy(filters)
+	row = rows[0] if rows else {}
+	total = int(row.get("total") or 0)
+	return {
+		"total": total,
+		"created": total,
+		"pending": int(row.get("pending") or 0),
+		"on_hold": int(row.get("on_hold") or 0) if has_on_hold else 0,
+		"resolved": int(row.get("resolved") or 0),
+		"closed": int(row.get("closed") or 0),
+		"replied": int(row.get("replied") or 0),
+	}
+
+
+def _dashboard_cards_for_filters_legacy(filters=None):
+	"""Original per-card-count implementation. Kept as a safe fallback if the
+	aggregate query ever fails (e.g. dialect mismatch on a non-MariaDB site)."""
 	total = _count(filters)
 	on_hold = (
 		_count(_merge_filters(filters, [[TICKET_DOCTYPE, "custom_is_on_hold", "=", 1]]))
@@ -2051,6 +2231,68 @@ def _agent_candidates():
 	)
 
 
+SUGGESTION_LIMIT = 8
+SUGGESTION_MIN_QUERY = 2
+SUGGESTION_CANDIDATE_CAP = 60
+
+
+@frappe.whitelist()
+def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
+	"""Lightweight as-you-type suggestions for the SPA search box.
+
+	Reuses the same candidate-resolver as get_tickets (so family-email expansion
+	and permission scoping behave consistently), but caps candidates at 60 rows
+	(vs 400 for get_tickets) and skips ranker + decoration for keystroke speed.
+	"""
+	capabilities = _require_unity_access()
+	query = cstr(search or "").strip()
+	if len(query) < SUGGESTION_MIN_QUERY:
+		return {"data": [], "query": query}
+
+	try:
+		limit = int(limit or SUGGESTION_LIMIT)
+	except (TypeError, ValueError):
+		limit = SUGGESTION_LIMIT
+	limit = max(1, min(limit, SUGGESTION_LIMIT))
+
+	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
+	list_filters = _build_filters(
+		"all",  # search reach mirrors get_tickets — permission is enforced via assigned_agent
+		None,
+		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
+	)
+	candidate_names = _search_candidate_ticket_names(list_filters, query)
+	if not candidate_names:
+		return {"data": [], "query": query, "view": effective_view}
+
+	# Pull a bounded slice with the lightweight fields the dropdown needs.
+	rows = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=["name", "subject", "raised_by", "status", "modified", "custom_is_on_hold"],
+		filters=[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		order_by="modified desc",
+		page_length=SUGGESTION_CANDIDATE_CAP,
+	)
+
+	# Cheap in-Python rank — no full ranker call.
+	q_lower = query.lower()
+	tokens = _search_tokens(query)
+
+	def _score(row):
+		name_lower = cstr(row.get("name")).lower()
+		subject_lower = cstr(row.get("subject")).lower()
+		if name_lower == q_lower:
+			return (3, row.get("modified"))
+		if subject_lower.startswith(q_lower):
+			return (2, row.get("modified"))
+		if tokens and all(t in subject_lower or t in name_lower for t in tokens):
+			return (1, row.get("modified"))
+		return (0, row.get("modified"))
+
+	rows.sort(key=_score, reverse=True)
+	return {"data": rows[:limit], "query": query, "view": effective_view}
+
+
 @frappe.whitelist()
 def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
 	capabilities = _require_unity_access()
@@ -2140,8 +2382,10 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 			limit_start=start,
 			page_length=page_length,
 		)
-		total_count = _count(list_filters)
 		cards = _dashboard_cards_for_filters(list_filters)
+		# `cards["total"]` is the same COUNT(*) the list page wants — re-use it
+		# instead of running another COUNT query.
+		total_count = int(cards.get("total") or 0)
 
 	return {
 		"data": [_decorate_ticket(row) for row in rows],
@@ -2623,6 +2867,90 @@ def update_ticket(
 		_log_hold_reason(name, hold_reason)
 	row = frappe.get_list(TICKET_DOCTYPE, fields=_ticket_fields(), filters={"name": name}, page_length=1)
 	return _decorate_ticket(row[0]) if row else {}
+
+
+ALLOWED_BULK_FIELDS = {"status", "priority", "_assign", "ticket_type", "agent_group"}
+# Fields whose changes don't trigger controller side effects (activity log,
+# search index rebuild, SLA recalculation). We can skip `doc.save()` for these
+# and do a raw column update — orders of magnitude faster at bulk scale.
+BULK_FAST_PATH_FIELDS = {"priority", "ticket_type", "agent_group"}
+BULK_UPDATE_MAX = 500
+
+
+@frappe.whitelist()
+def bulk_update_tickets(names, field, value=None):
+	"""Apply a single-field update to many HD Tickets in one request.
+
+	Matches the ergonomics of Frappe's bulk-edit but tailored for the Unity
+	SPA: synchronous up to `BULK_UPDATE_MAX`, returns structured
+	`{updated, failed}` so the UI can render an exact result count instead of
+	leaving the user with a `msgprint`.
+
+	For fields in `BULK_FAST_PATH_FIELDS` we issue a raw `db.set_value` per
+	ticket — skipping `doc.save()` avoids the per-row search-index rebuild
+	(see `HDTicket.on_update`), which is the dominant cost at 500-row scale."""
+	capabilities = _require_unity_access()
+	field_name = cstr(field or "").strip()
+	if field_name not in ALLOWED_BULK_FIELDS:
+		frappe.throw(_("Field {0} is not allowed for bulk edit").format(field_name or "<empty>"))
+	if isinstance(names, str):
+		names = _parse_json(names, [])
+	if not isinstance(names, list) or not names:
+		frappe.throw(_("Select at least one ticket"))
+	if len(names) > BULK_UPDATE_MAX:
+		frappe.throw(_("Bulk edit supports up to {0} tickets at a time").format(BULK_UPDATE_MAX))
+
+	if field_name == "status":
+		# Allow "On Hold" as a virtual status — mirrors `update_ticket`.
+		if value and value not in STATUS_OPTIONS and value != "On Hold":
+			frappe.throw(_("Invalid ticket status"))
+
+	clean_value = value if value not in ("",) else None
+	updated, failed = [], []
+	for name in names:
+		try:
+			_require_ticket_access(name, capabilities)
+			# `_require_ticket_access` only verifies existence for non-admins;
+			# admins get an early-return. Verify here so the fast-path
+			# `frappe.db.set_value` (which silently no-ops on missing rows)
+			# can't mask a bad ticket name as a success.
+			if not frappe.db.exists(TICKET_DOCTYPE, name):
+				raise frappe.DoesNotExistError(_("Ticket not found"))
+			if field_name == "_assign":
+				if clean_value:
+					assign_ticket_to_agent(name, clean_value)
+				else:
+					clear_all_assignments(TICKET_DOCTYPE, name)
+			elif field_name == "status":
+				ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+				if clean_value == "On Hold":
+					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+						ticket.custom_is_on_hold = 1
+					if ticket.status in FINAL_STATUSES or not ticket.status:
+						ticket.status = "Open"
+				else:
+					ticket.status = clean_value
+					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+						ticket.custom_is_on_hold = 0
+				ticket.save()
+			elif field_name in BULK_FAST_PATH_FIELDS:
+				# Raw column update — bypasses `on_update` which rebuilds the
+				# search index on every save. None of these fields participate
+				# in search/SLA, so it's safe to skip the controller.
+				frappe.db.set_value(TICKET_DOCTYPE, name, field_name, clean_value)
+			else:
+				ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+				ticket.set(field_name, clean_value)
+				ticket.save()
+			updated.append(name)
+		except frappe.PermissionError:
+			failed.append({"name": name, "reason": "permission_denied"})
+		except Exception as exc:
+			frappe.log_error(f"bulk_update_tickets failed for {name}: {exc}", "bulk_update_tickets")
+			failed.append({"name": name, "reason": cstr(exc)[:200] or "error"})
+
+	frappe.db.commit()
+	return {"updated": updated, "failed": failed}
 
 
 @frappe.whitelist()

@@ -62,3 +62,33 @@ def on_comment_after_insert(doc, method=None):
 		"update_ticket_message_search_index (comment)",
 		lambda: update_ticket_message_search_index(ticket_name),
 	)
+
+
+def on_communication_on_update(doc, method=None):
+	"""Refresh the message-body index when an existing email/communication is edited."""
+	if doc.get("reference_doctype") != "HD Ticket":
+		return
+	ticket_name = doc.get("reference_name")
+	if not ticket_name:
+		return
+
+	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+	_safe(
+		"update_ticket_message_search_index (communication on_update)",
+		lambda: update_ticket_message_search_index(ticket_name),
+	)
+
+
+def on_comment_on_update(doc, method=None):
+	"""Refresh the message-body index when an existing comment is edited."""
+	ticket_name = doc.get("reference_ticket")
+	if not ticket_name:
+		return
+
+	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+	_safe(
+		"update_ticket_message_search_index (comment on_update)",
+		lambda: update_ticket_message_search_index(ticket_name),
+	)

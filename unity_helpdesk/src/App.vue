@@ -219,6 +219,7 @@
               v-model="composer.message"
               :min-height="260"
               placeholder="Write the email that should be sent to the customer"
+              @template-subject="applyTemplateSubjectToComposer"
             />
           </label>
           <label>
@@ -287,8 +288,8 @@
           <div>
             <strong>Send Bulk Email</strong>
             <span
-              >Compose one email and BCC many recipients. A single audit
-              ticket is created.</span
+              >Compose one email and BCC many recipients. A single audit ticket
+              is created.</span
             >
           </div>
           <button class="btn secondary" @click="closeBulkEmail">Close</button>
@@ -307,8 +308,16 @@
                 :key="r.email"
                 class="recipient-chip"
               >
-                <span class="recipient-chip-label" :title="r.email">{{ r.label || r.email }}</span>
-                <button type="button" class="recipient-chip-remove" @click.stop="removeRecipient(r.email)">×</button>
+                <span class="recipient-chip-label" :title="r.email">{{
+                  r.label || r.email
+                }}</span>
+                <button
+                  type="button"
+                  class="recipient-chip-remove"
+                  @click.stop="removeRecipient(r.email)"
+                >
+                  ×
+                </button>
               </span>
               <div class="recipient-input-wrap">
                 <input
@@ -338,7 +347,7 @@
                 </div>
               </div>
             </div>
-            <div class="composer-attachment-actions" style="margin-top:6px">
+            <div class="composer-attachment-actions" style="margin-top: 6px">
               <button
                 type="button"
                 class="btn secondary"
@@ -363,7 +372,9 @@
                 Sample CSV
               </a>
               <span class="muted" style="margin-left: auto">
-                {{ bulkEmailRecipientCount }} recipient{{ bulkEmailRecipientCount === 1 ? "" : "s" }}
+                {{ bulkEmailRecipientCount }} recipient{{
+                  bulkEmailRecipientCount === 1 ? "" : "s"
+                }}
               </span>
             </div>
           </label>
@@ -398,6 +409,7 @@
               v-model="bulkEmail.message"
               :min-height="240"
               placeholder="Compose the email message"
+              @template-subject="applyTemplateSubjectToBulkEmail"
             />
           </label>
           <label>
@@ -533,7 +545,7 @@ const bulkEmailWarning = ref("");
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
 const bulkEmail = reactive({
-  recipients: [],   // [{email, name, label}]
+  recipients: [], // [{email, name, label}]
   subject: "",
   message: "",
   cc: "",
@@ -655,6 +667,30 @@ function closeComposer() {
   composer.attachments = [];
 }
 
+function applyTemplateSubjectToComposer(subject) {
+  if (!subject) return;
+  if (
+    composer.subject &&
+    composer.subject.trim() &&
+    !window.confirm("Replace the current subject with the template's subject?")
+  ) {
+    return;
+  }
+  composer.subject = subject;
+}
+
+function applyTemplateSubjectToBulkEmail(subject) {
+  if (!subject) return;
+  if (
+    bulkEmail.subject &&
+    bulkEmail.subject.trim() &&
+    !window.confirm("Replace the current subject with the template's subject?")
+  ) {
+    return;
+  }
+  bulkEmail.subject = subject;
+}
+
 function onEmailInput() {
   clearTimeout(suggestTimeout);
   const query = composer.raised_by;
@@ -755,7 +791,11 @@ function removeRecipient(email) {
 function selectRecipient(r) {
   const email = (r.email || "").toLowerCase().trim();
   if (!email || bulkEmail.recipients.find((x) => x.email === email)) return;
-  bulkEmail.recipients.push({ email, name: r.name || email, label: r.name ? `${r.name}` : email });
+  bulkEmail.recipients.push({
+    email,
+    name: r.name || email,
+    label: r.name ? `${r.name}` : email,
+  });
   recipientSearchQuery.value = "";
   recipientResults.value = [];
   recipientInputRef.value?.focus();
@@ -777,12 +817,20 @@ function onRecipientBackspace() {
 function onRecipientSearch() {
   clearTimeout(_recipientSearchTimer);
   const q = recipientSearchQuery.value.trim();
-  if (q.length < 2) { recipientResults.value = []; return; }
+  if (q.length < 2) {
+    recipientResults.value = [];
+    return;
+  }
   _recipientSearchTimer = window.setTimeout(async () => {
     try {
-      const results = await call("helpdesk.api.unity_helpdesk.search_contacts", { query: q });
+      const results = await call(
+        "helpdesk.api.unity_helpdesk.search_contacts",
+        { query: q }
+      );
       recipientResults.value = results || [];
-    } catch { recipientResults.value = []; }
+    } catch {
+      recipientResults.value = [];
+    }
   }, 280);
 }
 
@@ -815,12 +863,17 @@ async function handleBulkEmailCsv(event) {
     for (let i = startIdx; i < lines.length; i += 1) {
       const cell = (lines[i] || "").split(",")[0].trim();
       if (cell && EMAIL_REGEX.test(cell) && !existing.has(cell.toLowerCase())) {
-        bulkEmail.recipients.push({ email: cell.toLowerCase(), name: cell, label: cell });
+        bulkEmail.recipients.push({
+          email: cell.toLowerCase(),
+          name: cell,
+          label: cell,
+        });
         existing.add(cell.toLowerCase());
       }
     }
     if (!bulkEmail.recipients.length) {
-      bulkEmailError.value = "No valid emails found in CSV. Use a single 'email' column.";
+      bulkEmailError.value =
+        "No valid emails found in CSV. Use a single 'email' column.";
     }
   } finally {
     if (bulkEmailCsvInput.value) bulkEmailCsvInput.value.value = "";
