@@ -68,6 +68,21 @@
 
     <div v-else class="detail-grid">
       <div class="detail-main">
+        <div v-if="ticket.custom_replied_to_ticket" class="reply-origin-banner">
+          <span class="reply-origin-banner__label"
+            >Reply to previous ticket</span
+          >
+          <button
+            type="button"
+            class="link-btn"
+            @click="openDeskTicket(ticket.custom_replied_to_ticket)"
+          >
+            #{{ ticket.custom_replied_to_ticket }}
+          </button>
+          <span v-if="repliedToSummary" class="reply-origin-banner__meta">
+            · {{ repliedToSummary }}
+          </span>
+        </div>
         <div class="email-hero">
           <h2>{{ ticket.subject || "No subject" }}</h2>
           <p>
@@ -132,7 +147,7 @@
                             >{{ student.id }}</a
                           >
                         </small>
-                        <span class="student-context-pill">
+                        <span v-if="student.role" class="student-context-pill">
                           {{ student.role }}
                         </span>
                       </div>
@@ -319,12 +334,17 @@
                     <tr>
                       <th>Ticket No</th>
                       <th>Subject</th>
+                      <th>Ticket Type</th>
                       <th>Created On</th>
                       <th>Status</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr v-for="row in visiblePreviousTickets" :key="row.name">
+                    <tr
+                      v-for="row in visiblePreviousTickets"
+                      :key="row.name"
+                      :class="previousTicketRowClass(row)"
+                    >
                       <td>
                         <button
                           class="link-btn"
@@ -333,8 +353,27 @@
                         >
                           {{ row.name }}
                         </button>
+                        <span
+                          v-if="isOutgoingTicket(row)"
+                          class="ticket-origin-tag ticket-origin-tag--outgoing"
+                          :title="
+                            row.custom_is_bulk_email
+                              ? 'Bulk email we sent'
+                              : 'Ticket sent from portal'
+                          "
+                        >
+                          Sent
+                        </span>
+                        <span
+                          v-else-if="row.custom_replied_to_ticket"
+                          class="ticket-origin-tag ticket-origin-tag--reply"
+                          :title="`Reply to ${row.custom_replied_to_ticket}`"
+                        >
+                          Reply
+                        </span>
                       </td>
                       <td>{{ row.subject || "-" }}</td>
+                      <td>{{ row.ticket_type || "-" }}</td>
                       <td>{{ formatDate(row.creation) }}</td>
                       <td>{{ row.status || "-" }}</td>
                     </tr>
@@ -346,6 +385,18 @@
                 >
                   No previous tickets found in this date range.
                 </p>
+                <button
+                  v-if="filteredPreviousTickets.length > 5"
+                  class="btn secondary"
+                  type="button"
+                  @click="showAllPreviousTickets = !showAllPreviousTickets"
+                >
+                  {{
+                    showAllPreviousTickets
+                      ? "Show less"
+                      : `Show all ${filteredPreviousTickets.length}`
+                  }}
+                </button>
               </div>
               <div
                 v-else-if="previousTicketsHtml"
@@ -719,7 +770,9 @@ const attachmentInput = ref(null);
 const uploadingAttachment = ref(false);
 const additionalOpen = ref(true);
 const studentDetailsOpen = ref(true);
+const showAllPreviousTickets = ref(false);
 const previousTicketRows = ref([]);
+const repliedToSummary = ref("");
 let activeTicketRequestId = 0;
 const parsedDescription = ref({
   students: [],
@@ -769,7 +822,7 @@ const filteredPreviousTickets = computed(() =>
   )
 );
 const visiblePreviousTickets = computed(() =>
-  additionalOpen.value
+  showAllPreviousTickets.value
     ? filteredPreviousTickets.value
     : filteredPreviousTickets.value.slice(0, 5)
 );
@@ -814,20 +867,8 @@ const structuredStudentRows = computed(() => {
     ["Class", (student) => displayClassCell(student)],
     ["PE Document Status", (student) => displayPEDocumentStatus(student)],
     ["Status", (student) => displayValue(student.student_status)],
-    ["Primary Contact", (student) => displayValue(student.primary_contact)],
-    [
-      "Student Mobile",
-      (student) => displayValue(student.student_mobile_number),
-    ],
-    ["WhatsApp Number", (student) => displayValue(student.whatsapp_number)],
-    ["Guardian Emails", (student) => displayList(student.guardian_emails)],
     ["Payment Plan", (student) => displayPaymentPlan(student)],
-    ["Fees", (student) => displayFeesDocument(student)],
     ["Fee Link", (student) => displayFeeLink(student)],
-    [
-      "Next Payment Plan",
-      (student) => nextPaymentSummary(student.fees?.next_payment),
-    ],
   ];
 
   return rows.map(([field, formatter]) => ({
@@ -920,6 +961,7 @@ watch(
     emit("title", "Ticket Detail", `#${props.ticketId}`);
     comments.value = [];
     previousTicketRows.value = [];
+    repliedToSummary.value = "";
     await Promise.all([loadTicket(), loadLookups()]);
   },
   { immediate: true }
@@ -943,7 +985,7 @@ function studentContextBannerClass(context) {
 }
 
 function studentRoleLabel(student) {
-  if (student?.is_primary_match) return "Primary Student";
+  if (student?.is_primary_match) return "";
   if (student?.is_sibling) return "Sibling";
   return "Student";
 }
@@ -979,13 +1021,6 @@ function displayValue(value) {
   return text || "-";
 }
 
-function displayList(values = []) {
-  const items = (values || [])
-    .map((value) => cleanText(String(value || "")))
-    .filter(Boolean);
-  return items.length ? items.join(", ") : "-";
-}
-
 function compactPaymentPlan(value) {
   const text = cleanText(String(value ?? ""));
   if (!text) return "-";
@@ -999,32 +1034,10 @@ function displayPaymentPlan(student) {
   );
 }
 
-function displayFeesDocument(student) {
-  const feeName = cleanText(String(student?.fees?.name || ""));
-  if (!feeName) return "-";
-  const link = cleanText(String(student?.fees?.link || ""));
-  if (!link) return feeName;
-  return `<a href="${link}" target="_top" rel="noopener noreferrer">${feeName}</a>`;
-}
-
 function displayFeeLink(student) {
   const link = cleanText(String(student?.fees?.link || ""));
   if (!link) return "-";
   return `<a href="${link}" target="_top" rel="noopener noreferrer">Open Fees</a>`;
-}
-
-function nextPaymentSummary(nextPayment) {
-  if (!nextPayment) return "-";
-  const parts = [
-    displayValue(nextPayment.payment_term),
-    formatDate(nextPayment.due_date),
-    formatMoney(nextPayment.payment_amount),
-    `Outstanding ${formatMoney(nextPayment.outstanding)}`,
-  ];
-  if (nextPayment.payment_status) {
-    parts.push(displayValue(nextPayment.payment_status));
-  }
-  return parts.join(" · ");
 }
 
 function goBackToList() {
@@ -1066,16 +1079,6 @@ function goToPrevTicket() {
 function goToNextTicket() {
   if (nextTicketId.value)
     router.push({ path: `/tickets/${nextTicketId.value}`, query: route.query });
-}
-
-function formatMoney(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "-";
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 2,
-  }).format(number);
 }
 
 function clearAdditionalFilters() {
@@ -1406,6 +1409,7 @@ async function loadTicket() {
     queueMicrotask(() => {
       if (requestId === activeTicketRequestId) {
         loadPreviousTicketDetails();
+        loadRepliedToSummary();
       }
     });
   } catch (err) {
@@ -1453,6 +1457,31 @@ async function loadPreviousTicketDetails() {
   }
 }
 
+async function loadRepliedToSummary() {
+  const sourceName = ticket.value?.custom_replied_to_ticket;
+  if (!sourceName) {
+    repliedToSummary.value = "";
+    return;
+  }
+  try {
+    const rows = await call(
+      "helpdesk.api.unity_helpdesk.get_accessible_ticket_summaries",
+      { names: [sourceName] }
+    );
+    const source = (rows || [])[0];
+    if (!source) {
+      repliedToSummary.value = "";
+      return;
+    }
+    const parts = [];
+    if (source.subject) parts.push(source.subject);
+    if (source.ticket_type) parts.push(source.ticket_type);
+    repliedToSummary.value = parts.join(" · ");
+  } catch {
+    repliedToSummary.value = "";
+  }
+}
+
 function parsePreviousTicketRows(html) {
   if (!html) return [];
   const container = document.createElement("div");
@@ -1476,6 +1505,16 @@ function parsePreviousTicketRows(html) {
 
 function openDeskTicket(name) {
   openDeskPath(`/app/hd-ticket/${name}`);
+}
+
+function isOutgoingTicket(row) {
+  return !!(row?.custom_is_bulk_email || row?.custom_via_unity_portal);
+}
+
+function previousTicketRowClass(row) {
+  if (isOutgoingTicket(row)) return "previous-ticket-row--outgoing";
+  if (row?.custom_replied_to_ticket) return "previous-ticket-row--reply";
+  return "";
 }
 
 async function saveTicket() {

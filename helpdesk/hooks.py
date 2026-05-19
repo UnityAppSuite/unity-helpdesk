@@ -50,7 +50,10 @@ doc_events = {
 		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_ticket_after_insert",
 	},
 	"Communication": {
-		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_communication_after_insert",
+		"after_insert": [
+			"helpdesk.helpdesk.hooks.search_index.on_communication_after_insert",
+			"helpdesk.helpdesk.hooks.reply_link.on_communication_after_insert",
+		],
 		"on_update": "helpdesk.helpdesk.hooks.search_index.on_communication_on_update",
 	},
 	"HD Ticket Comment": {

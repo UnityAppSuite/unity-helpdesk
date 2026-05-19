@@ -1883,7 +1883,7 @@ const DATETIME_COLUMN_KEYS = new Set([
   "resolution_date",
 ]);
 
-const MAIL_BODY_PREVIEW_CHARS = 140;
+const MAIL_BODY_PREVIEW_CHARS = 210;
 
 function truncateBody(text) {
   const value = String(text || "")
