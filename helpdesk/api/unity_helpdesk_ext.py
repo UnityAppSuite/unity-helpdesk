@@ -451,6 +451,7 @@ def bulk_send_email(
     cc=None,
     bcc=None,
     attachments=None,
+    ticket_type=None,
 ):
     capabilities = _require_unity_access()
     if not capabilities.get("can_view_all_tickets"):
@@ -461,10 +462,15 @@ def bulk_send_email(
 
     subject = cstr(subject or "").strip()
     raw_message = cstr(message or "").strip()
+    ticket_type = cstr(ticket_type or "").strip()
     if not subject:
         frappe.throw(_("Subject is required"))
     if not raw_message:
         frappe.throw(_("Message is required"))
+    if not ticket_type:
+        frappe.throw(_("Ticket Type is required"))
+    if not frappe.db.exists("HD Ticket Type", ticket_type):
+        frappe.throw(_("Invalid Ticket Type: {0}").format(ticket_type))
 
     # Strip script tags, on* handlers, javascript: URLs, etc. before storing or sending.
     from frappe.utils import sanitize_html
@@ -522,6 +528,7 @@ def bulk_send_email(
         "raised_by": frappe.session.user,
         "description": audit_description,
         "status": "Open",
+        "ticket_type": ticket_type,
     }
     if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
         payload["custom_via_unity_portal"] = 1
@@ -597,9 +604,18 @@ def _split_email_list(value):
 
 def _split_email_list_with_counts(value):
     """Split a comma/semicolon-separated list (or list/tuple) of emails into
-    (valid_unique_lowercase, invalid_count). Invalid entries are dropped."""
+    (valid_unique_lowercase, invalid_count). Invalid entries are dropped.
+    Accepts JSON-encoded arrays (the SPA sends cc/bcc as JSON.stringify([...]))
+    so a `'["a@x.com"]'` string isn't mis-parsed as a single CSV cell."""
     if not value:
         return [], 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("["):
+            try:
+                value = frappe.parse_json(stripped)
+            except Exception:
+                pass
     if isinstance(value, (list, tuple)):
         items = value
     else:

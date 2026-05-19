@@ -63,6 +63,9 @@ OPTIONAL_TICKET_FIELDS = [
 	# Set by helpdesk.api.unity_helpdesk_ext.create_ticket; SPA tints these rows green
 	"custom_via_unity_portal",
 	"custom_is_bulk_email",
+	# Set by helpdesk.helpdesk.hooks.reply_link when an inbound reply chain
+	# resolves back to a bulk audit ticket — used by SPA for color + banner.
+	"custom_replied_to_ticket",
 ]
 
 
@@ -2671,17 +2674,27 @@ def get_accessible_ticket_summaries(names):
 	names = _parse_json(names, []) or []
 	if not names:
 		return []
+	summary_fields = [
+		"name",
+		"subject",
+		"creation",
+		"status",
+		"ticket_type",
+		"custom_is_bulk_email",
+		"custom_via_unity_portal",
+		"custom_replied_to_ticket",
+	]
 	if capabilities.can_view_all_tickets:
 		return frappe.get_list(
 			TICKET_DOCTYPE,
-			fields=["name", "subject", "creation", "status"],
+			fields=summary_fields,
 			filters={"name": ["in", names]},
 			page_length=max(len(names), 1),
 		)
 	current_user = _session_user()
 	rows = frappe.get_list(
 		TICKET_DOCTYPE,
-		fields=["name", "subject", "creation", "status", "_assign"],
+		fields=summary_fields + ["_assign"],
 		filters={"name": ["in", names]},
 		page_length=max(len(names), 1),
 	)
@@ -3156,6 +3169,104 @@ def search_contacts(query):
 		_add(c.email_id, c.full_name)
 
 	return results[:15]
+
+
+def _guardian_emails_for_student_ids(student_ids):
+	"""Return {student_name: [guardian_email, ...]} for the given Student ids.
+
+	Mirrors the Student → Student Guardian → Guardian join used by
+	get_student_context_for_ticket (around line 620). Prefers Guardian.email_address
+	over the denormalized Student Guardian.email row. Per-student dedupe + lowercase;
+	guardians with no email are skipped. Cross-student dedupe is the caller's job.
+	"""
+	import re as _re
+
+	ids = sorted({cstr(sid).strip() for sid in (student_ids or []) if cstr(sid).strip()})
+	if not ids:
+		return {}
+
+	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+	rows = frappe.get_all(
+		"Student Guardian",
+		fields=["parent", "guardian", "email"],
+		filters={"parenttype": "Student", "parent": ["in", ids]},
+		page_length=0,
+	)
+	guardian_ids = sorted({cstr(r.guardian).strip() for r in rows if cstr(r.guardian).strip()})
+	guardian_email_by_id = {}
+	if guardian_ids:
+		for g in frappe.get_all(
+			"Guardian",
+			fields=["name", "email_address"],
+			filters={"name": ["in", guardian_ids]},
+			page_length=0,
+		):
+			guardian_email_by_id[g.name] = cstr(g.email_address or "").strip().lower()
+
+	result = {}
+	for row in rows:
+		sid = cstr(row.parent).strip()
+		gid = cstr(row.guardian).strip()
+		email = guardian_email_by_id.get(gid) or cstr(row.email or "").strip().lower()
+		if not email or not _email_re.match(email):
+			continue
+		bucket = result.setdefault(sid, [])
+		if email not in bucket:
+			bucket.append(email)
+	return result
+
+
+@frappe.whitelist()
+def get_student_guardian_emails(student_emails):
+	"""Look up guardian emails for a list of student emails.
+
+	Used by the bulk-email composer to auto-populate BCC with each student's
+	guardian emails when a recipient matches a Student.student_email_id. Unknown
+	emails are omitted from the returned map (no entry, no error)."""
+	_require_unity_access()
+
+	import re as _re
+
+	raw = _parse_json(student_emails, []) or []
+	if isinstance(raw, str):
+		raw = [raw]
+	if not isinstance(raw, (list, tuple)):
+		return {}
+
+	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+	normalized = []
+	seen = set()
+	for value in raw:
+		email = cstr(value or "").strip().lower()
+		if not email or not _email_re.match(email) or email in seen:
+			continue
+		seen.add(email)
+		normalized.append(email)
+	if not normalized:
+		return {}
+
+	students = frappe.get_all(
+		"Student",
+		fields=["name", "student_email_id"],
+		filters={"student_email_id": ["in", normalized]},
+		page_length=0,
+	)
+	if not students:
+		return {}
+
+	email_by_student_id = {
+		s.name: cstr(s.student_email_id or "").strip().lower() for s in students
+	}
+	guardians_by_student_id = _guardian_emails_for_student_ids(list(email_by_student_id.keys()))
+
+	mapping = {}
+	for student_id, student_email in email_by_student_id.items():
+		guardians = guardians_by_student_id.get(student_id) or []
+		if not guardians:
+			continue
+		mapping[student_email] = guardians
+	return mapping
 
 
 @frappe.whitelist()

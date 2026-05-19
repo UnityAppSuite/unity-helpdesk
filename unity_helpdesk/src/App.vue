@@ -63,7 +63,7 @@
           <button
             v-if="canViewAllTickets"
             class="btn secondary"
-            @click="openBulkEmail = true"
+            @click="openBulkEmailModal"
           >
             Bulk Email
           </button>
@@ -302,44 +302,107 @@
 
           <label>
             Recipients
-            <div class="recipient-multiselect" @click="focusRecipientInput">
+            <div class="recipient-multiselect recipient-multiselect--locked">
+              <span class="recipient-chip recipient-chip--locked">
+                <span class="recipient-chip-label">{{ FEEDBACK_EMAIL }}</span>
+              </span>
+            </div>
+          </label>
+
+          <label>
+            Subject
+            <input
+              v-model="bulkEmail.subject"
+              type="text"
+              placeholder="Email subject"
+            />
+          </label>
+          <label>
+            Ticket Type <span class="required-asterisk">*</span>
+            <select v-model="bulkEmail.ticket_type" required>
+              <option value="" disabled>Select ticket type…</option>
+              <option
+                v-for="ticketType in ticketTypes"
+                :key="ticketType.name"
+                :value="ticketType.name"
+              >
+                {{ ticketType.name }}
+              </option>
+            </select>
+          </label>
+          <label>
+            CC (optional)
+            <div class="recipient-multiselect" @click="focusCcInput">
               <span
-                v-for="r in bulkEmail.recipients"
-                :key="r.email"
+                v-for="c in bulkEmail.cc"
+                :key="c.email"
                 class="recipient-chip"
               >
-                <span class="recipient-chip-label" :title="r.email">{{
-                  r.label || r.email
+                <span class="recipient-chip-label" :title="c.email">{{
+                  c.email
                 }}</span>
                 <button
                   type="button"
                   class="recipient-chip-remove"
-                  @click.stop="removeRecipient(r.email)"
+                  @click.stop="removeCc(c.email)"
                 >
                   ×
                 </button>
               </span>
               <div class="recipient-input-wrap">
                 <input
-                  ref="recipientInputRef"
-                  v-model="recipientSearchQuery"
+                  ref="ccInputRef"
+                  v-model="ccInputQuery"
                   type="text"
                   class="recipient-input"
-                  placeholder="Type name or email…"
+                  placeholder="cc1@example.com"
                   autocomplete="off"
-                  @input="onRecipientSearch"
-                  @keydown.enter.prevent="addRecipientFromInput"
-                  @keydown.backspace="onRecipientBackspace"
-                  @keydown.escape="recipientResults = []"
-                  @focus="onRecipientSearch"
+                  @keydown.enter.prevent="addCcFromInput"
+                  @keydown="onCcKeydown"
                 />
-                <div v-if="recipientResults.length" class="recipient-dropdown">
+              </div>
+            </div>
+          </label>
+          <label>
+            BCC (students)
+            <div class="recipient-multiselect" @click="focusBccInput">
+              <span
+                v-for="b in bulkEmail.bcc"
+                :key="b.email"
+                class="recipient-chip"
+              >
+                <span class="recipient-chip-label" :title="b.email">{{
+                  b.label || b.email
+                }}</span>
+                <button
+                  type="button"
+                  class="recipient-chip-remove"
+                  @click.stop="removeBcc(b.email)"
+                >
+                  ×
+                </button>
+              </span>
+              <div class="recipient-input-wrap">
+                <input
+                  ref="bccInputRef"
+                  v-model="bccSearchQuery"
+                  type="text"
+                  class="recipient-input"
+                  placeholder="Type student name or email…"
+                  autocomplete="off"
+                  @input="onBccSearch"
+                  @keydown.enter.prevent="addBccFromInput"
+                  @keydown.backspace="onBccBackspace"
+                  @keydown.escape="bccResults = []"
+                  @focus="onBccSearch"
+                />
+                <div v-if="bccResults.length" class="recipient-dropdown">
                   <button
-                    v-for="r in recipientResults"
+                    v-for="r in bccResults"
                     :key="r.email"
                     type="button"
                     class="recipient-dropdown-item"
-                    @mousedown.prevent="selectRecipient(r)"
+                    @mousedown.prevent="selectBcc(r)"
                   >
                     <span class="rd-name">{{ r.name }}</span>
                     <span class="rd-email">{{ r.email }}</span>
@@ -372,36 +435,30 @@
                 Sample CSV
               </a>
               <span class="muted" style="margin-left: auto">
-                {{ bulkEmailRecipientCount }} recipient{{
-                  bulkEmailRecipientCount === 1 ? "" : "s"
+                {{ bulkEmail.bcc.length }} student{{
+                  bulkEmail.bcc.length === 1 ? "" : "s"
                 }}
               </span>
             </div>
           </label>
-
-          <label>
-            Subject
+          <label class="bulk-email-guardian-toggle">
             <input
-              v-model="bulkEmail.subject"
-              type="text"
-              placeholder="Email subject"
+              v-model="includeGuardians"
+              type="checkbox"
+              @change="onIncludeGuardiansChange"
             />
+            Include guardian emails
+            <span v-if="guardiansLoading" class="muted" style="margin-left: 6px"
+              >fetching guardians…</span
+            >
           </label>
           <label>
-            CC (optional)
-            <input
-              v-model="bulkEmail.cc"
-              type="text"
-              placeholder="cc1@example.com, cc2@example.com"
-            />
-          </label>
-          <label>
-            BCC (optional)
-            <input
-              v-model="bulkEmail.bcc"
-              type="text"
-              placeholder="bcc1@example.com"
-            />
+            Guardian Emails
+            <textarea
+              v-model="guardianEmails"
+              rows="3"
+              placeholder="Check the box above to auto-fill guardian emails for the students added in BCC"
+            ></textarea>
           </label>
           <label>
             Message
@@ -462,14 +519,14 @@
           <button class="btn secondary" @click="closeBulkEmail">Cancel</button>
           <button
             class="btn"
-            :disabled="bulkEmailSending || !bulkEmailRecipientCount"
+            :disabled="bulkEmailSending || !bulkEmailBccTotal"
             @click="sendBulkEmail"
           >
             {{
               bulkEmailSending
                 ? "Sending..."
-                : `Send to ${bulkEmailRecipientCount} recipient${
-                    bulkEmailRecipientCount === 1 ? "" : "s"
+                : `Send to ${bulkEmailBccTotal} recipient${
+                    bulkEmailBccTotal === 1 ? "" : "s"
                   }`
             }}
           </button>
@@ -544,18 +601,27 @@ const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
+const FEEDBACK_EMAIL = "feedback@walnutedu.in";
 const bulkEmail = reactive({
-  recipients: [], // [{email, name, label}]
+  recipients: [
+    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
+  ],
   subject: "",
+  ticket_type: "",
   message: "",
-  cc: "",
-  bcc: "",
+  cc: [],
+  bcc: [], // [{email, name?, label?}] — students
   attachments: [],
 });
-const recipientInputRef = ref(null);
-const recipientSearchQuery = ref("");
-const recipientResults = ref([]);
-let _recipientSearchTimer = null;
+const includeGuardians = ref(false);
+const guardianEmails = ref("");
+const guardiansLoading = ref(false);
+const ccInputRef = ref(null);
+const ccInputQuery = ref("");
+const bccInputRef = ref(null);
+const bccSearchQuery = ref("");
+const bccResults = ref([]);
+let _bccSearchTimer = null;
 
 provide("unitySession", session);
 provide("refreshUnitySession", loadSession);
@@ -778,76 +844,175 @@ function parseBulkRecipients(raw) {
     .filter((value) => EMAIL_REGEX.test(value));
 }
 
-const bulkEmailRecipientCount = computed(() => bulkEmail.recipients.length);
+const parsedGuardianEmails = computed(() =>
+  parseBulkRecipients(guardianEmails.value)
+);
+const bulkEmailBccTotal = computed(() => {
+  const seen = new Set();
+  for (const b of bulkEmail.bcc) {
+    if (b.email) seen.add(b.email.toLowerCase());
+  }
+  for (const g of parsedGuardianEmails.value) seen.add(g);
+  return seen.size;
+});
 
-function focusRecipientInput() {
-  recipientInputRef.value?.focus();
+function focusCcInput() {
+  ccInputRef.value?.focus();
 }
 
-function removeRecipient(email) {
-  bulkEmail.recipients = bulkEmail.recipients.filter((r) => r.email !== email);
+function addCcFromInput() {
+  const val = ccInputQuery.value.trim().toLowerCase();
+  if (!EMAIL_REGEX.test(val)) return;
+  if (bulkEmail.cc.find((c) => c.email === val)) {
+    ccInputQuery.value = "";
+    return;
+  }
+  bulkEmail.cc.push({ email: val });
+  ccInputQuery.value = "";
 }
 
-function selectRecipient(r) {
+function removeCc(email) {
+  bulkEmail.cc = bulkEmail.cc.filter((c) => c.email !== email);
+}
+
+function onCcKeydown(e) {
+  if (e.key === ",") {
+    e.preventDefault();
+    addCcFromInput();
+  } else if (
+    e.key === "Backspace" &&
+    !ccInputQuery.value &&
+    bulkEmail.cc.length
+  ) {
+    bulkEmail.cc.pop();
+  }
+}
+
+function focusBccInput() {
+  bccInputRef.value?.focus();
+}
+
+function selectBcc(r) {
   const email = (r.email || "").toLowerCase().trim();
-  if (!email || bulkEmail.recipients.find((x) => x.email === email)) return;
-  bulkEmail.recipients.push({
+  if (!email || bulkEmail.bcc.find((x) => x.email === email)) return;
+  bulkEmail.bcc.push({
     email,
     name: r.name || email,
     label: r.name ? `${r.name}` : email,
   });
-  recipientSearchQuery.value = "";
-  recipientResults.value = [];
-  recipientInputRef.value?.focus();
+  bccSearchQuery.value = "";
+  bccResults.value = [];
+  bccInputRef.value?.focus();
+  if (includeGuardians.value) refreshGuardianEmails();
 }
 
-function addRecipientFromInput() {
-  const val = recipientSearchQuery.value.trim();
+function addBccFromInput() {
+  const val = bccSearchQuery.value.trim();
   if (EMAIL_REGEX.test(val)) {
-    selectRecipient({ email: val, name: val });
+    selectBcc({ email: val, name: val });
   }
 }
 
-function onRecipientBackspace() {
-  if (!recipientSearchQuery.value && bulkEmail.recipients.length) {
-    bulkEmail.recipients.pop();
+function removeBcc(email) {
+  bulkEmail.bcc = bulkEmail.bcc.filter((b) => b.email !== email);
+  if (includeGuardians.value) refreshGuardianEmails();
+}
+
+function onBccBackspace() {
+  if (!bccSearchQuery.value && bulkEmail.bcc.length) {
+    bulkEmail.bcc.pop();
+    if (includeGuardians.value) refreshGuardianEmails();
   }
 }
 
-function onRecipientSearch() {
-  clearTimeout(_recipientSearchTimer);
-  const q = recipientSearchQuery.value.trim();
+function onBccSearch() {
+  clearTimeout(_bccSearchTimer);
+  const q = bccSearchQuery.value.trim();
   if (q.length < 2) {
-    recipientResults.value = [];
+    bccResults.value = [];
     return;
   }
-  _recipientSearchTimer = window.setTimeout(async () => {
+  _bccSearchTimer = window.setTimeout(async () => {
     try {
       const results = await call(
         "helpdesk.api.unity_helpdesk.search_contacts",
         { query: q }
       );
-      recipientResults.value = results || [];
+      bccResults.value = results || [];
     } catch {
-      recipientResults.value = [];
+      bccResults.value = [];
     }
   }, 280);
 }
 
-function closeBulkEmail() {
-  openBulkEmail.value = false;
+async function onIncludeGuardiansChange() {
+  if (includeGuardians.value) {
+    await refreshGuardianEmails();
+  } else {
+    guardianEmails.value = "";
+  }
+}
+
+async function refreshGuardianEmails() {
+  const studentEmails = bulkEmail.bcc
+    .map((b) => (b.email || "").toLowerCase().trim())
+    .filter((e) => e && EMAIL_REGEX.test(e));
+  if (!studentEmails.length) {
+    guardianEmails.value = "";
+    return;
+  }
+  guardiansLoading.value = true;
+  try {
+    const result = await call(
+      "helpdesk.api.unity_helpdesk.get_student_guardian_emails",
+      { student_emails: JSON.stringify(studentEmails) }
+    );
+    const seen = new Set();
+    for (const studentEmail of studentEmails) {
+      const guardians = (result || {})[studentEmail] || [];
+      for (const g of guardians) {
+        const email = (g || "").toLowerCase().trim();
+        if (email && EMAIL_REGEX.test(email)) seen.add(email);
+      }
+    }
+    guardianEmails.value = [...seen].join(", ");
+  } catch {
+    // Silent — keep current textarea content if lookup fails.
+  } finally {
+    guardiansLoading.value = false;
+  }
+}
+
+function openBulkEmailModal() {
+  resetBulkEmail();
+  openBulkEmail.value = true;
+}
+
+function resetBulkEmail() {
   bulkEmailSending.value = false;
   bulkEmailUploading.value = false;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  bulkEmail.recipients = [];
-  recipientSearchQuery.value = "";
-  recipientResults.value = [];
+  bulkEmail.recipients = [
+    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
+  ];
   bulkEmail.subject = "";
+  bulkEmail.ticket_type = "";
   bulkEmail.message = "";
-  bulkEmail.cc = "";
-  bulkEmail.bcc = "";
+  bulkEmail.cc = [];
+  bulkEmail.bcc = [];
   bulkEmail.attachments = [];
+  ccInputQuery.value = "";
+  bccSearchQuery.value = "";
+  bccResults.value = [];
+  includeGuardians.value = false;
+  guardianEmails.value = "";
+  guardiansLoading.value = false;
+}
+
+function closeBulkEmail() {
+  openBulkEmail.value = false;
+  resetBulkEmail();
 }
 
 async function handleBulkEmailCsv(event) {
@@ -859,21 +1024,22 @@ async function handleBulkEmailCsv(event) {
     const lines = text.split(/\r?\n/);
     let startIdx = 0;
     if (lines.length && /\bemail\b/i.test(lines[0])) startIdx = 1;
-    const existing = new Set(bulkEmail.recipients.map((r) => r.email));
+    const existing = new Set(bulkEmail.bcc.map((b) => b.email));
+    let added = 0;
     for (let i = startIdx; i < lines.length; i += 1) {
       const cell = (lines[i] || "").split(",")[0].trim();
       if (cell && EMAIL_REGEX.test(cell) && !existing.has(cell.toLowerCase())) {
-        bulkEmail.recipients.push({
-          email: cell.toLowerCase(),
-          name: cell,
-          label: cell,
-        });
-        existing.add(cell.toLowerCase());
+        const lower = cell.toLowerCase();
+        bulkEmail.bcc.push({ email: lower, name: cell, label: cell });
+        existing.add(lower);
+        added += 1;
       }
     }
-    if (!bulkEmail.recipients.length) {
+    if (!added && !bulkEmail.bcc.length) {
       bulkEmailError.value =
         "No valid emails found in CSV. Use a single 'email' column.";
+    } else if (added && includeGuardians.value) {
+      refreshGuardianEmails();
     }
   } finally {
     if (bulkEmailCsvInput.value) bulkEmailCsvInput.value.value = "";
@@ -910,12 +1076,24 @@ async function sendBulkEmail() {
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
   const recipients = bulkEmail.recipients.map((r) => r.email);
-  if (!recipients.length) {
-    bulkEmailError.value = "Enter at least one valid recipient email.";
+  const bccSeen = new Set();
+  for (const b of bulkEmail.bcc) {
+    const email = (b.email || "").toLowerCase().trim();
+    if (email && EMAIL_REGEX.test(email)) bccSeen.add(email);
+  }
+  for (const g of parsedGuardianEmails.value) bccSeen.add(g);
+  const bccEmails = [...bccSeen];
+  if (!bccEmails.length) {
+    bulkEmailError.value =
+      "Add at least one student in BCC (and optionally include guardians).";
     return;
   }
   if (!bulkEmail.subject.trim()) {
     bulkEmailError.value = "Subject is required.";
+    return;
+  }
+  if (!bulkEmail.ticket_type) {
+    bulkEmailError.value = "Ticket Type is required.";
     return;
   }
   if (!bulkEmail.message.trim()) {
@@ -924,14 +1102,16 @@ async function sendBulkEmail() {
   }
   bulkEmailSending.value = true;
   try {
+    const ccEmails = bulkEmail.cc.map((c) => c.email);
     const result = await call(
       "helpdesk.api.unity_helpdesk_ext.bulk_send_email",
       {
         subject: bulkEmail.subject,
         message: bulkEmail.message,
+        ticket_type: bulkEmail.ticket_type,
         recipients: JSON.stringify(recipients),
-        cc: bulkEmail.cc || null,
-        bcc: bulkEmail.bcc || null,
+        cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
+        bcc: bccEmails.length ? JSON.stringify(bccEmails) : null,
         attachments: JSON.stringify(
           bulkEmail.attachments.map((attachment) => attachment.name)
         ),
