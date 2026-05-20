@@ -541,11 +541,13 @@ import { computed, onMounted, provide, reactive, ref, watch } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 import {
+  AuthRedirectError,
   call,
   initials,
   getAgents,
   getTicketTypes,
   getUnityProfile,
+  redirectToLogin,
   searchUsers,
   uploadAttachment,
 } from "./api";
@@ -625,6 +627,10 @@ let _bccSearchTimer = null;
 
 provide("unitySession", session);
 provide("refreshUnitySession", loadSession);
+// Lookups loaded at app level so child views (TicketsView, TicketDetailView)
+// can reuse them via inject instead of re-fetching on every navigation.
+provide("unityAgents", agents);
+provide("unityTicketTypes", ticketTypes);
 
 const capabilities = computed(() => session.capabilities || {});
 const canViewMyTickets = computed(
@@ -686,6 +692,17 @@ async function loadSession() {
       : [];
     enforceRouteAccess();
   } catch (err) {
+    if (err instanceof AuthRedirectError) {
+      // api.js already kicked off the redirect; nothing else to do.
+      return;
+    }
+    // If the error didn't carry the standard auth markers but the profile
+    // came back empty (no email, no roles), the session is effectively gone.
+    // Fall back to a login redirect so we don't render the SPA shell as Guest.
+    if (!session.email && !session.roles?.length) {
+      redirectToLogin();
+      return;
+    }
     composerError.value = err.message;
   }
 }

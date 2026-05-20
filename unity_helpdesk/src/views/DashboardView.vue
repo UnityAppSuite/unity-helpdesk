@@ -208,7 +208,13 @@
 
 <script setup>
 import { computed, inject, onMounted, ref } from "vue";
-import { call, callWithRetry, formatDate, getAgents } from "../api";
+import {
+  AuthRedirectError,
+  call,
+  callWithRetry,
+  formatDate,
+  getAgents,
+} from "../api";
 
 const emit = defineEmits(["title"]);
 const unitySession = inject("unitySession", { capabilities: {} });
@@ -375,6 +381,10 @@ async function load() {
       customTo.value = summary.value.to_date || customTo.value;
     }
   } catch (err) {
+    if (err instanceof AuthRedirectError || err.code === "AUTH_REDIRECT") {
+      error.value = "Session expired — redirecting to login…";
+      return;
+    }
     if (err.code === "NETWORK_ERROR" || (err.status && err.status >= 500)) {
       reloadPrompt.value = true;
     } else {

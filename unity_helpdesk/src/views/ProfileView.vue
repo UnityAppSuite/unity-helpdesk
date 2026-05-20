@@ -94,15 +94,74 @@
                 <tr>
                   <th>Name</th>
                   <th>Priority</th>
+                  <th>
+                    Keywords
+                    <small class="muted" style="font-weight: normal">
+                      — incoming tickets auto-assign to the type whose keyword
+                      matches their subject/body.
+                    </small>
+                  </th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="ticketType in ticketTypes" :key="ticketType.name">
                   <td>{{ ticketType.name }}</td>
                   <td>{{ ticketType.priority || "-" }}</td>
+                  <td>
+                    <template v-if="editingTicketType.name === ticketType.name">
+                      <input
+                        v-model="editingTicketType.keywordsInput"
+                        type="text"
+                        placeholder="comma, separated, keywords"
+                        style="min-width: 240px"
+                      />
+                    </template>
+                    <template v-else>
+                      <span
+                        v-if="ticketType.keywords && ticketType.keywords.length"
+                      >
+                        <span
+                          v-for="kw in ticketType.keywords"
+                          :key="kw"
+                          class="badge grey"
+                          style="margin-right: 4px"
+                        >
+                          {{ kw }}
+                        </span>
+                      </span>
+                      <span v-else class="muted">—</span>
+                    </template>
+                  </td>
+                  <td class="actions-cell">
+                    <template v-if="editingTicketType.name === ticketType.name">
+                      <button
+                        class="btn small"
+                        :disabled="savingTicketType"
+                        @click="saveTicketTypeEdit"
+                      >
+                        {{ savingTicketType ? "Saving..." : "Save" }}
+                      </button>
+                      <button
+                        class="btn small secondary"
+                        :disabled="savingTicketType"
+                        @click="cancelTicketTypeEdit"
+                      >
+                        Cancel
+                      </button>
+                    </template>
+                    <template v-else>
+                      <button
+                        class="btn small secondary"
+                        @click="startTicketTypeEdit(ticketType)"
+                      >
+                        Edit keywords
+                      </button>
+                    </template>
+                  </td>
                 </tr>
                 <tr v-if="!ticketTypes.length">
-                  <td colspan="2" class="empty">No ticket types found.</td>
+                  <td colspan="4" class="empty">No ticket types found.</td>
                 </tr>
               </tbody>
             </table>
@@ -486,8 +545,10 @@ import {
   getTicketTypes,
   listReplyTemplateCategoriesAdmin,
   listReplyTemplatesAdmin,
+  listTicketTypesWithKeywords,
   updateReplyTemplate,
   updateReplyTemplateCategory,
+  updateTicketTypeKeywords,
   updateUnitySettings,
 } from "../api";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
@@ -579,7 +640,9 @@ const creatingAgent = ref(false);
 const ticketTypes = ref([]);
 const ticketTypeError = ref("");
 const creatingTicketType = ref(false);
+const savingTicketType = ref(false);
 const newTicketType = reactive({ name: "", description: "", priority: "" });
+const editingTicketType = reactive({ name: "", keywordsInput: "" });
 
 // --- Reply template state ---
 const categories = ref([]);
@@ -705,9 +768,46 @@ async function loadCandidates() {
 
 async function loadTicketTypes() {
   try {
-    ticketTypes.value = await getTicketTypes();
+    if (canManageUnitySettings.value) {
+      // Admin view — also fetches keywords so the row can be edited inline.
+      ticketTypes.value = await listTicketTypesWithKeywords();
+    } else {
+      ticketTypes.value = await getTicketTypes();
+    }
   } catch {
     ticketTypes.value = [];
+  }
+}
+
+function startTicketTypeEdit(type) {
+  editingTicketType.name = type.name;
+  editingTicketType.keywordsInput = Array.isArray(type.keywords)
+    ? type.keywords.join(", ")
+    : "";
+  ticketTypeError.value = "";
+}
+
+function cancelTicketTypeEdit() {
+  editingTicketType.name = "";
+  editingTicketType.keywordsInput = "";
+}
+
+async function saveTicketTypeEdit() {
+  if (!editingTicketType.name) return;
+  savingTicketType.value = true;
+  ticketTypeError.value = "";
+  try {
+    const keywords = editingTicketType.keywordsInput
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean);
+    await updateTicketTypeKeywords(editingTicketType.name, keywords);
+    cancelTicketTypeEdit();
+    await loadTicketTypes();
+  } catch (err) {
+    ticketTypeError.value = err.message;
+  } finally {
+    savingTicketType.value = false;
   }
 }
 
