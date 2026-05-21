@@ -75,7 +75,7 @@
           <button
             type="button"
             class="link-btn"
-            @click="openDeskTicket(ticket.custom_replied_to_ticket)"
+            @click="openSpaTicket(ticket.custom_replied_to_ticket)"
           >
             #{{ ticket.custom_replied_to_ticket }}
           </button>
@@ -349,7 +349,7 @@
                         <button
                           class="link-btn"
                           type="button"
-                          @click="openDeskTicket(row.name)"
+                          @click="openSpaTicket(row.name)"
                         >
                           {{ row.name }}
                         </button>
@@ -733,6 +733,7 @@ import { computed, inject, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 import {
+  AuthRedirectError,
   call,
   callWithRetry,
   formatDate,
@@ -1414,7 +1415,12 @@ async function loadTicket() {
     });
   } catch (err) {
     if (requestId === activeTicketRequestId) {
-      if (err.code === "NETWORK_ERROR" || (err.status && err.status >= 500)) {
+      if (err instanceof AuthRedirectError || err.code === "AUTH_REDIRECT") {
+        error.value = "Session expired — redirecting to login…";
+      } else if (
+        err.code === "NETWORK_ERROR" ||
+        (err.status && err.status >= 500)
+      ) {
         reloadPrompt.value = true;
       } else {
         error.value = err.message;
@@ -1434,27 +1440,63 @@ async function loadPreviousTicketDetails() {
   );
   const names = fallbackRows.map((row) => row.name).filter(Boolean);
   previousTicketRows.value = fallbackRows;
-  if (!names.length) return;
 
-  try {
-    const rows = await call(
-      "helpdesk.api.unity_helpdesk.get_accessible_ticket_summaries",
-      {
+  const raisedBy = ticket.value?.raised_by || "";
+
+  // Run the two server calls in parallel: existing ticket history (from the
+  // names we parsed out of the description HTML) + bulk-email audit tickets
+  // where the current user was a recipient.
+  const summariesPromise = names.length
+    ? call("helpdesk.api.unity_helpdesk.get_accessible_ticket_summaries", {
         names,
-      }
-    );
-    const byName = Object.fromEntries(
-      (rows || []).map((row) => [String(row.name), row])
-    );
-    previousTicketRows.value = fallbackRows
-      .filter((row) => byName[String(row.name)])
-      .map((row) => ({
-        ...row,
-        ...(byName[String(row.name)] || {}),
-      }));
-  } catch {
-    previousTicketRows.value = fallbackRows;
+      }).catch(() => null)
+    : Promise.resolve([]);
+  const bulkPromise = raisedBy
+    ? call("helpdesk.api.unity_helpdesk.get_bulk_emails_received_by", {
+        email: raisedBy,
+      }).catch(() => [])
+    : Promise.resolve([]);
+
+  const [summaries, bulkRows] = await Promise.all([
+    summariesPromise,
+    bulkPromise,
+  ]);
+
+  if (summaries === null) {
+    // Summaries call failed — keep the HTML-parsed fallback rows but still
+    // try to merge bulk-email matches.
+    const dedup = new Map();
+    fallbackRows.forEach((r) => dedup.set(String(r.name), r));
+    (bulkRows || []).forEach((r) => {
+      if (String(r.name) === String(ticket.value?.name)) return;
+      dedup.set(String(r.name), r);
+    });
+    previousTicketRows.value = Array.from(dedup.values());
+    return;
   }
+
+  const byName = Object.fromEntries(
+    (summaries || []).map((row) => [String(row.name), row])
+  );
+  const merged = fallbackRows
+    .filter((row) => byName[String(row.name)])
+    .map((row) => ({ ...row, ...(byName[String(row.name)] || {}) }));
+
+  // Append bulk-email audit tickets we haven't already seen, skipping the
+  // current ticket itself if it happens to be one.
+  const seen = new Set(merged.map((r) => String(r.name)));
+  (bulkRows || []).forEach((r) => {
+    const key = String(r.name);
+    if (seen.has(key)) return;
+    if (key === String(ticket.value?.name)) return;
+    merged.push({ ...r, custom_is_bulk_email: 1 });
+    seen.add(key);
+  });
+
+  // Order newest-first so the most recent bulk email lands near the top.
+  merged.sort((a, b) => new Date(b.creation || 0) - new Date(a.creation || 0));
+
+  previousTicketRows.value = merged;
 }
 
 async function loadRepliedToSummary() {
@@ -1505,6 +1547,14 @@ function parsePreviousTicketRows(html) {
 
 function openDeskTicket(name) {
   openDeskPath(`/app/hd-ticket/${name}`);
+}
+
+// Navigate to another ticket inside the SPA — used by the Previous Tickets
+// table and the "replied to" banner. Preserves the list-view query param so
+// Back / Next still walks the list the user came from.
+function openSpaTicket(name) {
+  if (!name) return;
+  router.push({ path: `/tickets/${name}`, query: route.query });
 }
 
 function isOutgoingTicket(row) {

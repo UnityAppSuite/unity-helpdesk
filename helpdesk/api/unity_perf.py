@@ -98,3 +98,98 @@ def run_filter_benchmark():
 
 	row_count = frappe.db.count("HD Ticket")
 	return {"timings": timings, "explains": explains, "row_count": row_count}
+
+
+_BACKFILL_JOBS = (
+	# (job_id, label, completion_field, scope_filters)
+	# scope_filters narrows the "total" count — bulk-email-recipients only
+	# applies to audit tickets, so reporting % across all 92K rows would be
+	# misleading.
+	(
+		"unity_message_search_rebuild",
+		"message-search-rebuild",
+		"custom_search_message_body",
+		[],
+	),
+	(
+		"unity_student_search_backfill",
+		"student-search-backfill",
+		"custom_search_student_names",
+		[],
+	),
+	(
+		"unity_bulk_email_recipients_backfill",
+		"bulk-email-recipients-backfill",
+		"custom_bulk_email_recipients",
+		[["custom_is_bulk_email", "=", 1]],
+	),
+)
+
+
+def _rq_job_state(job_id):
+	"""Best-effort lookup of a single RQ job's state by job_id. Returns None if
+	the job isn't in the registry (worker may have finished and evicted it)."""
+	try:
+		from rq.job import Job
+
+		from frappe.utils.background_jobs import get_redis_conn
+
+		conn = get_redis_conn()
+		# Frappe namespaces jobs by site, so iterate keys and find the matching id.
+		for key in conn.scan_iter(match=f"rq:job:*{job_id}*"):
+			try:
+				job = Job.fetch(key.decode().split(":")[-1], connection=conn)
+				return {
+					"id": job.id,
+					"status": job.get_status(refresh=True),
+					"enqueued_at": str(job.enqueued_at) if job.enqueued_at else None,
+					"started_at": str(job.started_at) if job.started_at else None,
+					"ended_at": str(job.ended_at) if job.ended_at else None,
+				}
+			except Exception:
+				continue
+	except Exception:
+		return None
+	return None
+
+
+@frappe.whitelist()
+def print_backfill_status():
+	"""Report on the two long-queue background jobs that the Unity patches
+	enqueue. Useful immediately after a deploy to verify migrate didn't
+	silently fail to schedule them.
+
+	Run with:
+	  bench --site <site> execute helpdesk.api.unity_perf.print_backfill_status
+	"""
+	_require_admin()
+	total = frappe.db.count("HD Ticket")
+	report = {"total_tickets": total, "jobs": []}
+	for job_id, label, completion_field, scope_filters in _BACKFILL_JOBS:
+		# "is/not set" matches both NULL and empty-string — plain ["in", ["", None]]
+		# misses NULL rows because column IN (NULL) never matches in SQL, and
+		# newly-added custom columns default to NULL on existing rows.
+		pending_filters = list(scope_filters) + [[completion_field, "is", "not set"]]
+		scope_total = (
+			frappe.db.count("HD Ticket", filters=scope_filters) if scope_filters else total
+		)
+		if scope_total == 0:
+			pct = 100.0
+			pending = 0
+		else:
+			pending = frappe.db.count("HD Ticket", filters=pending_filters)
+			pct = round(100.0 * (scope_total - pending) / scope_total, 2)
+		report["jobs"].append(
+			{
+				"label": label,
+				"job_id": job_id,
+				"completion_field": completion_field,
+				"scope_total": scope_total,
+				"populated_pct": pct,
+				"pending_rows": pending,
+				"rq_job": _rq_job_state(job_id),
+			}
+		)
+	# Surface the report via the logger too so it shows up in bench logs.
+	frappe.logger().info(f"[unity-perf] backfill status: {report}")
+	return report

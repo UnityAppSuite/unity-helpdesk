@@ -534,6 +534,13 @@ def bulk_send_email(
         payload["custom_via_unity_portal"] = 1
     if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
         payload["custom_is_bulk_email"] = 1
+    # Denormalised list of every recipient (TO + CC + BCC). Drives the
+    # "Previous Tickets" history lookup for each recipient — a LIKE on this
+    # field is cheaper than scanning the audit_description HTML on every
+    # ticket open.
+    if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
+        all_recipients = sorted(set(valid_emails) | set(cc_list) | set(bcc_list))
+        payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
     doc = frappe.get_doc(payload).insert(ignore_permissions=True)
 
     attachment_list = _parse_json(attachments, []) or []

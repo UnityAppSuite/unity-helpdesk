@@ -795,6 +795,7 @@ import {
 } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
+  AuthRedirectError,
   bulkUpdateTickets,
   call,
   callWithRetry,
@@ -811,6 +812,10 @@ const route = useRoute();
 const router = useRouter();
 const unitySession = inject("unitySession", null);
 const refreshUnitySession = inject("refreshUnitySession", null);
+// Agents + ticket types are loaded once at the app level — reuse those refs
+// instead of issuing duplicate get_agents / get_ticket_types calls per view.
+const injectedAgents = inject("unityAgents", null);
+const injectedTicketTypes = inject("unityTicketTypes", null);
 
 const draftSearch = ref("");
 const appliedSearch = ref("");
@@ -824,14 +829,38 @@ const agents = ref([]);
 const ticketTypes = ref([]);
 const rowSaving = reactive({});
 const editState = reactive({});
+const PAGE_SIZE_OPTIONS = [20, 50, 100, 500];
+const PAGE_SIZE_STORAGE_KEY = "unity_helpdesk_page_size";
+
+function _initialPageSize() {
+  try {
+    const raw = window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
+    const n = Number(raw);
+    if (PAGE_SIZE_OPTIONS.includes(n)) return n;
+  } catch {
+    // localStorage unavailable (private mode, etc) — fall through to default.
+  }
+  return 20;
+}
+
 const result = reactive({
   data: [],
   total_count: 0,
   cards: {},
   start: 0,
-  page_length: 100,
+  page_length: _initialPageSize(),
 });
-const PAGE_SIZE_OPTIONS = [100, 500, 1000, 2500, 5000];
+
+watch(
+  () => result.page_length,
+  (size) => {
+    try {
+      window.localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(size));
+    } catch {
+      // Quota / private mode — non-fatal.
+    }
+  }
+);
 // Bulk-edit selection + dialog state.
 const selectedIds = ref(new Set());
 const bulkModalOpen = ref(false);
@@ -1480,7 +1509,36 @@ function syncEditState(rows) {
   });
 }
 
+// Keep local lookups in sync with App.vue's once they finish loading — saves
+// the duplicate get_agents / get_ticket_types round-trips on every navigation.
+if (injectedAgents) {
+  watch(
+    injectedAgents,
+    (val) => {
+      if (Array.isArray(val) && val.length) agents.value = val;
+    },
+    { immediate: true }
+  );
+}
+if (injectedTicketTypes) {
+  watch(
+    injectedTicketTypes,
+    (val) => {
+      if (Array.isArray(val) && val.length) ticketTypes.value = val;
+    },
+    { immediate: true }
+  );
+}
+
 async function loadLookups() {
+  // If the parent already provided lookups, we're already in sync via the
+  // watchers above — no need to round-trip the network again.
+  if (
+    (injectedAgents?.value?.length || 0) > 0 ||
+    (injectedTicketTypes?.value?.length || 0) > 0
+  ) {
+    return;
+  }
   const [agentResult, typeResult] = await Promise.allSettled([
     getAgents(),
     getTicketTypes(),
@@ -1724,18 +1782,75 @@ function resetResults() {
   result.start = 0;
 }
 
+// Stale-while-revalidate cache for the ticket list so a return visit paints
+// instantly with the last seen rows, then quietly refreshes. Scoped to
+// sessionStorage so we don't carry data across browser sessions.
+const LIST_CACHE_TTL_MS = 60 * 1000;
+function _listCacheKey() {
+  const sig = {
+    view: props.view,
+    filters: cleanFilters(),
+    search: appliedSearch.value,
+    page_length: result.page_length,
+  };
+  return "unity_helpdesk_tickets_cache:" + JSON.stringify(sig);
+}
+function _readListCache() {
+  try {
+    const raw = window.sessionStorage.getItem(_listCacheKey());
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    if (Date.now() - (parsed.ts || 0) > LIST_CACHE_TTL_MS) return null;
+    return parsed.data || null;
+  } catch {
+    return null;
+  }
+}
+function _writeListCache(data) {
+  try {
+    window.sessionStorage.setItem(
+      _listCacheKey(),
+      JSON.stringify({ ts: Date.now(), data })
+    );
+  } catch {
+    // Quota exceeded / disabled — silently ignore.
+  }
+}
+
 async function load({ append = false } = {}) {
   const requestId = activeRequestId + 1;
   activeRequestId = requestId;
   activeController?.abort();
   activeController = new AbortController();
+
+  // Stale-while-revalidate: if we have a fresh cache entry for this exact
+  // filter set, paint it immediately and treat the API call as a background
+  // refresh (no "Searching…" spinner). Cache only applies to first-page,
+  // non-append loads.
+  let usedCache = false;
+  if (!append) {
+    const cached = _readListCache();
+    if (cached && Array.isArray(cached.data)) {
+      result.data = cached.data;
+      result.total_count = cached.total_count || 0;
+      result.cards = cached.cards || {};
+      result.start = cached.start || 0;
+      syncEditState(cached.data);
+      usedCache = true;
+    }
+  }
+
   if (append) {
     loadingMore.value = true;
-  } else {
+  } else if (!usedCache) {
     loading.value = true;
+  } else {
+    // Cache hit — keep the list visible, just show the unobtrusive reload
+    // indicator while the background refresh runs.
+    reloading.value = true;
   }
   error.value = "";
-  reloading.value = false;
   reloadPrompt.value = false;
   emptyMessage.value = "No tickets found.";
   try {
@@ -1770,6 +1885,12 @@ async function load({ append = false } = {}) {
       result.cards = data.cards || {};
       result.start = data.start || 0;
       // Do not overwrite result.page_length — user selection is source of truth.
+      _writeListCache({
+        data: result.data,
+        total_count: result.total_count,
+        cards: result.cards,
+        start: result.start,
+      });
     }
     syncEditState(data.data || []);
   } catch (err) {
@@ -1781,6 +1902,12 @@ async function load({ append = false } = {}) {
       emptyMessage.value = appliedSearch.value.trim()
         ? `Search timed out. Try a more specific query — e.g. a ticket ID or exact name.`
         : "Loading timed out. Please refresh and try again.";
+      return;
+    }
+    // Session expired — api.js already kicked off the login redirect.
+    // Show a friendly placeholder for the millisecond before navigation.
+    if (err instanceof AuthRedirectError || err.code === "AUTH_REDIRECT") {
+      error.value = "Session expired — redirecting to login…";
       return;
     }
     // Network/5xx exhausted retries → unobtrusive reload prompt.

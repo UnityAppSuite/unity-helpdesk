@@ -192,3 +192,93 @@ class TestHDTicketAutoAssign(FrappeTestCase):
 			self.assertEqual(ticket.ticket_type, "Library")
 		finally:
 			frappe.delete_doc("HD Ticket", ticket.name, force=True, ignore_permissions=True)
+
+
+class TestKeywordSettingsAPI(FrappeTestCase):
+	"""Settings-tab API: list_ticket_types_with_keywords + update_ticket_type_keywords."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		_ensure_type("Fees", "fees,payment")
+		_ensure_type("Library", "book")
+		frappe.db.commit()
+
+	@classmethod
+	def tearDownClass(cls):
+		_delete_type_if_exists("Fees")
+		_delete_type_if_exists("Library")
+		frappe.db.commit()
+		super().tearDownClass()
+
+	def setUp(self):
+		frappe.cache().delete_value(_KEYWORD_CACHE_KEY)
+		frappe.set_user("Administrator")
+
+	def test_list_returns_keywords_split_and_normalised(self):
+		from helpdesk.api.unity_helpdesk import list_ticket_types_with_keywords
+
+		rows = list_ticket_types_with_keywords()
+		fees = next(r for r in rows if r["name"] == "Fees")
+		self.assertEqual(fees["keywords"], ["fees", "payment"])
+
+	def test_update_persists_and_invalidates_cache(self):
+		from helpdesk.api.unity_helpdesk import update_ticket_type_keywords
+
+		_get_ticket_type_keyword_map()  # populate cache
+		update_ticket_type_keywords("Fees", ["fees", "Refund", "INVOICE"])
+		# Stored normalised — lowercase, deduped, trimmed
+		stored = frappe.db.get_value("HD Ticket Type", "Fees", "keywords")
+		self.assertEqual(stored, "fees, refund, invoice")
+		# Cache cleared — fresh read picks up the new keywords
+		fresh = _get_ticket_type_keyword_map()
+		fees_kws = next(kws for name, kws in fresh if name == "Fees")
+		self.assertIn("invoice", fees_kws)
+		self.assertIn("refund", fees_kws)
+		# Restore for downstream tests
+		update_ticket_type_keywords("Fees", ["fees", "payment"])
+
+	def test_update_accepts_comma_string(self):
+		from helpdesk.api.unity_helpdesk import update_ticket_type_keywords
+
+		update_ticket_type_keywords("Library", " Book , novel ,  ")
+		stored = frappe.db.get_value("HD Ticket Type", "Library", "keywords")
+		self.assertEqual(stored, "book, novel")
+		update_ticket_type_keywords("Library", ["book"])
+
+	def test_update_rejects_overlong_keyword(self):
+		from helpdesk.api.unity_helpdesk import update_ticket_type_keywords
+
+		too_long = "x" * 80
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			update_ticket_type_keywords("Fees", [too_long])
+
+	def test_update_rejects_unknown_type(self):
+		from helpdesk.api.unity_helpdesk import update_ticket_type_keywords
+
+		with self.assertRaises(frappe.exceptions.DoesNotExistError):
+			update_ticket_type_keywords("NotARealType_xyz", ["a"])
+
+	def test_non_admin_cannot_call(self):
+		from helpdesk.api.unity_helpdesk import update_ticket_type_keywords
+
+		# Create a low-privilege test user without helpdesk roles
+		test_email = "kw-test-noadmin@example.com"
+		if not frappe.db.exists("User", test_email):
+			frappe.get_doc(
+				{
+					"doctype": "User",
+					"email": test_email,
+					"first_name": "KwTest",
+					"send_welcome_email": 0,
+				}
+			).insert(ignore_permissions=True)
+		frappe.db.commit()
+		try:
+			frappe.set_user(test_email)
+			with self.assertRaises(frappe.exceptions.PermissionError):
+				update_ticket_type_keywords("Fees", ["x"])
+		finally:
+			frappe.set_user("Administrator")
+			frappe.delete_doc("User", test_email, force=True, ignore_permissions=True)
+			frappe.db.commit()

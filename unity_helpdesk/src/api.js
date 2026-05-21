@@ -7,6 +7,51 @@ export function sanitize(html) {
   });
 }
 
+// Thrown by call() after kicking off a login redirect, so callers can skip
+// rendering error UI for the millisecond before window.location takes effect.
+export class AuthRedirectError extends Error {
+  constructor() {
+    super("Session expired, redirecting to login.");
+    this.name = "AuthRedirectError";
+    this.code = "AUTH_REDIRECT";
+  }
+}
+
+let _redirectInFlight = false;
+
+export function redirectToLogin() {
+  if (_redirectInFlight) return;
+  if (typeof window === "undefined") return;
+  const path = window.location.pathname || "/";
+  if (path.startsWith("/login")) return;
+  _redirectInFlight = true;
+  const target = window.location.pathname + (window.location.search || "");
+  window.location.href = "/login?redirect-to=" + encodeURIComponent(target);
+}
+
+// Match Frappe's many shapes of "you are not authenticated / authorised".
+// Trigger only on signals strong enough to mean a guest / expired session —
+// not on every PermissionError (which can also mean "role missing for THIS doc").
+const AUTH_MESSAGE_RE =
+  /not permitted|not whitelisted|login to access|guest cannot access|authentication failed|session expired|please login|please log in/i;
+
+function _isAuthSignal(payload, status) {
+  if (status === 401) return true;
+  if (!payload) return false;
+  const excType = payload.exc_type || "";
+  if (excType === "AuthenticationError" || excType === "SessionExpired") {
+    return true;
+  }
+  const msg = extractError(payload) || "";
+  if (msg && AUTH_MESSAGE_RE.test(msg)) return true;
+  // payload.exc is a JSON-encoded list of tracebacks; check its head for the
+  // same auth markers (server stuffs the exception string in there too).
+  if (typeof payload.exc === "string" && AUTH_MESSAGE_RE.test(payload.exc)) {
+    return true;
+  }
+  return false;
+}
+
 async function _refreshCsrfToken() {
   try {
     const r = await fetch(
@@ -74,6 +119,10 @@ export async function call(method, params = {}, options = {}) {
           });
           const retryPayload = await retry.json().catch(() => ({}));
           if (!retry.ok || retryPayload.exc || retryPayload._server_messages) {
+            if (_isAuthSignal(retryPayload, retry.status)) {
+              redirectToLogin();
+              throw new AuthRedirectError();
+            }
             const message =
               extractError(retryPayload) || `Request failed: ${method}`;
             const err = new Error(message);
@@ -83,9 +132,13 @@ export async function call(method, params = {}, options = {}) {
           }
           return retryPayload.message;
         }
-        // Refresh failed — reload so the page gets a fresh token from server
-        window.location.reload();
-        return;
+        // CSRF refresh failed — assume session is gone, go to login
+        redirectToLogin();
+        throw new AuthRedirectError();
+      }
+      if (_isAuthSignal(payload, response.status)) {
+        redirectToLogin();
+        throw new AuthRedirectError();
       }
       const message = extractError(payload) || `Request failed: ${method}`;
       const err = new Error(message);
@@ -181,6 +234,10 @@ export async function uploadAttachment(file, doctype, docname) {
   });
   const payload = await response.json().catch(() => ({}));
   if (!response.ok || payload.exc || payload._server_messages) {
+    if (_isAuthSignal(payload, response.status)) {
+      redirectToLogin();
+      throw new AuthRedirectError();
+    }
     const message = extractError(payload) || "Attachment upload failed";
     throw new Error(message);
   }
@@ -281,6 +338,21 @@ export async function createAgent(user) {
 
 export async function createTicketType(params) {
   return call("helpdesk.api.unity_helpdesk.create_ticket_type", params);
+}
+
+export async function listTicketTypesWithKeywords() {
+  return (
+    (await call(
+      "helpdesk.api.unity_helpdesk.list_ticket_types_with_keywords"
+    )) || []
+  );
+}
+
+export async function updateTicketTypeKeywords(name, keywords) {
+  return call("helpdesk.api.unity_helpdesk.update_ticket_type_keywords", {
+    name,
+    keywords,
+  });
 }
 
 export async function updateUnitySettings(params) {

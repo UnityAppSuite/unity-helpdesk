@@ -7,17 +7,43 @@ for its custom field definitions.
 
 Safe to re-run: create_custom_fields with update=True never drops columns or existing data.
 
-Also backfills custom_search_student_names/refs/guardian_emails for tickets that are
-missing them (skips tickets that are already populated).
+Backfill of custom_search_student_names/refs/guardian_emails is deferred to a
+long-queue background job so `bench migrate` doesn't block on the sweep.
+Re-run manually with:
+  bench --site <site> execute helpdesk.patches.unity_helpdesk_student_search_fields.run_student_search_backfill
 """
+import time
+
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+# Index on raised_by accelerates both the backfill UPDATE and the runtime
+# guardian-family search path (full-table scan -> ~1ms). Cheap idempotent add.
+_RAISED_BY_INDEX = "raised_by_unity_idx"
+
 
 def execute():
-	_create_fields()
-	frappe.clear_cache(doctype="HD Ticket")
-	_backfill_student_search_fields()
+	start = time.monotonic()
+	try:
+		_create_fields()
+		_ensure_raised_by_index()
+		frappe.clear_cache(doctype="HD Ticket")
+		# Enqueue the heavy sweep. migrate stays sub-second; the worker drains
+		# in the background. New tickets get populated inline by create_ticket
+		# regardless of whether the worker has caught up yet.
+		frappe.enqueue(
+			"helpdesk.patches.unity_helpdesk_student_search_fields.run_student_search_backfill",
+			queue="long",
+			timeout=21600,
+			is_async=True,
+			job_id="unity_student_search_backfill",
+			deduplicate=True,
+			enqueue_after_commit=True,
+		)
+	finally:
+		frappe.logger().info(
+			f"[unity-patch] unity_helpdesk_student_search_fields took {time.monotonic() - start:.2f}s"
+		)
 
 
 def _create_fields():
@@ -114,7 +140,47 @@ def _create_fields():
 	)
 
 
-def _backfill_student_search_fields():
+def _ensure_raised_by_index():
+	# add_index is a no-op if the index already exists. Safe to call on every migrate.
+	try:
+		frappe.db.add_index("HD Ticket", ["raised_by"], index_name=_RAISED_BY_INDEX)
+	except Exception:
+		# Some MariaDB versions raise on duplicate index even though the docs say it's a no-op.
+		# Log and continue — the index either exists already or will be added next migrate.
+		frappe.log_error(
+			title="unity_helpdesk_student_search_fields: raised_by index",
+			message=frappe.get_traceback(),
+		)
+
+
+def _backfill_is_complete():
+	"""Short-circuit when there's nothing left to backfill. Cheap COUNT only.
+
+	Use the Frappe "is / not set" operator so the count catches both NULL
+	(field newly added) and empty-string (explicit "" sentinel) rows. A plain
+	`["in", ["", None]]` filter misses NULLs because `column IN (NULL)` never
+	matches in SQL.
+	"""
+	total = frappe.db.count("HD Ticket")
+	if total == 0:
+		return True
+	pending = frappe.db.count(
+		"HD Ticket",
+		filters=[["custom_search_student_names", "is", "not set"]],
+	)
+	return pending == 0
+
+
+def run_student_search_backfill():
+	"""Background job: populate custom_search_student_* fields for tickets that
+	don't have them yet. Idempotent — re-running on a fully-populated DB is a
+	single COUNT(*) and then a return."""
+	if _backfill_is_complete():
+		frappe.logger().info(
+			"[unity-patch] student-search-backfill: already complete, skipping"
+		)
+		return
+
 	try:
 		from helpdesk.api.unity_helpdesk import populate_ticket_student_search_fields
 	except ImportError:
@@ -125,7 +191,7 @@ def _backfill_student_search_fields():
 
 	tickets = frappe.get_all(
 		"HD Ticket",
-		filters=[["HD Ticket", "custom_search_student_names", "in", ["", None]]],
+		filters=[["HD Ticket", "custom_search_student_names", "is", "not set"]],
 		fields=["name", "raised_by"],
 		page_length=0,
 	)

@@ -334,6 +334,68 @@ def _decorate_ticket(row):
 	return row
 
 
+def _decorate_ticket_rows(rows):
+	# Page-wide bulk fetch: collapses N+1 User lookups (and the ToDo fallback
+	# for empty _assign) into one SELECT each. Used by the list endpoint —
+	# single-row callers stay on _decorate_ticket().
+	if not rows:
+		return []
+
+	users_needed = set()
+	name_to_users = {}
+	todo_lookup_names = []
+	for row in rows:
+		row_dict = frappe._dict(row)
+		assignees = frappe.parse_json(_assignment_value(row_dict) or "[]")
+		if assignees:
+			name_to_users[row_dict.get("name")] = assignees
+			users_needed.update(a for a in assignees if a)
+		else:
+			todo_lookup_names.append(row_dict.get("name"))
+
+	# One ToDo lookup for the empty-_assign fallback (matches _assignee_from_assign).
+	if todo_lookup_names:
+		todos = frappe.get_all(
+			"ToDo",
+			filters={
+				"reference_type": TICKET_DOCTYPE,
+				"reference_name": ["in", todo_lookup_names],
+				"status": "Open",
+			},
+			fields=["reference_name", "owner"],
+			order_by="creation asc",
+		)
+		for t in todos:
+			if not t.owner:
+				continue
+			name_to_users.setdefault(t.reference_name, []).append(t.owner)
+			users_needed.add(t.owner)
+
+	# One User lookup for everyone we'll display.
+	user_map = {}
+	if users_needed:
+		user_rows = frappe.get_all(
+			"User",
+			filters={"name": ["in", list(users_needed)]},
+			fields=["name", "full_name", "user_image", "email"],
+		)
+		user_map = {u.name: u for u in user_rows}
+
+	decorated = []
+	for row in rows:
+		row_dict = frappe._dict(row)
+		users = name_to_users.get(row_dict.get("name")) or []
+		first = users[0] if users else None
+		if first:
+			row_dict.assignee = user_map.get(first) or {"name": first, "full_name": first}
+		else:
+			row_dict.assignee = None
+		row_dict.status_indicator = _status_indicator(row_dict)
+		row_dict.priority_target = PRIORITY_TARGETS.get(row_dict.get("priority"), "")
+		decorated.append(row_dict)
+	return decorated
+
+
 def _normalize_search_text(value):
 	text = html.unescape(cstr(value or ""))
 	text = re.sub(r"<[^>]+>", " ", text)
@@ -2391,7 +2453,7 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 		total_count = int(cards.get("total") or 0)
 
 	return {
-		"data": [_decorate_ticket(row) for row in rows],
+		"data": _decorate_ticket_rows(rows),
 		"total_count": total_count,
 		"cards": cards,
 		"row_count": len(rows),
@@ -2641,6 +2703,80 @@ def create_ticket_type(name, description=None, priority=None):
 	return doc.as_dict()
 
 
+# Keep in sync with hd_ticket._KEYWORD_CACHE_KEY — the matcher reads the cached
+# list and we have to invalidate it when admins edit keywords from the SPA.
+_TICKET_TYPE_KEYWORD_CACHE_KEY = "hd_ticket_type_keywords"
+_MAX_KEYWORDS_PER_TYPE = 50
+_MAX_KEYWORD_LEN = 60
+
+
+def _parse_keyword_input(keywords):
+	# Accept either a list[str] or a comma-separated string. Normalise to a
+	# lowercase, deduped, trimmed list capped at _MAX_KEYWORDS_PER_TYPE.
+	if isinstance(keywords, str):
+		raw = keywords.split(",")
+	elif isinstance(keywords, (list, tuple)):
+		raw = list(keywords)
+	elif keywords is None:
+		raw = []
+	else:
+		raw = _parse_json(keywords, []) or []
+
+	seen = set()
+	cleaned = []
+	for entry in raw:
+		token = cstr(entry or "").strip().lower()
+		if not token or token in seen:
+			continue
+		if len(token) > _MAX_KEYWORD_LEN:
+			frappe.throw(
+				_("Keyword '{0}' exceeds {1} characters").format(token[:20] + "…", _MAX_KEYWORD_LEN)
+			)
+		seen.add(token)
+		cleaned.append(token)
+		if len(cleaned) >= _MAX_KEYWORDS_PER_TYPE:
+			break
+	return cleaned
+
+
+@frappe.whitelist()
+def list_ticket_types_with_keywords():
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	rows = frappe.get_all(
+		"HD Ticket Type",
+		fields=["name", "description", "priority", "keywords"],
+		order_by="name asc",
+	)
+	for row in rows:
+		row["keywords"] = [
+			k.strip().lower()
+			for k in cstr(row.get("keywords") or "").split(",")
+			if k.strip()
+		]
+	return rows
+
+
+@frappe.whitelist()
+def update_ticket_type_keywords(name, keywords=None):
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("Ticket type name is required"))
+	if not frappe.db.exists("HD Ticket Type", name):
+		frappe.throw(_("Ticket type {0} not found").format(name), frappe.DoesNotExistError)
+	cleaned = _parse_keyword_input(keywords)
+	joined = ", ".join(cleaned)
+	# set_value bypasses HDTicketType.on_update — invalidate the matcher cache
+	# directly so the next ticket pickup sees the new mapping.
+	frappe.db.set_value("HD Ticket Type", name, "keywords", joined)
+	frappe.cache().delete_value(_TICKET_TYPE_KEYWORD_CACHE_KEY)
+	return {"name": name, "keywords": cleaned}
+
+
 @frappe.whitelist()
 def get_agent_candidates():
 	capabilities = _require_unity_access()
@@ -2703,6 +2839,38 @@ def get_accessible_ticket_summaries(names):
 		for row in rows
 		if current_user in frappe.parse_json(row.get("_assign") or "[]")
 	]
+
+
+@frappe.whitelist()
+def get_bulk_emails_received_by(email):
+	"""Return bulk-email audit tickets whose recipient list includes `email`.
+	Used by the ticket detail view to surface "we sent this person a bulk email"
+	rows alongside their own previous tickets."""
+	_require_unity_access()
+	email = cstr(email or "").strip().lower()
+	if not email or not _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
+		return []
+	# LIKE %email% is a full table scan on the Long Text. For the volumes this
+	# handles (a parent's history surface — never more than a handful of bulk
+	# emails per recipient) the cost is acceptable. If it grows hot we can move
+	# to a join table.
+	rows = frappe.get_all(
+		TICKET_DOCTYPE,
+		filters=[
+			["custom_is_bulk_email", "=", 1],
+			["custom_bulk_email_recipients", "like", f"%{email}%"],
+		],
+		fields=[
+			"name",
+			"subject",
+			"creation",
+			"status",
+			"ticket_type",
+		],
+		order_by="creation desc",
+		page_length=50,
+	)
+	return rows
 
 
 @frappe.whitelist()
