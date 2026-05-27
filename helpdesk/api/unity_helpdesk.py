@@ -2427,9 +2427,16 @@ def _agent_map():
 
 
 def _ticket_type_options():
+	# Always-on lookup used by every SPA user via get_ticket_types(). Include
+	# `custom_color` when the field exists so TicketDetailView can render the
+	# Previous-Tickets type dot without a second round-trip. _has_field is
+	# memoised, so the existence check is cheap.
+	fields = ["name"]
+	if _has_field("HD Ticket Type", "custom_color"):
+		fields.append("custom_color")
 	return frappe.get_all(
 		"HD Ticket Type",
-		fields=["name"],
+		fields=fields,
 		order_by="name asc",
 		page_length=0,
 	)
@@ -3038,9 +3045,12 @@ def list_ticket_types_with_keywords():
 	capabilities = _require_unity_access()
 	if not capabilities.can_manage_unity_settings:
 		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	fields = ["name", "description", "priority", "keywords"]
+	if _has_field("HD Ticket Type", "custom_color"):
+		fields.append("custom_color")
 	rows = frappe.get_all(
 		"HD Ticket Type",
-		fields=["name", "description", "priority", "keywords"],
+		fields=fields,
 		order_by="name asc",
 	)
 	for row in rows:
@@ -3050,6 +3060,34 @@ def list_ticket_types_with_keywords():
 			if k.strip()
 		]
 	return rows
+
+
+@frappe.whitelist()
+def update_ticket_type_color(name, color=None):
+	"""Set the SPA-displayed colour on an HD Ticket Type. Accepts any value
+	that the Frappe Color field accepts (e.g. '#3b82f6'); pass empty string
+	to clear. Admins only — same gate as update_ticket_type_keywords.
+	"""
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("Ticket type name is required"))
+	if not frappe.db.exists("HD Ticket Type", name):
+		frappe.throw(_("Ticket type {0} not found").format(name), frappe.DoesNotExistError)
+	if not _has_field("HD Ticket Type", "custom_color"):
+		frappe.throw(
+			_("Color field is not yet available on this site — run `bench migrate` first.")
+		)
+	# Empty string clears the colour back to default.
+	color_value = cstr(color or "").strip()
+	# Basic shape check; the Frappe Color field stores hex strings.
+	# Don't be strict — admins may paste a 3-char or 8-char hex.
+	if color_value and not (color_value.startswith("#") and 4 <= len(color_value) <= 9):
+		frappe.throw(_("Color must be a hex string like #3b82f6 (got {0})").format(color_value))
+	frappe.db.set_value("HD Ticket Type", name, "custom_color", color_value or None)
+	return {"name": name, "custom_color": color_value or None}
 
 
 @frappe.whitelist()
@@ -3713,8 +3751,26 @@ def get_student_guardian_emails(student_emails):
 	"""Look up guardian emails for a list of student emails.
 
 	Used by the bulk-email composer to auto-populate BCC with each student's
-	guardian emails when a recipient matches a Student.student_email_id. Unknown
-	emails are omitted from the returned map (no entry, no error)."""
+	guardian emails when a recipient matches a Student.student_email_id.
+
+	Response shape (changed from a bare {email: [guardians]} dict):
+
+	    {
+	      "mapping": {student_email: [guardian_email, ...], ...},
+	      "diagnostic": {
+	        "input_count":            <int>,
+	        "students_matched":       <int>,  # rows where student_email_id matched
+	        "students_with_guardians": <int>, # students that yielded guardian emails
+	        "unmatched_emails":       [...],  # input emails with no Student record
+	      },
+	    }
+
+	The diagnostic block lets the SPA surface a non-blocking warning when
+	the auto-fill silently produces nothing (e.g. wrong student_email_id
+	on the env, missing Student Guardian rows). Previously the empty
+	result was indistinguishable from "no guardians on file" and
+	swallowed silently in App.vue:996.
+	"""
 	_require_unity_access()
 
 	import re as _re
@@ -3723,7 +3779,12 @@ def get_student_guardian_emails(student_emails):
 	if isinstance(raw, str):
 		raw = [raw]
 	if not isinstance(raw, (list, tuple)):
-		return {}
+		return {"mapping": {}, "diagnostic": {
+			"input_count": 0,
+			"students_matched": 0,
+			"students_with_guardians": 0,
+			"unmatched_emails": [],
+		}}
 
 	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 	normalized = []
@@ -3734,21 +3795,35 @@ def get_student_guardian_emails(student_emails):
 			continue
 		seen.add(email)
 		normalized.append(email)
+
+	def _empty(unmatched=None):
+		return {
+			"mapping": {},
+			"diagnostic": {
+				"input_count": len(normalized),
+				"students_matched": 0,
+				"students_with_guardians": 0,
+				"unmatched_emails": list(unmatched or normalized),
+			},
+		}
+
 	if not normalized:
-		return {}
+		return _empty()
 
 	students = frappe.get_all(
 		"Student",
 		fields=["name", "student_email_id"],
 		filters={"student_email_id": ["in", normalized]},
-		page_length=0,
+		page_length=len(normalized) + 1,
 	)
 	if not students:
-		return {}
+		return _empty()
 
 	email_by_student_id = {
 		s.name: cstr(s.student_email_id or "").strip().lower() for s in students
 	}
+	matched_emails = set(email_by_student_id.values())
+	unmatched_emails = [e for e in normalized if e not in matched_emails]
 	guardians_by_student_id = _guardian_emails_for_student_ids(list(email_by_student_id.keys()))
 
 	mapping = {}
@@ -3757,7 +3832,15 @@ def get_student_guardian_emails(student_emails):
 		if not guardians:
 			continue
 		mapping[student_email] = guardians
-	return mapping
+	return {
+		"mapping": mapping,
+		"diagnostic": {
+			"input_count": len(normalized),
+			"students_matched": len(students),
+			"students_with_guardians": len(mapping),
+			"unmatched_emails": unmatched_emails,
+		},
+	}
 
 
 @frappe.whitelist()

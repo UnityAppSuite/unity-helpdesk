@@ -2093,10 +2093,43 @@ tbody tr.bulk-email-ticket:hover {
 }
 
 .previous-ticket-row--outgoing td {
-  background: #eff6ff;
+  background: #dbeafe;
+}
+.previous-ticket-row--outgoing td:first-child {
+  box-shadow: inset 3px 0 0 #3b82f6;
 }
 .previous-ticket-row--reply td {
-  background: #ecfdf5;
+  background: #dcfce7;
+}
+.previous-ticket-row--reply td:first-child {
+  box-shadow: inset 3px 0 0 #16a34a;
+}
+
+/* Ticket-type pill rendering — circular color dot followed by the type
+   name. Used in the Previous Tickets panel of the ticket detail page and
+   anywhere else we want a compact visual category cue. Color comes from
+   HD Ticket Type.custom_color (admin-configurable via the Settings UI). */
+.ticket-type-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ticket-type-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  flex: 0 0 auto;
+}
+/* Slightly larger swatch in the Settings table where the admin picks it. */
+.ticket-type-color-input {
+  width: 48px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  background: transparent;
 }
 
 .ticket-origin-tag {

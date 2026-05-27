@@ -373,7 +373,18 @@
                         </span>
                       </td>
                       <td>{{ row.subject || "-" }}</td>
-                      <td>{{ row.ticket_type || "-" }}</td>
+                      <td>
+                        <span v-if="row.ticket_type" class="ticket-type-pill">
+                          <span
+                            class="ticket-type-dot"
+                            :style="{
+                              background: ticketTypeColor(row.ticket_type),
+                            }"
+                          ></span>
+                          {{ row.ticket_type }}
+                        </span>
+                        <span v-else>-</span>
+                      </td>
                       <td>{{ formatDate(row.creation) }}</td>
                       <td>{{ row.status || "-" }}</td>
                     </tr>
@@ -1565,6 +1576,15 @@ function previousTicketRowClass(row) {
   if (isOutgoingTicket(row)) return "previous-ticket-row--outgoing";
   if (row?.custom_replied_to_ticket) return "previous-ticket-row--reply";
   return "";
+}
+
+function ticketTypeColor(name) {
+  // Look the colour up in the in-memory ticket-types list (already loaded
+  // by App.vue / loadLookups). Fallback to a muted grey when the type has
+  // no custom_color set or the lookup hasn't populated yet.
+  if (!name) return "#94a3b8";
+  const match = (ticketTypes.value || []).find((t) => t && t.name === name);
+  return (match && match.custom_color) || "#94a3b8";
 }
 
 async function saveTicket() {
