@@ -20,7 +20,11 @@ import time
 
 import frappe
 
-BATCH_SIZE = 200
+BATCH_SIZE = 50
+# Idle gap between batches — same rationale as in
+# unity_ticket_message_search_rebuild: keep the SPA's list-page query
+# responsive while the sweep is running.
+_BATCH_SLEEP_SEC = 0.2
 # Matches plausible email addresses inside HTML / free text. Greedy on the
 # local-part is fine; the row-set is already filtered to audit tickets.
 _EMAIL_RE = re.compile(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", re.IGNORECASE)
@@ -120,3 +124,5 @@ def run_backfill():
 		if len(rows) < BATCH_SIZE:
 			break
 		start += BATCH_SIZE
+		# Yield to foreground requests between batches.
+		time.sleep(_BATCH_SLEEP_SEC)

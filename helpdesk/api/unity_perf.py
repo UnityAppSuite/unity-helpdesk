@@ -3,17 +3,22 @@
 Invocation:
 
     bench --site <site> execute helpdesk.api.unity_perf.run_filter_benchmark
+    bench --site <site> execute helpdesk.api.unity_perf.run_endpoint_benchmark
+
+`run_filter_benchmark` times raw SQL — useful for spotting missing indexes.
+`run_endpoint_benchmark` times the actual whitelisted API methods end-to-end
+so the "what does the user feel" wall-clock matches the SPA's experience.
 
 Each query runs twice; the second (warm) timing is the headline.
 EXPLAIN output for the two highest-traffic queries is included so a missing
 or unused index shows up immediately.
 
-Future work — known full-scan offenders we deliberately don't index here:
-- `_assign LIKE '%user%'` (line in `_build_filters`). Cannot use a regular
-  index because the pattern starts with `%`; needs FULLTEXT or a join-table
-  refactor.
-- `custom_search_message_body` LIKE. Same shape; covered by the search-body
-  patch's denormalized field but still full-scan.
+The historical full-scan offenders mentioned in the original docstring:
+- `_assign LIKE '%user%'` — replaced by the ToDo-based lookup in
+  `_apply_assignee_filter`, which uses the indexed `tabToDo` table instead.
+- `custom_search_message_body` LIKE — still full-scan but only fires
+  when the user actively searches; the empty-search default path no
+  longer touches that column.
 """
 
 import time
@@ -21,7 +26,12 @@ import time
 import frappe
 from frappe import _
 
-from helpdesk.api.unity_helpdesk import _require_unity_access
+from helpdesk.api.unity_helpdesk import (
+	_assigned_ticket_names,
+	_require_unity_access,
+	get_tickets_page,
+	get_tickets_summary,
+)
 
 
 _BENCHMARK_QUERIES = (
@@ -98,6 +108,87 @@ def run_filter_benchmark():
 
 	row_count = frappe.db.count("HD Ticket")
 	return {"timings": timings, "explains": explains, "row_count": row_count}
+
+
+@frappe.whitelist()
+def run_endpoint_benchmark(view="all", page_length=20):
+	"""Time the actual SPA-facing endpoints end-to-end.
+
+	Returns timings (cold + warm) for:
+	- `get_tickets_page` and `get_tickets_summary` separately (the post-split
+	  endpoints the SPA now fires in parallel)
+	- `_assigned_ticket_names(session_user)` so the ToDo-resolved "My Tickets"
+	  filter cost is visible
+	- The legacy combined `get_tickets` wrapper, to confirm the back-compat
+	  path didn't regress
+
+	Useful before/after the helpdesk-optimizations branch deploys — confirms
+	the SPA's wall-clock matches expectations and that the ToDo lookup is
+	indeed sub-millisecond.
+	"""
+	_require_admin()
+	from helpdesk.api.unity_helpdesk import get_tickets
+
+	try:
+		page_length_int = int(page_length or 20)
+	except (TypeError, ValueError):
+		page_length_int = 20
+
+	# Two-call timing pattern — call() returns warm; call() again returns
+	# cache-hit if any internal memoization fires. We deliberately reset the
+	# per-request cache between cold/warm so we measure the underlying work
+	# cost, not the request-scoped memoization (which doesn't survive across
+	# real HTTP requests anyway).
+	def _time_call(label, fn, *args, **kwargs):
+		# Cold: clear the per-request cache so the first call pays the full cost.
+		frappe.local.__dict__.pop("_unity_request_cache", None)
+		t0 = time.perf_counter()
+		try:
+			fn(*args, **kwargs)
+		except Exception as exc:
+			return {"name": label, "error": str(exc), "cold_ms": None, "warm_ms": None}
+		cold = round((time.perf_counter() - t0) * 1000, 1)
+		# Warm: same call again with the per-request cache primed.
+		t0 = time.perf_counter()
+		try:
+			fn(*args, **kwargs)
+		except Exception:
+			pass
+		warm = round((time.perf_counter() - t0) * 1000, 1)
+		return {"name": label, "cold_ms": cold, "warm_ms": warm}
+
+	timings = [
+		_time_call(
+			"assigned_ticket_names_for_session_user",
+			_assigned_ticket_names,
+			frappe.session.user,
+		),
+		_time_call(
+			f"get_tickets_page__{view}",
+			get_tickets_page,
+			view=view,
+			page_length=page_length_int,
+			start=0,
+		),
+		_time_call(
+			f"get_tickets_summary__{view}",
+			get_tickets_summary,
+			view=view,
+		),
+		_time_call(
+			f"get_tickets_combined__{view}__back_compat",
+			get_tickets,
+			view=view,
+			page_length=page_length_int,
+			start=0,
+		),
+	]
+	return {
+		"timings": timings,
+		"row_count": frappe.db.count("HD Ticket"),
+		"session_user": frappe.session.user,
+		"view": view,
+	}
 
 
 _BACKFILL_JOBS = (

@@ -28,3 +28,5 @@ helpdesk.patches.unity_reply_link_field
 helpdesk.patches.unity_bulk_email_recipients_field
 helpdesk.patches.unity_bulk_email_recipients_backfill
 helpdesk.patches.unity_raised_by_index
+helpdesk.patches.unity_ticket_list_indexes
+helpdesk.patches.unity_post_migrate_warmup

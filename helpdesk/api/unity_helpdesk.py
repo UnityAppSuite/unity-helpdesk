@@ -1,3 +1,4 @@
+import functools
 import html
 import json
 import re
@@ -30,6 +31,15 @@ PRIORITY_TARGETS = {
 	"Low": "2-3 days",
 }
 MAX_SEARCH_CANDIDATES = 400
+# Top-N most-recently-assigned tickets we resolve via ToDo for the "My
+# Tickets" / "Assigned: X" filters. Set high enough that no real human
+# user can hit it (the typical agent has dozens to low-hundreds of open
+# assignments). The result is still ordered by HD Ticket.modified for
+# display, so this only bounds the candidate set, not the page that
+# renders. Truncation here is preferable to falling back to the legacy
+# `_assign LIKE '%user%'` full-table scan, which is what made the SPA's
+# first paint hit 20–30 s.
+MAX_ASSIGNED_LOOKUP = 25000
 UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
@@ -73,8 +83,25 @@ def _session_user():
 	return frappe.session.user
 
 
+def _request_cache():
+	"""Per-request scratch dict on frappe.local, cleared automatically between
+	requests. Used to memoize helpers (capabilities, roles, has-field checks)
+	that get called 3–8 times per `get_tickets` request — each individually
+	cheap, but together a measurable fraction of cold first-paint latency.
+	"""
+	cache = getattr(frappe.local, "_unity_request_cache", None)
+	if cache is None:
+		cache = {}
+		frappe.local._unity_request_cache = cache
+	return cache
+
+
 def _user_roles(user=None):
-	return set(frappe.get_roles(user or _session_user()))
+	user = user or _session_user()
+	cache = _request_cache().setdefault("_user_roles", {})
+	if user not in cache:
+		cache[user] = set(frappe.get_roles(user))
+	return cache[user]
 
 
 def _is_super_admin(user=None):
@@ -89,6 +116,9 @@ def _is_super_admin(user=None):
 
 def _get_capabilities(user=None):
 	user = user or _session_user()
+	cache = _request_cache().setdefault("_capabilities", {})
+	if user in cache:
+		return cache[user]
 	roles = _user_roles(user)
 	is_super_admin = _is_super_admin(user)
 	is_helpdesk_admin = is_super_admin or HELPDESK_ADMIN_ROLE in roles
@@ -106,7 +136,7 @@ def _get_capabilities(user=None):
 	elif is_helpdesk_user:
 		role = HELPDESK_USER_ROLE
 
-	return frappe._dict(
+	capabilities = frappe._dict(
 		{
 			"role": role,
 			"can_view_my_tickets": bool(is_helpdesk_user),
@@ -117,6 +147,8 @@ def _get_capabilities(user=None):
 			"can_manage_unity_settings": bool(is_super_admin),
 		}
 	)
+	cache[user] = capabilities
+	return capabilities
 
 
 def _require_unity_access():
@@ -172,7 +204,10 @@ def _parse_json(value, fallback):
 	return value
 
 
+@functools.lru_cache(maxsize=256)
 def _has_field(doctype, fieldname):
+	# Schema doesn't change within a process — safe to cache forever.
+	# `bench migrate` reloads the worker, so the cache is fresh after deploys.
 	return frappe.get_meta(doctype).has_field(fieldname)
 
 
@@ -2062,14 +2097,69 @@ def diagnose_ticket_thread_and_search(name, text=None):
 	}
 
 
+def _assigned_ticket_names(user):
+	"""Return the set of HD Ticket names currently assigned to `user`, resolved
+	via the indexed `tabToDo` table instead of `_assign LIKE '%user%'`.
+
+	The old LIKE filter was a guaranteed full-table scan on a 90K-row HD Ticket
+	table (leading-wildcard means no B-tree index can be used). ToDo has
+	composite indexes on (reference_type, reference_name) and on (owner), so
+	this lookup is O(matched-rows) — milliseconds even for the heaviest-loaded
+	agent.
+
+	Truncated to the most-recently-assigned MAX_ASSIGNED_LOOKUP names — well
+	above any realistic per-user assignment count. We deliberately don't fall
+	back to the LIKE filter when over the cap, because the LIKE is exactly
+	the regression this whole rewrite eliminates.
+	"""
+	if not user:
+		return set()
+	cache = _request_cache().setdefault("_assigned_ticket_names", {})
+	if user in cache:
+		return cache[user]
+	rows = frappe.get_all(
+		"ToDo",
+		filters={
+			"reference_type": TICKET_DOCTYPE,
+			"owner": user,
+			"status": "Open",
+		},
+		fields=["reference_name"],
+		# Most-recent assignments first, so silent truncation at MAX still
+		# returns the rows a user would actually be looking at.
+		order_by="creation desc",
+		page_length=MAX_ASSIGNED_LOOKUP,
+	)
+	names = {row.reference_name for row in rows if row.reference_name}
+	cache[user] = names
+	return names
+
+
+def _apply_assignee_filter(res, user):
+	"""Translate "tickets assigned to <user>" into a `name IN (...)` filter via
+	the indexed ToDo table. Mutates `res` (the filter list); caller continues
+	building other filters normally. When the user has zero open assignments,
+	emits a sentinel filter that yields an empty result without scanning the
+	table.
+	"""
+	names = _assigned_ticket_names(user)
+	if not names:
+		# Sentinel that can't be a valid ticket name — short-circuits to an
+		# empty result without touching tabHD Ticket. Cheaper than running the
+		# query and getting 0 rows back.
+		res.append([TICKET_DOCTYPE, "name", "in", ["__unity_no_assignments__"]])
+		return
+	res.append([TICKET_DOCTYPE, "name", "in", list(names)])
+
+
 def _build_filters(view="all", filters=None, assigned_agent=None):
 	filters = frappe._dict(_parse_json(filters, {}) or {})
 	res = []
 
 	if assigned_agent:
-		res.append([TICKET_DOCTYPE, "_assign", "like", f"%{assigned_agent}%"])
+		_apply_assignee_filter(res, assigned_agent)
 	elif view == "my":
-		res.append([TICKET_DOCTYPE, "_assign", "like", f"%{_session_user()}%"])
+		_apply_assignee_filter(res, _session_user())
 
 	if filters.get("status"):
 		if filters.status == "On Hold" and _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
@@ -2087,7 +2177,7 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 		if filters.assigned_to == "Unassigned":
 			res.append([TICKET_DOCTYPE, "_assign", "in", ["", "[]"]])
 		else:
-			res.append([TICKET_DOCTYPE, "_assign", "like", f"%{filters.assigned_to}%"])
+			_apply_assignee_filter(res, filters.assigned_to)
 
 	if filters.get("created_from"):
 		res.append([TICKET_DOCTYPE, "creation", ">=", filters.created_from])
@@ -2358,8 +2448,33 @@ def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
 	return {"data": rows[:limit], "query": query, "view": effective_view}
 
 
-@frappe.whitelist()
-def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+def _resolve_ticket_context(view, filters, search, message_body, page_length, start):
+	"""Compute the shared context that get_tickets_page and get_tickets_summary
+	both need: capabilities, effective view, base filter list, cleaned search
+	text, and (when searching) the candidate-name set + family expansion. The
+	result is cached on `frappe.local` so the two parallel endpoints don't
+	repeat the work twice within a single request — only relevant for the
+	back-compat `get_tickets` wrapper, but harmless otherwise.
+	"""
+	# Cache key embeds the inputs so different filter combinations don't
+	# collide within the same request.
+	cache_key = (
+		"_ticket_context",
+		view,
+		json.dumps(filters or {}, sort_keys=True, default=str) if filters else "",
+		cstr(search or ""),
+		cstr(message_body or ""),
+	)
+	cache = _request_cache()
+	cached = cache.get(cache_key)
+	if cached is not None:
+		# Update pagination on each call so the same context object can be
+		# reused with different `start` / `page_length` values cheaply.
+		cached = dict(cached)
+		cached["page_length"] = int(page_length or 20)
+		cached["start"] = int(start or 0)
+		return cached
+
 	capabilities = _require_unity_access()
 	page_length = int(page_length or 20)
 	start = int(start or 0)
@@ -2387,22 +2502,67 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 				or expanded.get("student_ids")
 			):
 				search_family_terms = expanded
-	candidate_names = search_candidate_names
+
+	context = {
+		"capabilities": capabilities,
+		"effective_view": effective_view,
+		"list_filters": list_filters,
+		"fields": fields,
+		"search": search,
+		"search_candidate_names": search_candidate_names,
+		"search_family_terms": search_family_terms,
+		"page_length": page_length,
+		"start": start,
+	}
+	cache[cache_key] = context
+	return context
+
+
+def _fetch_candidate_rows(context):
+	"""For the search path, fetch the candidate-ranked rows once. The candidate
+	set is bounded at MAX_SEARCH_CANDIDATES so this is a single small query.
+	Result is cached on the context dict for the page + summary endpoints to
+	share within the same request."""
+	if "candidate_rows" in context:
+		return context["candidate_rows"]
+	candidate_names = context["search_candidate_names"]
+	if not candidate_names:
+		context["candidate_rows"] = []
+		return []
+	rows = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=context["fields"],
+		filters=_merge_filters(
+			context["list_filters"],
+			[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		),
+		order_by="modified desc",
+		page_length=min(max(len(candidate_names), 1), MAX_SEARCH_CANDIDATES),
+	)
+	context["candidate_rows"] = rows
+	return rows
+
+
+def _compute_tickets_page(context):
+	"""Return just the paginated rows for the current view + filters. Drops
+	the cards/total_count which the summary endpoint is responsible for —
+	keeps this endpoint's response small and its work minimal so the SPA
+	can paint the list as soon as it lands.
+	"""
+	page_length = context["page_length"]
+	start = context["start"]
+	candidate_names = context["search_candidate_names"]
+	search = context["search"]
+	fields = context["fields"]
+	list_filters = context["list_filters"]
+	effective_view = context["effective_view"]
 
 	if candidate_names is not None:
-		candidate_rows = (
-			frappe.get_list(
-				TICKET_DOCTYPE,
-				fields=fields,
-				filters=_merge_filters(list_filters, [[TICKET_DOCTYPE, "name", "in", list(candidate_names)]]),
-				order_by="modified desc",
-				page_length=min(max(len(candidate_names), 1), MAX_SEARCH_CANDIDATES),
-			)
-			if candidate_names
-			else []
-		)
+		candidate_rows = _fetch_candidate_rows(context)
 		ranked_ids = (
-			_ranked_ticket_ids(candidate_rows, search, family_terms=search_family_terms)
+			_ranked_ticket_ids(
+				candidate_rows, search, family_terms=context["search_family_terms"]
+			)
 			if search
 			else [
 				row.name
@@ -2426,6 +2586,43 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 				)
 			}
 		rows = [row_map[name] for name in paginated_ids if name in row_map]
+	else:
+		rows = frappe.get_list(
+			TICKET_DOCTYPE,
+			fields=fields,
+			filters=list_filters,
+			order_by="modified desc",
+			limit_start=start,
+			page_length=page_length,
+		)
+
+	return {
+		"data": _decorate_ticket_rows(rows),
+		"row_count": len(rows),
+		"start": start,
+		"page_length": page_length,
+		"view": effective_view,
+	}
+
+
+def _compute_tickets_summary(context):
+	"""Return just total_count + cards for the current view + filters. The
+	search path replays the candidate ranking so the cards reflect matches,
+	not the full filter set; the empty-search path uses the single SQL
+	aggregate in _dashboard_cards_for_filters."""
+	candidate_names = context["search_candidate_names"]
+	search = context["search"]
+	list_filters = context["list_filters"]
+
+	if candidate_names is not None:
+		candidate_rows = _fetch_candidate_rows(context)
+		ranked_ids = (
+			_ranked_ticket_ids(
+				candidate_rows, search, family_terms=context["search_family_terms"]
+			)
+			if search
+			else [row.name for row in candidate_rows]
+		)
 		matched_ids = set(ranked_ids)
 		summary_rows = [
 			{
@@ -2439,28 +2636,44 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 		total_count = len(ranked_ids)
 		cards = _dashboard_cards(summary_rows)
 	else:
-		rows = frappe.get_list(
-			TICKET_DOCTYPE,
-			fields=fields,
-			filters=list_filters,
-			order_by="modified desc",
-			limit_start=start,
-			page_length=page_length,
-		)
 		cards = _dashboard_cards_for_filters(list_filters)
-		# `cards["total"]` is the same COUNT(*) the list page wants — re-use it
-		# instead of running another COUNT query.
 		total_count = int(cards.get("total") or 0)
 
-	return {
-		"data": _decorate_ticket_rows(rows),
-		"total_count": total_count,
-		"cards": cards,
-		"row_count": len(rows),
-		"start": start,
-		"page_length": page_length,
-		"view": effective_view,
-	}
+	return {"total_count": total_count, "cards": cards}
+
+
+@frappe.whitelist()
+def get_tickets_page(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+	"""Paginated ticket rows for the current view + filters. Companion to
+	`get_tickets_summary`. The Unity SPA fires both in parallel so the list
+	paints as soon as the page response lands — typically tens of
+	milliseconds — without waiting for the dashboard-cards aggregate."""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	return _compute_tickets_page(context)
+
+
+@frappe.whitelist()
+def get_tickets_summary(view="all", filters=None, search=None, message_body=None):
+	"""Dashboard-card counts (total/pending/on_hold/resolved/closed/replied)
+	for the current view + filters. Companion to `get_tickets_page`. Issues
+	a single aggregate SQL via `_dashboard_cards_for_filters` (empty-search
+	path) or replays the candidate-rank set (search path)."""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length=1, start=0)
+	return _compute_tickets_summary(context)
+
+
+@frappe.whitelist()
+def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+	"""Back-compat wrapper that returns the same shape the previous monolithic
+	endpoint did — `{data, total_count, cards, row_count, start, page_length, view}`.
+	Internally calls the same helpers as `get_tickets_page` and
+	`get_tickets_summary`, sharing the candidate-rows fetch via the
+	per-request cache so no extra DB work is paid for back-compat.
+	"""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	page = _compute_tickets_page(context)
+	summary = _compute_tickets_summary(context)
+	return {**page, **summary}
 
 
 def _dashboard_range(range_key="week", from_date=None, to_date=None):
@@ -2500,7 +2713,10 @@ def _dashboard_rows(from_date, to_date, assigned_agent=None):
 		[TICKET_DOCTYPE, "creation", "<=", f"{to_date} 23:59:59"],
 	]
 	if assigned_agent:
-		filters.append([TICKET_DOCTYPE, "_assign", "like", f"%{assigned_agent}%"])
+		# Same ToDo-based fast path the list page uses — avoids the
+		# `_assign LIKE '%user%'` full-table scan that previously dominated
+		# the dashboard query budget for filtered-by-agent views.
+		_apply_assignee_filter(filters, assigned_agent)
 	return frappe.get_list(
 		TICKET_DOCTYPE,
 		fields=["name", "status", "ticket_type", "creation", "modified", "custom_is_on_hold"],
