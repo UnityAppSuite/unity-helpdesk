@@ -1933,6 +1933,18 @@ def _search_candidate_ticket_names(base_filters, search):
 	# cap their per-token result at the 400 most-recently-modified rows and
 	# silently drop older tickets that do contain all the tokens.
 	candidate_names = _multi_token_candidates(tokens, search_fields, base_filters)
+
+	# FULLTEXT fallback for long paste queries. AND-of-OR cliff-edges to
+	# zero results when one common token doesn't survive head/tail
+	# truncation of the indexed body. FULLTEXT scores partial matches and
+	# ignores stopwords automatically, so we use it as a safety net only
+	# when the legacy path returned nothing AND the query is long enough
+	# to warrant relevance ranking. (Short queries like "TA16" stay on
+	# the legacy path because they're already covered by the direct ticket
+	# ID + Data-field LIKE matches above.)
+	if not candidate_names and (len(tokens) >= 4 or len(cstr(query)) > 60):
+		candidate_names = _fulltext_candidates(query, base_filters)
+
 	return candidate_names
 
 
@@ -1996,6 +2008,72 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
 	rows = query.run(as_dict=True)
 	return {row["name"] for row in rows}
+
+
+# Columns covered by the FULLTEXT index added in
+# helpdesk/patches/unity_ticket_search_fulltext.py. Must match exactly
+# (MariaDB only uses a FULLTEXT index when the MATCH column list is
+# byte-identical to the index column list).
+_FULLTEXT_COLUMNS = (
+	"custom_search_message_body",
+	"subject",
+	"custom_search_student_names",
+	"custom_search_student_refs",
+	"custom_search_guardian_emails",
+)
+
+
+def _fulltext_candidates(query, base_filters):
+	"""Relevance-ranked candidate set via MariaDB FULLTEXT INDEX. Used as a
+	fallback when the AND-of-OR LIKE path returns nothing for a long pasted
+	query. Tolerates a missing index (returns empty set) so the rest of the
+	search keeps working on a site where the patch hasn't run yet.
+	"""
+	# FULLTEXT in InnoDB ignores words shorter than
+	# innodb_ft_min_token_size (default 3) and the stopword list; strip
+	# explicitly so the query stays short and predictable.
+	cleaned_tokens = [t for t in _search_tokens(query) if len(t) >= 4]
+	if not cleaned_tokens:
+		return set()
+	# Bound the query string length — long pastes still tokenise to dozens
+	# of unique 4+-char words; 200 chars is plenty for relevance ranking.
+	cleaned = " ".join(cleaned_tokens)[:200]
+
+	col_list = ", ".join(f"`{c}`" for c in _FULLTEXT_COLUMNS)
+	sql = (
+		f"SELECT name FROM `tabHD Ticket` "
+		f"WHERE MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) "
+		f"ORDER BY MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) DESC "
+		f"LIMIT %s"
+	)
+	try:
+		rows = frappe.db.sql(sql, (cleaned, cleaned, MAX_SEARCH_CANDIDATES))
+	except Exception as exc:
+		# 1191 = "Can't find FULLTEXT index matching the column list" — the
+		# patch hasn't run on this site. Log once and degrade silently;
+		# the legacy search path still returns its (empty) result.
+		frappe.log_error(
+			title="unity search FULLTEXT fallback failed",
+			message=f"{type(exc).__name__}: {exc}",
+		)
+		return set()
+
+	candidate_names = {row[0] for row in rows if row and row[0]}
+	if not candidate_names or not base_filters:
+		return candidate_names
+
+	# Re-apply base_filters (view + permission_query scope) via a narrow
+	# IN(...) query — the raw SQL above bypassed Frappe's permission layer.
+	filtered = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=["name"],
+		filters=_merge_filters(
+			base_filters,
+			[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		),
+		page_length=len(candidate_names),
+	)
+	return {row.name for row in filtered}
 
 
 @frappe.whitelist()
