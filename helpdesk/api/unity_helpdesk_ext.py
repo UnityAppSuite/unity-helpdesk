@@ -441,6 +441,12 @@ from frappe.utils import validate_email_address
 
 RECIPIENT_HARD_CAP = 1000
 TOTAL_ADDRESS_HARD_CAP = 1500
+# Mailbox that should receive an audit copy of every bulk email with the
+# full recipient list visible in the body. The same address is locked as
+# the default "Recipients" chip on the SPA composer (App.vue line ~606).
+# Real recipients (students + guardians) are BCC'd separately so they
+# never see this audit copy or each other.
+AUDIT_RECIPIENT_EMAIL = "feedback@walnutedu.in"
 
 
 @frappe.whitelist()
@@ -584,20 +590,52 @@ def bulk_send_email(
     except Exception:
         frappe.log_error(frappe.get_traceback(), "Unity Helpdesk bulk_send_email: Communication creation")
 
+    # Split the recipient list so the audit mailbox can see who was emailed
+    # while real recipients stay hidden from each other. Two separate
+    # sendmail calls: clean BCC copy for students/guardians; visible-list
+    # copy for the audit mailbox.
+    audit_emails = [
+        e for e in valid_emails if e.lower() == AUDIT_RECIPIENT_EMAIL.lower()
+    ]
+    real_recipients = [
+        e for e in valid_emails if e.lower() != AUDIT_RECIPIENT_EMAIL.lower()
+    ] + list(bcc_list)
+
     warning = ""
     queued = 0
     try:
-        # BCC all real recipients so they can't see one another.
-        frappe.sendmail(
-            recipients=[frappe.session.user],
-            cc=cc_list or None,
-            bcc=valid_emails + bcc_list,
-            subject=subject,
-            message=message,
-            attachments=sendmail_attachments,
-            delayed=True,
-        )
-        queued = len(valid_emails)
+        if real_recipients:
+            # Hide-everyone-from-everyone copy. Students/guardians see TO=
+            # frappe.session.user, no other addresses visible (BCC is
+            # stripped from the headers Gmail / Outlook show).
+            frappe.sendmail(
+                recipients=[frappe.session.user],
+                cc=cc_list or None,
+                bcc=real_recipients,
+                subject=subject,
+                message=message,
+                attachments=sendmail_attachments,
+                delayed=True,
+            )
+            queued += len(real_recipients)
+
+        if audit_emails:
+            # Audit copy with the full recipient list visible in the body.
+            # Goes only to AUDIT_RECIPIENT_EMAIL (typically feedback@) so
+            # the audit mailbox owner can see who was emailed without
+            # leaking the list to real recipients.
+            audit_summary = _build_audit_summary_html(
+                real_recipients, cc_list, bcc_list
+            )
+            frappe.sendmail(
+                recipients=audit_emails,
+                cc=cc_list or None,
+                subject=f"[Audit] {subject}",
+                message=audit_summary + message,
+                attachments=sendmail_attachments,
+                delayed=True,
+            )
+            queued += len(audit_emails)
     except Exception as exc:
         if _is_missing_sender_error(exc):
             warning = _("Audit-trail ticket created, but no outgoing email account is configured. No email was sent.")
@@ -681,6 +719,46 @@ def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
     sections.append("<hr style='margin:12px 0'>")
     sections.append("<p><strong>Message sent:</strong></p>")
     sections.append(message)
+    return "".join(sections)
+
+
+def _build_audit_summary_html(real_recipients, cc_list, bcc_list):
+    """Audit banner prepended to the email body sent to the AUDIT_RECIPIENT
+    mailbox. Same shape as the audit-ticket description but lives inside
+    the email body, so the feedback inbox owner can see the full recipient
+    list at a glance.
+
+    This content is ONLY sent to AUDIT_RECIPIENT_EMAIL — never to the real
+    recipients (students/guardians). The dual-sendmail split in
+    bulk_send_email enforces that separation."""
+    recipient_items = "".join(
+        f"<li style='font-size:12px;color:#475569'>{frappe.utils.escape_html(e)}</li>"
+        for e in real_recipients
+    )
+    recipient_count = len(real_recipients)
+    recipient_block = (
+        f"<details open style='margin:6px 0'>"
+        f"<summary style='cursor:pointer;font-weight:600;color:#3730a3'>"
+        f"📧 {recipient_count} recipient{'s' if recipient_count != 1 else ''}"
+        f"</summary>"
+        f"<ul style='margin:6px 0 0 16px;padding:0'>{recipient_items}</ul>"
+        f"</details>"
+    )
+    sections = [
+        "<div style='border:1px solid #c7d2fe;background:#eef2ff;padding:12px;border-radius:6px;margin:0 0 16px'>",
+        "<p style='margin:0 0 8px'><strong>🗂 Audit copy</strong> &mdash; full recipient list below. "
+        "Real recipients did NOT receive this banner; they got the message via BCC and can only see their own address.</p>",
+        recipient_block,
+    ]
+    if cc_list:
+        sections.append(
+            f"<p style='margin:6px 0'><strong>CC:</strong> {frappe.utils.escape_html(', '.join(cc_list))}</p>"
+        )
+    if bcc_list:
+        sections.append(
+            f"<p style='margin:6px 0'><strong>Additional BCC:</strong> {frappe.utils.escape_html(', '.join(bcc_list))}</p>"
+        )
+    sections.append("</div>")
     return "".join(sections)
 
 
