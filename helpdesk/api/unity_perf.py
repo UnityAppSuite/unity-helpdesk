@@ -28,7 +28,11 @@ from frappe import _
 
 from helpdesk.api.unity_helpdesk import (
 	_assigned_ticket_names,
+	_has_field,
+	_normalize_search_text,
 	_require_unity_access,
+	_search_tokens,
+	_ticket_message_search_fields,
 	get_tickets_page,
 	get_tickets_summary,
 )
@@ -189,6 +193,251 @@ def run_endpoint_benchmark(view="all", page_length=20):
 		"session_user": frappe.session.user,
 		"view": view,
 	}
+
+
+_DIAGNOSTIC_BODY_PREVIEW = 800
+_DIAGNOSTIC_TOKEN_CAP = 32
+
+
+@frappe.whitelist()
+def print_search_diagnostic(ticket_name, query):
+	"""Explain why a specific search query does (or doesn't) match a specific
+	ticket. Reports the ticket's indexed body, the normalized tokens of the
+	query, and whether each token is present in each indexed field.
+
+	Usage:
+	    bench --site <site> execute helpdesk.api.unity_perf.print_search_diagnostic \\
+	        --kwargs '{"ticket_name": "97895", "query": "I am writing to inquire..."}'
+
+	The output mirrors the actual search pipeline:
+	1. Query → _normalize_search_text → _search_tokens → 3-char filter → 8-token cap.
+	2. Each indexed field on the ticket is fetched and normalized the same way.
+	3. Token-vs-field presence matrix shows the exact reason the AND-of-OR
+	   path would fail (any token missing from every field => no match).
+	"""
+	_require_admin()
+	ticket_name = (ticket_name or "").strip()
+	if not ticket_name:
+		frappe.throw(_("ticket_name is required"))
+	if not frappe.db.exists("HD Ticket", ticket_name):
+		frappe.throw(_("Ticket {0} not found").format(ticket_name))
+
+	raw_query = (query or "").strip()
+	# Replicate _search_candidate_ticket_names' token pipeline.
+	all_tokens = _search_tokens(raw_query)
+	filtered_tokens = (
+		[t for t in all_tokens if len(t) >= 3] if len(all_tokens) > 1 else list(all_tokens)
+	)
+	# Mirror MAX_SEARCH_TOKENS = 8 (the local constant inside
+	# _search_candidate_ticket_names). Diagnostic shows what the search WOULD
+	# do, so we cap the same way.
+	used_tokens = filtered_tokens[:8]
+
+	# Collect every indexed field that's actually present on this site.
+	candidate_fields = ["name", "subject", "raised_by"]
+	for fname in (
+		"custom_search_student_names",
+		"custom_search_student_refs",
+		"custom_search_guardian_emails",
+	):
+		if _has_field("HD Ticket", fname):
+			candidate_fields.append(fname)
+	# Message search body fields (might or might not be populated for this row)
+	for fname in _ticket_message_search_fields():
+		if fname not in candidate_fields:
+			candidate_fields.append(fname)
+
+	ticket_row = frappe.db.get_value("HD Ticket", ticket_name, candidate_fields, as_dict=True) or {}
+
+	# Build the token-vs-field matrix using the same normalization the indexer
+	# does — case + whitespace folded, HTML stripped — so the diagnostic
+	# reflects what the LIKE / FULLTEXT operators would actually see.
+	field_text = {
+		fname: _normalize_search_text(value)
+		for fname, value in ticket_row.items()
+	}
+
+	per_token = []
+	for token in used_tokens[:_DIAGNOSTIC_TOKEN_CAP]:
+		hits = [fname for fname, text in field_text.items() if token in text]
+		per_token.append({
+			"token": token,
+			"matched_fields": hits,
+			"matched": bool(hits),
+		})
+
+	missing_tokens = [row["token"] for row in per_token if not row["matched"]]
+	verdict = (
+		"MATCH — every token present in at least one indexed field"
+		if not missing_tokens
+		else f"NO MATCH — token(s) absent from every field: {missing_tokens}"
+	)
+
+	# Short previews of the heaviest field so the operator can eyeball the
+	# indexed content without spamming the terminal.
+	body_text = field_text.get("custom_search_message_body") or ""
+	preview = body_text[:_DIAGNOSTIC_BODY_PREVIEW]
+	if len(body_text) > _DIAGNOSTIC_BODY_PREVIEW:
+		preview += f"... [truncated, full length={len(body_text)}]"
+
+	report = {
+		"ticket_name": ticket_name,
+		"query": raw_query,
+		"tokens_raw": all_tokens,
+		"tokens_after_3char_filter": filtered_tokens,
+		"tokens_used_for_search": used_tokens,
+		"tokens_dropped_by_8_cap": filtered_tokens[8:],
+		"indexed_fields_present": list(field_text.keys()),
+		"per_token_match": per_token,
+		"missing_tokens": missing_tokens,
+		"custom_search_message_body_length": len(body_text),
+		"custom_search_message_body_preview": preview,
+		"verdict": verdict,
+	}
+	frappe.logger().info(f"[unity-perf] search-diagnostic: {report}")
+	return report
+
+
+@frappe.whitelist()
+def diagnose_guardian_lookup(emails):
+	"""Walk through `get_student_guardian_emails`' lookup chain step by step,
+	reporting the result of each step. Lets the operator see exactly why no
+	guardians were resolved on a given site.
+
+	Usage:
+	    bench --site <site> execute helpdesk.api.unity_perf.diagnose_guardian_lookup \\
+	        --kwargs '{"emails": ["sample.student@walnutedu.in"]}'
+	"""
+	_require_admin()
+	# Accept JSON-string (via bench --kwargs) or list/tuple.
+	if isinstance(emails, str):
+		try:
+			emails = frappe.parse_json(emails)
+		except Exception:
+			emails = [emails]
+	if not isinstance(emails, (list, tuple)):
+		emails = []
+	normalized = sorted({(e or "").strip().lower() for e in emails if (e or "").strip()})
+
+	report = {
+		"input_emails": normalized,
+		"steps": [],
+	}
+
+	def _step(label, **payload):
+		entry = {"step": label, **payload}
+		report["steps"].append(entry)
+		frappe.logger().info(f"[unity-perf] guardian-diagnostic: {entry}")
+
+	# Step 1: doctypes exist?
+	for dt in ("Student", "Student Guardian", "Guardian"):
+		_step(
+			f"doctype_exists::{dt}",
+			present=bool(frappe.db.exists("DocType", dt)),
+		)
+
+	# Step 2: required fields exist on each doctype?
+	_step(
+		"field::Student.student_email_id",
+		present=_has_field("Student", "student_email_id") if frappe.db.exists("DocType", "Student") else False,
+	)
+	_step(
+		"field::Guardian.email_address",
+		present=_has_field("Guardian", "email_address") if frappe.db.exists("DocType", "Guardian") else False,
+	)
+
+	if not normalized:
+		_step("input_empty", note="No emails passed; aborting further checks")
+		return report
+
+	# Step 3: Student lookup by student_email_id
+	try:
+		students = frappe.get_all(
+			"Student",
+			fields=["name", "student_email_id"],
+			filters={"student_email_id": ["in", normalized]},
+			page_length=200,
+		)
+	except Exception as exc:
+		_step("student_lookup_error", error=str(exc))
+		return report
+	_step(
+		"student_lookup",
+		input_count=len(normalized),
+		matched_count=len(students),
+		matched=[{"name": s.name, "email": s.student_email_id} for s in students[:20]],
+	)
+
+	if not students:
+		_step(
+			"no_students_matched",
+			note=(
+				"None of the input emails are listed as `student_email_id` on a Student record. "
+				"Confirm the Student records on this site actually have those emails populated."
+			),
+		)
+		return report
+
+	student_ids = [s.name for s in students]
+
+	# Step 4: Student Guardian rows
+	try:
+		sg_rows = frappe.get_all(
+			"Student Guardian",
+			fields=["parent", "guardian", "email"],
+			filters={"parenttype": "Student", "parent": ["in", student_ids]},
+			page_length=1000,
+		)
+	except Exception as exc:
+		_step("student_guardian_lookup_error", error=str(exc))
+		return report
+	_step(
+		"student_guardian_lookup",
+		matched_count=len(sg_rows),
+		sample=[{"student": r.parent, "guardian": r.guardian, "email": r.email} for r in sg_rows[:20]],
+	)
+
+	if not sg_rows:
+		_step(
+			"no_student_guardian_rows",
+			note=(
+				"Students were matched but no Student Guardian child-table rows reference them. "
+				"Verify the Student.guardians child table is populated."
+			),
+		)
+		return report
+
+	# Step 5: Guardian email_address resolution
+	guardian_ids = sorted({r.guardian for r in sg_rows if r.guardian})
+	try:
+		guardian_rows = frappe.get_all(
+			"Guardian",
+			fields=["name", "email_address"],
+			filters={"name": ["in", guardian_ids]},
+			page_length=len(guardian_ids) + 1,
+		)
+	except Exception as exc:
+		_step("guardian_lookup_error", error=str(exc))
+		return report
+	guardians_with_email = [g for g in guardian_rows if (g.email_address or "").strip()]
+	_step(
+		"guardian_lookup",
+		total=len(guardian_rows),
+		with_email=len(guardians_with_email),
+		without_email=len(guardian_rows) - len(guardians_with_email),
+		sample=[{"name": g.name, "email_address": g.email_address} for g in guardian_rows[:20]],
+	)
+
+	_step(
+		"final",
+		guardians_per_student=(
+			len([r for r in sg_rows if (
+				next((g for g in guardian_rows if g.name == r.guardian and (g.email_address or "").strip()), None)
+				or (r.email or "").strip()
+			)]) / max(len(students), 1)
+		),
+	)
+	return report
 
 
 _BACKFILL_JOBS = (
