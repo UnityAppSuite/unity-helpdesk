@@ -543,12 +543,24 @@ def bulk_send_email(
         payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
     doc = frappe.get_doc(payload).insert(ignore_permissions=True)
 
-    attachment_list = _parse_json(attachments, []) or []
-    sendmail_attachments = [
-        {"file_url": name}
-        for name in attachment_list
-        if name and frappe.db.exists("File", name)
-    ]
+    attachment_list = [n for n in (_parse_json(attachments, []) or []) if n]
+    # Single IN(...) query instead of one EXISTS per attachment — bulk email
+    # with 10 attachments was paying 10 sequential DB round-trips here. The
+    # ordered list comprehension preserves the user's intended attachment
+    # order rather than the set iteration order.
+    if attachment_list:
+        existing_files = set(
+            frappe.get_all(
+                "File",
+                filters={"name": ["in", attachment_list]},
+                pluck="name",
+            )
+        )
+        sendmail_attachments = [
+            {"file_url": name} for name in attachment_list if name in existing_files
+        ]
+    else:
+        sendmail_attachments = []
 
     # Create a Communication immediately so the sent message appears in the ticket thread.
     # Use frappe's make() which handles linking/indexing correctly.

@@ -3633,6 +3633,14 @@ def search_contacts(query):
 	return results[:15]
 
 
+# Bound the worst-case row fetch when looking up guardians. A real school
+# has a few thousand Student Guardian rows total; a misconfigured site (or
+# a query with thousands of student ids) shouldn't be allowed to
+# materialise an unbounded result set into worker memory. Above this we
+# log and truncate.
+_GUARDIAN_LOOKUP_HARD_CAP = 5000
+
+
 def _guardian_emails_for_student_ids(student_ids):
 	"""Return {student_name: [guardian_email, ...]} for the given Student ids.
 
@@ -3640,6 +3648,10 @@ def _guardian_emails_for_student_ids(student_ids):
 	get_student_context_for_ticket (around line 620). Prefers Guardian.email_address
 	over the denormalized Student Guardian.email row. Per-student dedupe + lowercase;
 	guardians with no email are skipped. Cross-student dedupe is the caller's job.
+
+	Per-request cached on `frappe.local` — the bulk-email composer triggers
+	this on every BCC keystroke for repeated student id sets; the cache
+	collapses N consecutive identical lookups into one DB round-trip.
 	"""
 	import re as _re
 
@@ -3647,14 +3659,30 @@ def _guardian_emails_for_student_ids(student_ids):
 	if not ids:
 		return {}
 
+	# Per-request memoization keyed on the sorted id tuple. Cleared by Frappe
+	# between requests via frappe.local lifecycle.
+	cache = _request_cache().setdefault("_guardian_emails_for_student_ids", {})
+	cache_key = tuple(ids)
+	if cache_key in cache:
+		return cache[cache_key]
+
 	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 	rows = frappe.get_all(
 		"Student Guardian",
 		fields=["parent", "guardian", "email"],
 		filters={"parenttype": "Student", "parent": ["in", ids]},
-		page_length=0,
+		# Hard cap (vs. previous page_length=0). For a real school the join
+		# is in the low thousands at most; anything above this is a sign of
+		# misconfiguration and we'd rather log and truncate than OOM the worker.
+		page_length=_GUARDIAN_LOOKUP_HARD_CAP,
 	)
+	if len(rows) >= _GUARDIAN_LOOKUP_HARD_CAP:
+		frappe.logger().warning(
+			f"_guardian_emails_for_student_ids: Student Guardian rows hit cap "
+			f"({_GUARDIAN_LOOKUP_HARD_CAP}) for {len(ids)} student ids; "
+			f"results may be truncated"
+		)
 	guardian_ids = sorted({cstr(r.guardian).strip() for r in rows if cstr(r.guardian).strip()})
 	guardian_email_by_id = {}
 	if guardian_ids:
@@ -3662,7 +3690,7 @@ def _guardian_emails_for_student_ids(student_ids):
 			"Guardian",
 			fields=["name", "email_address"],
 			filters={"name": ["in", guardian_ids]},
-			page_length=0,
+			page_length=len(guardian_ids) + 1,
 		):
 			guardian_email_by_id[g.name] = cstr(g.email_address or "").strip().lower()
 
@@ -3676,6 +3704,7 @@ def _guardian_emails_for_student_ids(student_ids):
 		bucket = result.setdefault(sid, [])
 		if email not in bucket:
 			bucket.append(email)
+	cache[cache_key] = result
 	return result
 
 
