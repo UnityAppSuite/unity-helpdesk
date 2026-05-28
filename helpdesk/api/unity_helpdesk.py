@@ -1927,25 +1927,27 @@ def _search_candidate_ticket_names(base_filters, search):
 		)
 		return candidate_names
 
-	# Multi-token: each token must match in at least one searchable field
-	# (AND-of-OR). Run as a single SQL so the LIMIT applies after the AND
-	# filter, not per token — otherwise common tokens like "the" or "and"
-	# cap their per-token result at the 400 most-recently-modified rows and
-	# silently drop older tickets that do contain all the tokens.
-	candidate_names = _multi_token_candidates(tokens, search_fields, base_filters)
-
-	# FULLTEXT fallback for long paste queries. AND-of-OR cliff-edges to
-	# zero results when one common token doesn't survive head/tail
-	# truncation of the indexed body. FULLTEXT scores partial matches and
-	# ignores stopwords automatically, so we use it as a safety net only
-	# when the legacy path returned nothing AND the query is long enough
-	# to warrant relevance ranking. (Short queries like "TA16" stay on
-	# the legacy path because they're already covered by the direct ticket
-	# ID + Data-field LIKE matches above.)
-	if not candidate_names and (len(tokens) >= 4 or len(cstr(query)) > 60):
+	# For long pasted queries (≥4 tokens or >60 chars), run FULLTEXT first
+	# when the index is available. The AND-of-OR LIKE path scans the whole
+	# 90K-row table and cliff-edges to zero whenever any one of the 8
+	# capped tokens is missing from the head/tail-truncated indexed body —
+	# trying it first for a long query is doubled wasted work. FULLTEXT
+	# scores partial matches and ignores stopwords automatically.
+	# Short queries like "TA16" stay on the legacy path (direct ticket-ID
+	# + Data-field LIKE handles them already).
+	is_long_query = len(tokens) >= 4 or len(cstr(query)) > 60
+	if is_long_query and _fulltext_index_available():
 		candidate_names = _fulltext_candidates(query, base_filters)
+		if candidate_names:
+			return candidate_names
 
-	return candidate_names
+	# Multi-token AND-of-OR — primary path for short queries, and the
+	# fallback for long queries whose FULLTEXT search returned empty.
+	# Single SQL so the LIMIT applies after the AND filter, not per token
+	# — otherwise common tokens like "the" or "and" cap their per-token
+	# result at the 400 most-recently-modified rows and silently drop
+	# older tickets that do contain all the tokens.
+	return _multi_token_candidates(tokens, search_fields, base_filters)
 
 
 def _multi_token_candidates(tokens, search_fields, base_filters):
@@ -2021,6 +2023,30 @@ _FULLTEXT_COLUMNS = (
 	"custom_search_student_refs",
 	"custom_search_guardian_emails",
 )
+_FULLTEXT_INDEX_NAME = "search_body_ft_idx"
+
+
+@functools.lru_cache(maxsize=1)
+def _fulltext_index_available():
+	"""One-shot check: does the search_body_ft_idx FULLTEXT INDEX exist on
+	tabHD Ticket? Cached for the worker's lifetime — schema doesn't change
+	without a migrate + worker restart, and the cache avoids a per-query
+	"try MATCH AGAINST → catch 1191 → log_error" overhead when the index
+	isn't there (older deploys, fresh installs before the patch runs,
+	or sites whose MariaDB version refused the ALTER TABLE).
+	"""
+	try:
+		rows = frappe.db.sql(
+			"""SELECT 1 FROM information_schema.STATISTICS
+			   WHERE table_schema = DATABASE()
+			     AND table_name = 'tabHD Ticket'
+			     AND index_name = %s
+			   LIMIT 1""",
+			(_FULLTEXT_INDEX_NAME,),
+		)
+		return bool(rows)
+	except Exception:
+		return False
 
 
 def _fulltext_candidates(query, base_filters):
@@ -2029,6 +2055,10 @@ def _fulltext_candidates(query, base_filters):
 	query. Tolerates a missing index (returns empty set) so the rest of the
 	search keeps working on a site where the patch hasn't run yet.
 	"""
+	# Skip entirely if the FULLTEXT index isn't on this site — saves the
+	# round-trip + 1191 exception cost on every "no AND match" query.
+	if not _fulltext_index_available():
+		return set()
 	# FULLTEXT in InnoDB ignores words shorter than
 	# innodb_ft_min_token_size (default 3) and the stopword list; strip
 	# explicitly so the query stays short and predictable.
