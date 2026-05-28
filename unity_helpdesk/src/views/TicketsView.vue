@@ -421,23 +421,33 @@
 
     <div class="metrics" :class="{ 'metrics-stale': showFilteringBanner }">
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : result.total_count || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : result.total_count || 0
+        }}</b>
         <span>Total Tickets</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.pending || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.pending || 0
+        }}</b>
         <span>Pending</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.on_hold || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.on_hold || 0
+        }}</b>
         <span>On Hold</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.resolved || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.resolved || 0
+        }}</b>
         <span>Resolved</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.closed || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.closed || 0
+        }}</b>
         <span>Closed</span>
       </div>
     </div>
@@ -446,7 +456,9 @@
       <div class="table-header">
         <strong>{{ title }}</strong>
         <span>{{
-          showFilteringBanner ? "…" : `${result.total_count || 0} tickets`
+          showFilteringBanner || summaryPending
+            ? "…"
+            : `${result.total_count || 0} tickets`
         }}</span>
       </div>
       <div v-if="selectionCount > 0" class="bulk-action-bar">
@@ -901,6 +913,12 @@ const dateRangeDraft = reactive({ from: "", to: "" });
 // don't flicker the UI on top of fast post-index responses.
 const showFilteringBanner = ref(false);
 let filteringBannerTimer = null;
+// True from request start until the get_tickets_summary response lands.
+// Drives "…" placeholders on the KPI cards so the user doesn't stare at
+// stale sessionStorage-cached numbers while the dashboard aggregate
+// refreshes in the background. Independent of the row-skeleton `loading`
+// flag because rows usually render seconds before cards.
+const summaryPending = ref(false);
 const filters = reactive({
   status: "",
   priority: "",
@@ -1906,6 +1924,12 @@ async function load({ append = false } = {}) {
     // we await it (e.g. page errors out first, we return early below).
     summaryPromise.catch(() => undefined);
 
+    // Mark cards as pending until the summary lands. UI swaps stale
+    // cached values for "…" placeholders so the user doesn't see an
+    // out-of-date count for the 10+ seconds the dashboard aggregate
+    // can take on a cold buffer pool.
+    summaryPending.value = true;
+
     const pageData = await pagePromise;
     if (requestId !== activeRequestId) return;
     if (append) {
@@ -1947,6 +1971,7 @@ async function load({ append = false } = {}) {
       result.total_count = summaryData.total_count || 0;
       result.cards = summaryData.cards || {};
     }
+    summaryPending.value = false;
 
     if (!append) {
       _writeListCache({
@@ -1988,6 +2013,9 @@ async function load({ append = false } = {}) {
         loading.value = false;
       }
       reloading.value = false;
+      // Always clear summaryPending — without this an early-return after
+      // page-resolved would leave the cards stuck at "…" forever.
+      summaryPending.value = false;
       activeController = null;
     }
   }

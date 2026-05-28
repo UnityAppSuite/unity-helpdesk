@@ -2720,14 +2720,63 @@ def _compute_tickets_page(context):
 	}
 
 
+_SUMMARY_CACHE_TTL_SECS = 30
+_SUMMARY_CACHE_PREFIX = "unity:tickets:summary"
+
+
+def _summary_cache_key(context):
+	"""Per-(user, view, filters) cache key for the dashboard cards.
+	Search-path summaries (where candidate_names is set) are not cached —
+	they'd diverge per keystroke and the cache would churn. Only the
+	empty-search list-page summary is keyed reliably.
+	"""
+	import hashlib
+
+	filter_json = json.dumps(context.get("list_filters") or [], sort_keys=True, default=str)
+	raw = "|".join(
+		[
+			_SUMMARY_CACHE_PREFIX,
+			cstr(context.get("effective_view") or ""),
+			filter_json,
+			cstr(frappe.session.user or ""),
+		]
+	)
+	return f"{_SUMMARY_CACHE_PREFIX}:{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
+
+
 def _compute_tickets_summary(context):
 	"""Return just total_count + cards for the current view + filters. The
 	search path replays the candidate ranking so the cards reflect matches,
 	not the full filter set; the empty-search path uses the single SQL
-	aggregate in _dashboard_cards_for_filters."""
+	aggregate in _dashboard_cards_for_filters.
+
+	The empty-search result is Redis-cached for _SUMMARY_CACHE_TTL_SECS
+	seconds — the aggregate is a full-table scan on a 90K-row HD Ticket
+	table, which is the dominant cost of the list-page first paint when
+	the InnoDB buffer pool is cold. KPI cards don't need real-time
+	freshness; 30 s of staleness is acceptable, and the first visitor
+	within each TTL window primes the cache for the rest.
+	"""
 	candidate_names = context["search_candidate_names"]
 	search = context["search"]
 	list_filters = context["list_filters"]
+
+	# Cache only the non-search path: the search path's candidate_rows
+	# depend on the query string and would either need per-query cache
+	# keys (which churn) or risk stale results.
+	cache_key = None
+	if candidate_names is None and not search:
+		cache_key = _summary_cache_key(context)
+		try:
+			cached_raw = frappe.cache().get_value(cache_key)
+		except Exception:
+			cached_raw = None
+		if cached_raw:
+			try:
+				return json.loads(cached_raw)
+			except (TypeError, ValueError):
+				# Cache value was malformed; fall through to recompute.
+				pass
 
 	if candidate_names is not None:
 		candidate_rows = _fetch_candidate_rows(context)
@@ -2754,7 +2803,19 @@ def _compute_tickets_summary(context):
 		cards = _dashboard_cards_for_filters(list_filters)
 		total_count = int(cards.get("total") or 0)
 
-	return {"total_count": total_count, "cards": cards}
+	result = {"total_count": total_count, "cards": cards}
+	if cache_key:
+		try:
+			frappe.cache().set_value(
+				cache_key,
+				json.dumps(result, default=str),
+				expires_in_sec=_SUMMARY_CACHE_TTL_SECS,
+			)
+		except Exception:
+			# Cache write failures are non-fatal — the response is correct,
+			# we just lose the speed-up on the next call.
+			pass
+	return result
 
 
 @frappe.whitelist()
