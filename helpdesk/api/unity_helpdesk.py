@@ -1,3 +1,4 @@
+import functools
 import html
 import json
 import re
@@ -30,6 +31,15 @@ PRIORITY_TARGETS = {
 	"Low": "2-3 days",
 }
 MAX_SEARCH_CANDIDATES = 400
+# Top-N most-recently-assigned tickets we resolve via ToDo for the "My
+# Tickets" / "Assigned: X" filters. Set high enough that no real human
+# user can hit it (the typical agent has dozens to low-hundreds of open
+# assignments). The result is still ordered by HD Ticket.modified for
+# display, so this only bounds the candidate set, not the page that
+# renders. Truncation here is preferable to falling back to the legacy
+# `_assign LIKE '%user%'` full-table scan, which is what made the SPA's
+# first paint hit 20–30 s.
+MAX_ASSIGNED_LOOKUP = 25000
 UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
@@ -73,8 +83,25 @@ def _session_user():
 	return frappe.session.user
 
 
+def _request_cache():
+	"""Per-request scratch dict on frappe.local, cleared automatically between
+	requests. Used to memoize helpers (capabilities, roles, has-field checks)
+	that get called 3–8 times per `get_tickets` request — each individually
+	cheap, but together a measurable fraction of cold first-paint latency.
+	"""
+	cache = getattr(frappe.local, "_unity_request_cache", None)
+	if cache is None:
+		cache = {}
+		frappe.local._unity_request_cache = cache
+	return cache
+
+
 def _user_roles(user=None):
-	return set(frappe.get_roles(user or _session_user()))
+	user = user or _session_user()
+	cache = _request_cache().setdefault("_user_roles", {})
+	if user not in cache:
+		cache[user] = set(frappe.get_roles(user))
+	return cache[user]
 
 
 def _is_super_admin(user=None):
@@ -89,6 +116,9 @@ def _is_super_admin(user=None):
 
 def _get_capabilities(user=None):
 	user = user or _session_user()
+	cache = _request_cache().setdefault("_capabilities", {})
+	if user in cache:
+		return cache[user]
 	roles = _user_roles(user)
 	is_super_admin = _is_super_admin(user)
 	is_helpdesk_admin = is_super_admin or HELPDESK_ADMIN_ROLE in roles
@@ -106,7 +136,7 @@ def _get_capabilities(user=None):
 	elif is_helpdesk_user:
 		role = HELPDESK_USER_ROLE
 
-	return frappe._dict(
+	capabilities = frappe._dict(
 		{
 			"role": role,
 			"can_view_my_tickets": bool(is_helpdesk_user),
@@ -117,6 +147,8 @@ def _get_capabilities(user=None):
 			"can_manage_unity_settings": bool(is_super_admin),
 		}
 	)
+	cache[user] = capabilities
+	return capabilities
 
 
 def _require_unity_access():
@@ -172,7 +204,10 @@ def _parse_json(value, fallback):
 	return value
 
 
+@functools.lru_cache(maxsize=256)
 def _has_field(doctype, fieldname):
+	# Schema doesn't change within a process — safe to cache forever.
+	# `bench migrate` reloads the worker, so the cache is fresh after deploys.
 	return frappe.get_meta(doctype).has_field(fieldname)
 
 
@@ -574,6 +609,25 @@ def _next_payment_schedule(payment_schedule_rows):
 	)
 	outstanding_rows = [row for row in rows if float(row.get("outstanding") or 0) > 0]
 	return (outstanding_rows or rows)[0]
+
+
+@frappe.whitelist()
+def get_student_context(ticket_name):
+	"""Whitelisted wrapper around `get_student_context_for_ticket` so the SPA
+	can fetch the student panel in parallel with `get_ticket_detail`.
+
+	Previously the student context was bundled into the synchronous
+	`get_ticket_detail` response, but its ~10+ Education-app `frappe.get_all`
+	calls regularly pushed the combined response over the SPA's 20 s
+	timeout (the ticket detail page rendered as a permanent skeleton).
+	With this split, the ticket header / thread renders the moment the
+	first response lands; the student panel fills in when the second
+	resolves. A slow Education app no longer hangs the whole page.
+	"""
+	capabilities = _require_unity_access()
+	_require_ticket_access(ticket_name, capabilities)
+	raised_by = frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "raised_by") or ""
+	return get_student_context_for_ticket(ticket_name=ticket_name, raised_by=raised_by)
 
 
 def get_student_context_for_ticket(ticket_name=None, raised_by=None):
@@ -1892,13 +1946,27 @@ def _search_candidate_ticket_names(base_filters, search):
 		)
 		return candidate_names
 
-	# Multi-token: each token must match in at least one searchable field
-	# (AND-of-OR). Run as a single SQL so the LIMIT applies after the AND
-	# filter, not per token — otherwise common tokens like "the" or "and"
-	# cap their per-token result at the 400 most-recently-modified rows and
-	# silently drop older tickets that do contain all the tokens.
-	candidate_names = _multi_token_candidates(tokens, search_fields, base_filters)
-	return candidate_names
+	# For long pasted queries (≥4 tokens or >60 chars), run FULLTEXT first
+	# when the index is available. The AND-of-OR LIKE path scans the whole
+	# 90K-row table and cliff-edges to zero whenever any one of the 8
+	# capped tokens is missing from the head/tail-truncated indexed body —
+	# trying it first for a long query is doubled wasted work. FULLTEXT
+	# scores partial matches and ignores stopwords automatically.
+	# Short queries like "TA16" stay on the legacy path (direct ticket-ID
+	# + Data-field LIKE handles them already).
+	is_long_query = len(tokens) >= 4 or len(cstr(query)) > 60
+	if is_long_query and _fulltext_index_available():
+		candidate_names = _fulltext_candidates(query, base_filters)
+		if candidate_names:
+			return candidate_names
+
+	# Multi-token AND-of-OR — primary path for short queries, and the
+	# fallback for long queries whose FULLTEXT search returned empty.
+	# Single SQL so the LIMIT applies after the AND filter, not per token
+	# — otherwise common tokens like "the" or "and" cap their per-token
+	# result at the 400 most-recently-modified rows and silently drop
+	# older tickets that do contain all the tokens.
+	return _multi_token_candidates(tokens, search_fields, base_filters)
 
 
 def _multi_token_candidates(tokens, search_fields, base_filters):
@@ -1961,6 +2029,100 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
 	rows = query.run(as_dict=True)
 	return {row["name"] for row in rows}
+
+
+# Columns covered by the FULLTEXT index added in
+# helpdesk/patches/unity_ticket_search_fulltext.py. Must match exactly
+# (MariaDB only uses a FULLTEXT index when the MATCH column list is
+# byte-identical to the index column list).
+_FULLTEXT_COLUMNS = (
+	"custom_search_message_body",
+	"subject",
+	"custom_search_student_names",
+	"custom_search_student_refs",
+	"custom_search_guardian_emails",
+)
+_FULLTEXT_INDEX_NAME = "search_body_ft_idx"
+
+
+@functools.lru_cache(maxsize=1)
+def _fulltext_index_available():
+	"""One-shot check: does the search_body_ft_idx FULLTEXT INDEX exist on
+	tabHD Ticket? Cached for the worker's lifetime — schema doesn't change
+	without a migrate + worker restart, and the cache avoids a per-query
+	"try MATCH AGAINST → catch 1191 → log_error" overhead when the index
+	isn't there (older deploys, fresh installs before the patch runs,
+	or sites whose MariaDB version refused the ALTER TABLE).
+	"""
+	try:
+		rows = frappe.db.sql(
+			"""SELECT 1 FROM information_schema.STATISTICS
+			   WHERE table_schema = DATABASE()
+			     AND table_name = 'tabHD Ticket'
+			     AND index_name = %s
+			   LIMIT 1""",
+			(_FULLTEXT_INDEX_NAME,),
+		)
+		return bool(rows)
+	except Exception:
+		return False
+
+
+def _fulltext_candidates(query, base_filters):
+	"""Relevance-ranked candidate set via MariaDB FULLTEXT INDEX. Used as a
+	fallback when the AND-of-OR LIKE path returns nothing for a long pasted
+	query. Tolerates a missing index (returns empty set) so the rest of the
+	search keeps working on a site where the patch hasn't run yet.
+	"""
+	# Skip entirely if the FULLTEXT index isn't on this site — saves the
+	# round-trip + 1191 exception cost on every "no AND match" query.
+	if not _fulltext_index_available():
+		return set()
+	# FULLTEXT in InnoDB ignores words shorter than
+	# innodb_ft_min_token_size (default 3) and the stopword list; strip
+	# explicitly so the query stays short and predictable.
+	cleaned_tokens = [t for t in _search_tokens(query) if len(t) >= 4]
+	if not cleaned_tokens:
+		return set()
+	# Bound the query string length — long pastes still tokenise to dozens
+	# of unique 4+-char words; 200 chars is plenty for relevance ranking.
+	cleaned = " ".join(cleaned_tokens)[:200]
+
+	col_list = ", ".join(f"`{c}`" for c in _FULLTEXT_COLUMNS)
+	sql = (
+		f"SELECT name FROM `tabHD Ticket` "
+		f"WHERE MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) "
+		f"ORDER BY MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) DESC "
+		f"LIMIT %s"
+	)
+	try:
+		rows = frappe.db.sql(sql, (cleaned, cleaned, MAX_SEARCH_CANDIDATES))
+	except Exception as exc:
+		# 1191 = "Can't find FULLTEXT index matching the column list" — the
+		# patch hasn't run on this site. Log once and degrade silently;
+		# the legacy search path still returns its (empty) result.
+		frappe.log_error(
+			title="unity search FULLTEXT fallback failed",
+			message=f"{type(exc).__name__}: {exc}",
+		)
+		return set()
+
+	candidate_names = {row[0] for row in rows if row and row[0]}
+	if not candidate_names or not base_filters:
+		return candidate_names
+
+	# Re-apply base_filters (view + permission_query scope) via a narrow
+	# IN(...) query — the raw SQL above bypassed Frappe's permission layer.
+	filtered = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=["name"],
+		filters=_merge_filters(
+			base_filters,
+			[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		),
+		page_length=len(candidate_names),
+	)
+	return {row.name for row in filtered}
 
 
 @frappe.whitelist()
@@ -2062,14 +2224,69 @@ def diagnose_ticket_thread_and_search(name, text=None):
 	}
 
 
+def _assigned_ticket_names(user):
+	"""Return the set of HD Ticket names currently assigned to `user`, resolved
+	via the indexed `tabToDo` table instead of `_assign LIKE '%user%'`.
+
+	The old LIKE filter was a guaranteed full-table scan on a 90K-row HD Ticket
+	table (leading-wildcard means no B-tree index can be used). ToDo has
+	composite indexes on (reference_type, reference_name) and on (owner), so
+	this lookup is O(matched-rows) — milliseconds even for the heaviest-loaded
+	agent.
+
+	Truncated to the most-recently-assigned MAX_ASSIGNED_LOOKUP names — well
+	above any realistic per-user assignment count. We deliberately don't fall
+	back to the LIKE filter when over the cap, because the LIKE is exactly
+	the regression this whole rewrite eliminates.
+	"""
+	if not user:
+		return set()
+	cache = _request_cache().setdefault("_assigned_ticket_names", {})
+	if user in cache:
+		return cache[user]
+	rows = frappe.get_all(
+		"ToDo",
+		filters={
+			"reference_type": TICKET_DOCTYPE,
+			"owner": user,
+			"status": "Open",
+		},
+		fields=["reference_name"],
+		# Most-recent assignments first, so silent truncation at MAX still
+		# returns the rows a user would actually be looking at.
+		order_by="creation desc",
+		page_length=MAX_ASSIGNED_LOOKUP,
+	)
+	names = {row.reference_name for row in rows if row.reference_name}
+	cache[user] = names
+	return names
+
+
+def _apply_assignee_filter(res, user):
+	"""Translate "tickets assigned to <user>" into a `name IN (...)` filter via
+	the indexed ToDo table. Mutates `res` (the filter list); caller continues
+	building other filters normally. When the user has zero open assignments,
+	emits a sentinel filter that yields an empty result without scanning the
+	table.
+	"""
+	names = _assigned_ticket_names(user)
+	if not names:
+		# Sentinel that can't be a valid ticket name — short-circuits to an
+		# empty result without touching tabHD Ticket. Cheaper than running the
+		# query and getting 0 rows back.
+		res.append([TICKET_DOCTYPE, "name", "in", ["__unity_no_assignments__"]])
+		return
+	res.append([TICKET_DOCTYPE, "name", "in", list(names)])
+
+
 def _build_filters(view="all", filters=None, assigned_agent=None):
 	filters = frappe._dict(_parse_json(filters, {}) or {})
 	res = []
 
 	if assigned_agent:
-		res.append([TICKET_DOCTYPE, "_assign", "like", f"%{assigned_agent}%"])
+		_apply_assignee_filter(res, assigned_agent)
 	elif view == "my":
-		res.append([TICKET_DOCTYPE, "_assign", "like", f"%{_session_user()}%"])
+		_apply_assignee_filter(res, _session_user())
 
 	if filters.get("status"):
 		if filters.status == "On Hold" and _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
@@ -2087,7 +2304,7 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 		if filters.assigned_to == "Unassigned":
 			res.append([TICKET_DOCTYPE, "_assign", "in", ["", "[]"]])
 		else:
-			res.append([TICKET_DOCTYPE, "_assign", "like", f"%{filters.assigned_to}%"])
+			_apply_assignee_filter(res, filters.assigned_to)
 
 	if filters.get("created_from"):
 		res.append([TICKET_DOCTYPE, "creation", ">=", filters.created_from])
@@ -2158,12 +2375,72 @@ def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
 
 
 def _dashboard_cards_for_filters(filters=None):
-	"""Compute dashboard card counts in a single SQL query.
+	"""Compute dashboard card counts.
 
-	Was 6 sequential `COUNT(*)` scans on a ~90K-row table; rewritten as one
-	`SELECT COUNT(*), SUM(CASE WHEN ...)` aggregate to keep the list page
-	responsive."""
+	Two paths:
+	- **No filters** (the common case for `/tickets/all` and `/tickets/my`
+	  without a status/priority/type filter applied): six narrow
+	  `SELECT COUNT(*) WHERE status=...` queries. Each uses a specific
+	  covering index:
+	    - `total` → clustered index on `name` (PRIMARY)
+	    - `replied/resolved/closed/pending` → `status_modified_unity_idx`
+	      composite from `unity_ticket_list_indexes`
+	    - `on_hold` → `on_hold_modified_unity_idx` composite
+	  Index-only scans run in milliseconds even on a 90K-row table; the
+	  six together sum to ~100 ms even on cold InnoDB buffer pool. The
+	  previous single `SUM(CASE)` aggregate forced a full table scan
+	  every call, which dominated the SPA's list-page first paint at 10+ s.
+	- **Filters present**: keep the single `SUM(CASE)` aggregate.
+	  Filter combinations can be arbitrary; multiplying that across six
+	  COUNTs would be N×6 round trips with worse plans than one
+	  aggregate that gets filtered down once.
+	"""
 	has_on_hold = _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
+
+	if not filters:
+		# Fast path — leverage the per-status / per-on_hold composite
+		# indexes added by unity_ticket_list_indexes for index-only scans.
+		sql = frappe.db.sql
+		try:
+			total = int(sql("SELECT COUNT(*) FROM `tabHD Ticket`")[0][0] or 0)
+			replied = int(
+				sql("SELECT COUNT(*) FROM `tabHD Ticket` WHERE status='Replied'")[0][0] or 0
+			)
+			resolved = int(
+				sql("SELECT COUNT(*) FROM `tabHD Ticket` WHERE status='Resolved'")[0][0] or 0
+			)
+			closed = int(
+				sql("SELECT COUNT(*) FROM `tabHD Ticket` WHERE status='Closed'")[0][0] or 0
+			)
+			pending = int(
+				sql(
+					"SELECT COUNT(*) FROM `tabHD Ticket` WHERE status IN ('Open','Replied')"
+				)[0][0]
+				or 0
+			)
+			on_hold = 0
+			if has_on_hold:
+				on_hold = int(
+					sql("SELECT COUNT(*) FROM `tabHD Ticket` WHERE custom_is_on_hold=1")[0][0]
+					or 0
+				)
+		except Exception:
+			# Any per-COUNT failure (DB hiccup, missing column) drops us
+			# back to the existing aggregate path; the legacy function
+			# also has its own fallback.
+			frappe.log_error("unity dashboard cards indexed COUNTs failed; falling back")
+			return _dashboard_cards_for_filters_legacy(filters)
+		return {
+			"total": total,
+			"created": total,
+			"pending": pending,
+			"on_hold": on_hold,
+			"resolved": resolved,
+			"closed": closed,
+			"replied": replied,
+		}
+
+	# Filtered path — single SUM(CASE) aggregate as before.
 	HDT = frappe.qb.DocType(TICKET_DOCTYPE)
 	q = frappe.qb.from_(HDT).select(
 		Count(HDT.name).as_("total"),
@@ -2259,9 +2536,16 @@ def _agent_map():
 
 
 def _ticket_type_options():
+	# Always-on lookup used by every SPA user via get_ticket_types(). Include
+	# `custom_color` when the field exists so TicketDetailView can render the
+	# Previous-Tickets type dot without a second round-trip. _has_field is
+	# memoised, so the existence check is cheap.
+	fields = ["name"]
+	if frappe.db.has_column("HD Ticket Type", "custom_color"):
+		fields.append("custom_color")
 	return frappe.get_all(
 		"HD Ticket Type",
-		fields=["name"],
+		fields=fields,
 		order_by="name asc",
 		page_length=0,
 	)
@@ -2358,8 +2642,33 @@ def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
 	return {"data": rows[:limit], "query": query, "view": effective_view}
 
 
-@frappe.whitelist()
-def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+def _resolve_ticket_context(view, filters, search, message_body, page_length, start):
+	"""Compute the shared context that get_tickets_page and get_tickets_summary
+	both need: capabilities, effective view, base filter list, cleaned search
+	text, and (when searching) the candidate-name set + family expansion. The
+	result is cached on `frappe.local` so the two parallel endpoints don't
+	repeat the work twice within a single request — only relevant for the
+	back-compat `get_tickets` wrapper, but harmless otherwise.
+	"""
+	# Cache key embeds the inputs so different filter combinations don't
+	# collide within the same request.
+	cache_key = (
+		"_ticket_context",
+		view,
+		json.dumps(filters or {}, sort_keys=True, default=str) if filters else "",
+		cstr(search or ""),
+		cstr(message_body or ""),
+	)
+	cache = _request_cache()
+	cached = cache.get(cache_key)
+	if cached is not None:
+		# Update pagination on each call so the same context object can be
+		# reused with different `start` / `page_length` values cheaply.
+		cached = dict(cached)
+		cached["page_length"] = int(page_length or 20)
+		cached["start"] = int(start or 0)
+		return cached
+
 	capabilities = _require_unity_access()
 	page_length = int(page_length or 20)
 	start = int(start or 0)
@@ -2387,22 +2696,67 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 				or expanded.get("student_ids")
 			):
 				search_family_terms = expanded
-	candidate_names = search_candidate_names
+
+	context = {
+		"capabilities": capabilities,
+		"effective_view": effective_view,
+		"list_filters": list_filters,
+		"fields": fields,
+		"search": search,
+		"search_candidate_names": search_candidate_names,
+		"search_family_terms": search_family_terms,
+		"page_length": page_length,
+		"start": start,
+	}
+	cache[cache_key] = context
+	return context
+
+
+def _fetch_candidate_rows(context):
+	"""For the search path, fetch the candidate-ranked rows once. The candidate
+	set is bounded at MAX_SEARCH_CANDIDATES so this is a single small query.
+	Result is cached on the context dict for the page + summary endpoints to
+	share within the same request."""
+	if "candidate_rows" in context:
+		return context["candidate_rows"]
+	candidate_names = context["search_candidate_names"]
+	if not candidate_names:
+		context["candidate_rows"] = []
+		return []
+	rows = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=context["fields"],
+		filters=_merge_filters(
+			context["list_filters"],
+			[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		),
+		order_by="modified desc",
+		page_length=min(max(len(candidate_names), 1), MAX_SEARCH_CANDIDATES),
+	)
+	context["candidate_rows"] = rows
+	return rows
+
+
+def _compute_tickets_page(context):
+	"""Return just the paginated rows for the current view + filters. Drops
+	the cards/total_count which the summary endpoint is responsible for —
+	keeps this endpoint's response small and its work minimal so the SPA
+	can paint the list as soon as it lands.
+	"""
+	page_length = context["page_length"]
+	start = context["start"]
+	candidate_names = context["search_candidate_names"]
+	search = context["search"]
+	fields = context["fields"]
+	list_filters = context["list_filters"]
+	effective_view = context["effective_view"]
 
 	if candidate_names is not None:
-		candidate_rows = (
-			frappe.get_list(
-				TICKET_DOCTYPE,
-				fields=fields,
-				filters=_merge_filters(list_filters, [[TICKET_DOCTYPE, "name", "in", list(candidate_names)]]),
-				order_by="modified desc",
-				page_length=min(max(len(candidate_names), 1), MAX_SEARCH_CANDIDATES),
-			)
-			if candidate_names
-			else []
-		)
+		candidate_rows = _fetch_candidate_rows(context)
 		ranked_ids = (
-			_ranked_ticket_ids(candidate_rows, search, family_terms=search_family_terms)
+			_ranked_ticket_ids(
+				candidate_rows, search, family_terms=context["search_family_terms"]
+			)
 			if search
 			else [
 				row.name
@@ -2426,6 +2780,92 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 				)
 			}
 		rows = [row_map[name] for name in paginated_ids if name in row_map]
+	else:
+		rows = frappe.get_list(
+			TICKET_DOCTYPE,
+			fields=fields,
+			filters=list_filters,
+			order_by="modified desc",
+			limit_start=start,
+			page_length=page_length,
+		)
+
+	return {
+		"data": _decorate_ticket_rows(rows),
+		"row_count": len(rows),
+		"start": start,
+		"page_length": page_length,
+		"view": effective_view,
+	}
+
+
+_SUMMARY_CACHE_TTL_SECS = 30
+_SUMMARY_CACHE_PREFIX = "unity:tickets:summary"
+
+
+def _summary_cache_key(context):
+	"""Per-(user, view, filters) cache key for the dashboard cards.
+	Search-path summaries (where candidate_names is set) are not cached —
+	they'd diverge per keystroke and the cache would churn. Only the
+	empty-search list-page summary is keyed reliably.
+	"""
+	import hashlib
+
+	filter_json = json.dumps(context.get("list_filters") or [], sort_keys=True, default=str)
+	raw = "|".join(
+		[
+			_SUMMARY_CACHE_PREFIX,
+			cstr(context.get("effective_view") or ""),
+			filter_json,
+			cstr(frappe.session.user or ""),
+		]
+	)
+	return f"{_SUMMARY_CACHE_PREFIX}:{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
+
+
+def _compute_tickets_summary(context):
+	"""Return just total_count + cards for the current view + filters. The
+	search path replays the candidate ranking so the cards reflect matches,
+	not the full filter set; the empty-search path uses the single SQL
+	aggregate in _dashboard_cards_for_filters.
+
+	The empty-search result is Redis-cached for _SUMMARY_CACHE_TTL_SECS
+	seconds — the aggregate is a full-table scan on a 90K-row HD Ticket
+	table, which is the dominant cost of the list-page first paint when
+	the InnoDB buffer pool is cold. KPI cards don't need real-time
+	freshness; 30 s of staleness is acceptable, and the first visitor
+	within each TTL window primes the cache for the rest.
+	"""
+	candidate_names = context["search_candidate_names"]
+	search = context["search"]
+	list_filters = context["list_filters"]
+
+	# Cache only the non-search path: the search path's candidate_rows
+	# depend on the query string and would either need per-query cache
+	# keys (which churn) or risk stale results.
+	cache_key = None
+	if candidate_names is None and not search:
+		cache_key = _summary_cache_key(context)
+		try:
+			cached_raw = frappe.cache().get_value(cache_key)
+		except Exception:
+			cached_raw = None
+		if cached_raw:
+			try:
+				return json.loads(cached_raw)
+			except (TypeError, ValueError):
+				# Cache value was malformed; fall through to recompute.
+				pass
+
+	if candidate_names is not None:
+		candidate_rows = _fetch_candidate_rows(context)
+		ranked_ids = (
+			_ranked_ticket_ids(
+				candidate_rows, search, family_terms=context["search_family_terms"]
+			)
+			if search
+			else [row.name for row in candidate_rows]
+		)
 		matched_ids = set(ranked_ids)
 		summary_rows = [
 			{
@@ -2439,28 +2879,56 @@ def get_tickets(view="all", filters=None, search=None, message_body=None, page_l
 		total_count = len(ranked_ids)
 		cards = _dashboard_cards(summary_rows)
 	else:
-		rows = frappe.get_list(
-			TICKET_DOCTYPE,
-			fields=fields,
-			filters=list_filters,
-			order_by="modified desc",
-			limit_start=start,
-			page_length=page_length,
-		)
 		cards = _dashboard_cards_for_filters(list_filters)
-		# `cards["total"]` is the same COUNT(*) the list page wants — re-use it
-		# instead of running another COUNT query.
 		total_count = int(cards.get("total") or 0)
 
-	return {
-		"data": _decorate_ticket_rows(rows),
-		"total_count": total_count,
-		"cards": cards,
-		"row_count": len(rows),
-		"start": start,
-		"page_length": page_length,
-		"view": effective_view,
-	}
+	result = {"total_count": total_count, "cards": cards}
+	if cache_key:
+		try:
+			frappe.cache().set_value(
+				cache_key,
+				json.dumps(result, default=str),
+				expires_in_sec=_SUMMARY_CACHE_TTL_SECS,
+			)
+		except Exception:
+			# Cache write failures are non-fatal — the response is correct,
+			# we just lose the speed-up on the next call.
+			pass
+	return result
+
+
+@frappe.whitelist()
+def get_tickets_page(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+	"""Paginated ticket rows for the current view + filters. Companion to
+	`get_tickets_summary`. The Unity SPA fires both in parallel so the list
+	paints as soon as the page response lands — typically tens of
+	milliseconds — without waiting for the dashboard-cards aggregate."""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	return _compute_tickets_page(context)
+
+
+@frappe.whitelist()
+def get_tickets_summary(view="all", filters=None, search=None, message_body=None):
+	"""Dashboard-card counts (total/pending/on_hold/resolved/closed/replied)
+	for the current view + filters. Companion to `get_tickets_page`. Issues
+	a single aggregate SQL via `_dashboard_cards_for_filters` (empty-search
+	path) or replays the candidate-rank set (search path)."""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length=1, start=0)
+	return _compute_tickets_summary(context)
+
+
+@frappe.whitelist()
+def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+	"""Back-compat wrapper that returns the same shape the previous monolithic
+	endpoint did — `{data, total_count, cards, row_count, start, page_length, view}`.
+	Internally calls the same helpers as `get_tickets_page` and
+	`get_tickets_summary`, sharing the candidate-rows fetch via the
+	per-request cache so no extra DB work is paid for back-compat.
+	"""
+	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	page = _compute_tickets_page(context)
+	summary = _compute_tickets_summary(context)
+	return {**page, **summary}
 
 
 def _dashboard_range(range_key="week", from_date=None, to_date=None):
@@ -2500,7 +2968,10 @@ def _dashboard_rows(from_date, to_date, assigned_agent=None):
 		[TICKET_DOCTYPE, "creation", "<=", f"{to_date} 23:59:59"],
 	]
 	if assigned_agent:
-		filters.append([TICKET_DOCTYPE, "_assign", "like", f"%{assigned_agent}%"])
+		# Same ToDo-based fast path the list page uses — avoids the
+		# `_assign LIKE '%user%'` full-table scan that previously dominated
+		# the dashboard query budget for filtered-by-agent views.
+		_apply_assignee_filter(filters, assigned_agent)
 	return frappe.get_list(
 		TICKET_DOCTYPE,
 		fields=["name", "status", "ticket_type", "creation", "modified", "custom_is_on_hold"],
@@ -2744,9 +3215,12 @@ def list_ticket_types_with_keywords():
 	capabilities = _require_unity_access()
 	if not capabilities.can_manage_unity_settings:
 		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	fields = ["name", "description", "priority", "keywords"]
+	if frappe.db.has_column("HD Ticket Type", "custom_color"):
+		fields.append("custom_color")
 	rows = frappe.get_all(
 		"HD Ticket Type",
-		fields=["name", "description", "priority", "keywords"],
+		fields=fields,
 		order_by="name asc",
 	)
 	for row in rows:
@@ -2756,6 +3230,42 @@ def list_ticket_types_with_keywords():
 			if k.strip()
 		]
 	return rows
+
+
+@frappe.whitelist()
+def update_ticket_type_color(name, color=None):
+	"""Set the SPA-displayed colour on an HD Ticket Type. Accepts any value
+	that the Frappe Color field accepts (e.g. '#3b82f6'); pass empty string
+	to clear. Admins only — same gate as update_ticket_type_keywords.
+	"""
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage ticket types"), frappe.PermissionError)
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("Ticket type name is required"))
+	if not frappe.db.exists("HD Ticket Type", name):
+		frappe.throw(_("Ticket type {0} not found").format(name), frappe.DoesNotExistError)
+	color_value = cstr(color or "").strip()
+	# Basic shape check; the Frappe Color field stores hex strings.
+	# Don't be strict — admins may paste a 3-char or 8-char hex.
+	if color_value and not (color_value.startswith("#") and 4 <= len(color_value) <= 9):
+		frappe.throw(_("Color must be a hex string like #3b82f6 (got {0})").format(color_value))
+	if not frappe.db.has_column("HD Ticket Type", "custom_color"):
+		# Silent no-op when the column hasn't been added yet (the schema
+		# patch hasn't applied on this site). End users see "Saved" in the
+		# SPA instead of a developer-facing 'run `bench migrate`' message;
+		# the SPA's loaded ticket-type list will also lack `custom_color`,
+		# so the Color column stays hidden until the column actually
+		# exists. Server-side log lets the admin diagnose.
+		frappe.logger().warning(
+			"update_ticket_type_color: custom_color column missing on tabHD Ticket Type; "
+			"skipped colour update for %s",
+			name,
+		)
+		return {"name": name, "custom_color": None, "skipped": True}
+	frappe.db.set_value("HD Ticket Type", name, "custom_color", color_value or None)
+	return {"name": name, "custom_color": color_value or None}
 
 
 @frappe.whitelist()
@@ -3339,6 +3849,14 @@ def search_contacts(query):
 	return results[:15]
 
 
+# Bound the worst-case row fetch when looking up guardians. A real school
+# has a few thousand Student Guardian rows total; a misconfigured site (or
+# a query with thousands of student ids) shouldn't be allowed to
+# materialise an unbounded result set into worker memory. Above this we
+# log and truncate.
+_GUARDIAN_LOOKUP_HARD_CAP = 5000
+
+
 def _guardian_emails_for_student_ids(student_ids):
 	"""Return {student_name: [guardian_email, ...]} for the given Student ids.
 
@@ -3346,6 +3864,10 @@ def _guardian_emails_for_student_ids(student_ids):
 	get_student_context_for_ticket (around line 620). Prefers Guardian.email_address
 	over the denormalized Student Guardian.email row. Per-student dedupe + lowercase;
 	guardians with no email are skipped. Cross-student dedupe is the caller's job.
+
+	Per-request cached on `frappe.local` — the bulk-email composer triggers
+	this on every BCC keystroke for repeated student id sets; the cache
+	collapses N consecutive identical lookups into one DB round-trip.
 	"""
 	import re as _re
 
@@ -3353,14 +3875,30 @@ def _guardian_emails_for_student_ids(student_ids):
 	if not ids:
 		return {}
 
+	# Per-request memoization keyed on the sorted id tuple. Cleared by Frappe
+	# between requests via frappe.local lifecycle.
+	cache = _request_cache().setdefault("_guardian_emails_for_student_ids", {})
+	cache_key = tuple(ids)
+	if cache_key in cache:
+		return cache[cache_key]
+
 	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 
 	rows = frappe.get_all(
 		"Student Guardian",
 		fields=["parent", "guardian", "email"],
 		filters={"parenttype": "Student", "parent": ["in", ids]},
-		page_length=0,
+		# Hard cap (vs. previous page_length=0). For a real school the join
+		# is in the low thousands at most; anything above this is a sign of
+		# misconfiguration and we'd rather log and truncate than OOM the worker.
+		page_length=_GUARDIAN_LOOKUP_HARD_CAP,
 	)
+	if len(rows) >= _GUARDIAN_LOOKUP_HARD_CAP:
+		frappe.logger().warning(
+			f"_guardian_emails_for_student_ids: Student Guardian rows hit cap "
+			f"({_GUARDIAN_LOOKUP_HARD_CAP}) for {len(ids)} student ids; "
+			f"results may be truncated"
+		)
 	guardian_ids = sorted({cstr(r.guardian).strip() for r in rows if cstr(r.guardian).strip()})
 	guardian_email_by_id = {}
 	if guardian_ids:
@@ -3368,7 +3906,7 @@ def _guardian_emails_for_student_ids(student_ids):
 			"Guardian",
 			fields=["name", "email_address"],
 			filters={"name": ["in", guardian_ids]},
-			page_length=0,
+			page_length=len(guardian_ids) + 1,
 		):
 			guardian_email_by_id[g.name] = cstr(g.email_address or "").strip().lower()
 
@@ -3382,6 +3920,7 @@ def _guardian_emails_for_student_ids(student_ids):
 		bucket = result.setdefault(sid, [])
 		if email not in bucket:
 			bucket.append(email)
+	cache[cache_key] = result
 	return result
 
 
@@ -3390,8 +3929,26 @@ def get_student_guardian_emails(student_emails):
 	"""Look up guardian emails for a list of student emails.
 
 	Used by the bulk-email composer to auto-populate BCC with each student's
-	guardian emails when a recipient matches a Student.student_email_id. Unknown
-	emails are omitted from the returned map (no entry, no error)."""
+	guardian emails when a recipient matches a Student.student_email_id.
+
+	Response shape (changed from a bare {email: [guardians]} dict):
+
+	    {
+	      "mapping": {student_email: [guardian_email, ...], ...},
+	      "diagnostic": {
+	        "input_count":            <int>,
+	        "students_matched":       <int>,  # rows where student_email_id matched
+	        "students_with_guardians": <int>, # students that yielded guardian emails
+	        "unmatched_emails":       [...],  # input emails with no Student record
+	      },
+	    }
+
+	The diagnostic block lets the SPA surface a non-blocking warning when
+	the auto-fill silently produces nothing (e.g. wrong student_email_id
+	on the env, missing Student Guardian rows). Previously the empty
+	result was indistinguishable from "no guardians on file" and
+	swallowed silently in App.vue:996.
+	"""
 	_require_unity_access()
 
 	import re as _re
@@ -3400,7 +3957,12 @@ def get_student_guardian_emails(student_emails):
 	if isinstance(raw, str):
 		raw = [raw]
 	if not isinstance(raw, (list, tuple)):
-		return {}
+		return {"mapping": {}, "diagnostic": {
+			"input_count": 0,
+			"students_matched": 0,
+			"students_with_guardians": 0,
+			"unmatched_emails": [],
+		}}
 
 	_email_re = _re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 	normalized = []
@@ -3411,21 +3973,35 @@ def get_student_guardian_emails(student_emails):
 			continue
 		seen.add(email)
 		normalized.append(email)
+
+	def _empty(unmatched=None):
+		return {
+			"mapping": {},
+			"diagnostic": {
+				"input_count": len(normalized),
+				"students_matched": 0,
+				"students_with_guardians": 0,
+				"unmatched_emails": list(unmatched or normalized),
+			},
+		}
+
 	if not normalized:
-		return {}
+		return _empty()
 
 	students = frappe.get_all(
 		"Student",
 		fields=["name", "student_email_id"],
 		filters={"student_email_id": ["in", normalized]},
-		page_length=0,
+		page_length=len(normalized) + 1,
 	)
 	if not students:
-		return {}
+		return _empty()
 
 	email_by_student_id = {
 		s.name: cstr(s.student_email_id or "").strip().lower() for s in students
 	}
+	matched_emails = set(email_by_student_id.values())
+	unmatched_emails = [e for e in normalized if e not in matched_emails]
 	guardians_by_student_id = _guardian_emails_for_student_ids(list(email_by_student_id.keys()))
 
 	mapping = {}
@@ -3434,7 +4010,15 @@ def get_student_guardian_emails(student_emails):
 		if not guardians:
 			continue
 		mapping[student_email] = guardians
-	return mapping
+	return {
+		"mapping": mapping,
+		"diagnostic": {
+			"input_count": len(normalized),
+			"students_matched": len(students),
+			"students_with_guardians": len(mapping),
+			"unmatched_emails": unmatched_emails,
+		},
+	}
 
 
 @frappe.whitelist()

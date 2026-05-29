@@ -94,6 +94,7 @@
                 <tr>
                   <th>Name</th>
                   <th>Priority</th>
+                  <th v-if="colorColumnAvailable" style="width: 90px">Color</th>
                   <th>
                     Keywords
                     <small class="muted" style="font-weight: normal">
@@ -108,6 +109,29 @@
                 <tr v-for="ticketType in ticketTypes" :key="ticketType.name">
                   <td>{{ ticketType.name }}</td>
                   <td>{{ ticketType.priority || "-" }}</td>
+                  <td v-if="colorColumnAvailable">
+                    <template v-if="editingTicketType.name === ticketType.name">
+                      <input
+                        v-model="editingTicketType.colorInput"
+                        type="color"
+                        class="ticket-type-color-input"
+                        title="Pick color for this ticket type"
+                      />
+                    </template>
+                    <template v-else>
+                      <span class="ticket-type-pill">
+                        <span
+                          class="ticket-type-dot"
+                          :style="{
+                            background: ticketType.custom_color || '#94a3b8',
+                          }"
+                        ></span>
+                        <span v-if="!ticketType.custom_color" class="muted"
+                          >none</span
+                        >
+                      </span>
+                    </template>
+                  </td>
                   <td>
                     <template v-if="editingTicketType.name === ticketType.name">
                       <input
@@ -155,13 +179,15 @@
                         class="btn small secondary"
                         @click="startTicketTypeEdit(ticketType)"
                       >
-                        Edit keywords
+                        Edit
                       </button>
                     </template>
                   </td>
                 </tr>
                 <tr v-if="!ticketTypes.length">
-                  <td colspan="4" class="empty">No ticket types found.</td>
+                  <td :colspan="colorColumnAvailable ? 5 : 4" class="empty">
+                    No ticket types found.
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -548,6 +574,7 @@ import {
   listTicketTypesWithKeywords,
   updateReplyTemplate,
   updateReplyTemplateCategory,
+  updateTicketTypeColor,
   updateTicketTypeKeywords,
   updateUnitySettings,
 } from "../api";
@@ -640,9 +667,25 @@ const creatingAgent = ref(false);
 const ticketTypes = ref([]);
 const ticketTypeError = ref("");
 const creatingTicketType = ref(false);
+// True when the backend's loaded ticket-type list includes a custom_color
+// key on at least one row. The backend strips that key when the
+// HD Ticket Type table doesn't have the custom_color column yet (e.g.
+// the schema patch hasn't applied), so this flag also gates whether we
+// expose the Color column in the UI — no half-working pickers, no
+// developer-facing "run bench migrate" prompts.
+const colorColumnAvailable = computed(() =>
+  ticketTypes.value.some((t) =>
+    Object.prototype.hasOwnProperty.call(t, "custom_color")
+  )
+);
 const savingTicketType = ref(false);
 const newTicketType = reactive({ name: "", description: "", priority: "" });
-const editingTicketType = reactive({ name: "", keywordsInput: "" });
+const editingTicketType = reactive({
+  name: "",
+  keywordsInput: "",
+  colorInput: "#94a3b8",
+  originalColor: "",
+});
 
 // --- Reply template state ---
 const categories = ref([]);
@@ -784,12 +827,18 @@ function startTicketTypeEdit(type) {
   editingTicketType.keywordsInput = Array.isArray(type.keywords)
     ? type.keywords.join(", ")
     : "";
+  // <input type="color"> requires a valid hex string — fall back to a
+  // neutral default when the type has no color set yet.
+  editingTicketType.colorInput = type.custom_color || "#94a3b8";
+  editingTicketType.originalColor = type.custom_color || "";
   ticketTypeError.value = "";
 }
 
 function cancelTicketTypeEdit() {
   editingTicketType.name = "";
   editingTicketType.keywordsInput = "";
+  editingTicketType.colorInput = "#94a3b8";
+  editingTicketType.originalColor = "";
 }
 
 async function saveTicketTypeEdit() {
@@ -801,7 +850,19 @@ async function saveTicketTypeEdit() {
       .split(",")
       .map((k) => k.trim())
       .filter(Boolean);
-    await updateTicketTypeKeywords(editingTicketType.name, keywords);
+
+    // Fire both saves in parallel. The color endpoint only writes when the
+    // value changed — saves a needless round-trip when the admin just
+    // tweaked keywords.
+    const promises = [
+      updateTicketTypeKeywords(editingTicketType.name, keywords),
+    ];
+    const newColor = editingTicketType.colorInput || "";
+    if (newColor !== editingTicketType.originalColor) {
+      promises.push(updateTicketTypeColor(editingTicketType.name, newColor));
+    }
+    await Promise.all(promises);
+
     cancelTicketTypeEdit();
     await loadTicketTypes();
   } catch (err) {

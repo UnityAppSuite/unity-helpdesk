@@ -355,6 +355,13 @@ export async function updateTicketTypeKeywords(name, keywords) {
   });
 }
 
+export async function updateTicketTypeColor(name, color) {
+  return call("helpdesk.api.unity_helpdesk.update_ticket_type_color", {
+    name,
+    color: color || "",
+  });
+}
+
 export async function updateUnitySettings(params) {
   return call("helpdesk.api.unity_helpdesk.update_unity_settings", params);
 }

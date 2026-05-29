@@ -421,23 +421,33 @@
 
     <div class="metrics" :class="{ 'metrics-stale': showFilteringBanner }">
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : result.total_count || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : result.total_count || 0
+        }}</b>
         <span>Total Tickets</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.pending || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.pending || 0
+        }}</b>
         <span>Pending</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.on_hold || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.on_hold || 0
+        }}</b>
         <span>On Hold</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.resolved || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.resolved || 0
+        }}</b>
         <span>Resolved</span>
       </div>
       <div class="metric">
-        <b>{{ showFilteringBanner ? "…" : cards.closed || 0 }}</b>
+        <b>{{
+          showFilteringBanner || summaryPending ? "…" : cards.closed || 0
+        }}</b>
         <span>Closed</span>
       </div>
     </div>
@@ -446,7 +456,9 @@
       <div class="table-header">
         <strong>{{ title }}</strong>
         <span>{{
-          showFilteringBanner ? "…" : `${result.total_count || 0} tickets`
+          showFilteringBanner || summaryPending
+            ? "…"
+            : `${result.total_count || 0} tickets`
         }}</span>
       </div>
       <div v-if="selectionCount > 0" class="bulk-action-bar">
@@ -476,6 +488,21 @@
         </button>
       </div>
       <p v-if="error" class="error">{{ error }}</p>
+      <!-- First-paint skeleton: shown only while the very first page-load query
+           is in flight. Replaces the bare "Searching…" text that previously
+           sat unchanged for the full 30 s timeout, making slow loads look
+           like a frozen UI. We render the skeleton for empty-search loads;
+           a search keystroke keeps the existing inline "Searching…" hint. -->
+      <div
+        v-else-if="loading && !tickets.length && !appliedSearch"
+        class="skeleton-rows"
+        aria-busy="true"
+        aria-label="Loading tickets"
+      >
+        <div v-for="i in 5" :key="i" class="skeleton-row">
+          <span /><span /><span /><span /><span /><span /><span />
+        </div>
+      </div>
       <p v-else-if="loading && !tickets.length" class="empty">Searching…</p>
       <p v-else-if="!tickets.length && appliedSearch" class="empty">
         No tickets found for <strong>{{ activeFilterSummary }}</strong> — try a
@@ -620,8 +647,13 @@
                     v-model="editState[ticket.name].ticket_type"
                     :class="[
                       'select-chip',
-                      ticketTypeClass(editState[ticket.name].ticket_type),
+                      !ticketTypeStyle(editState[ticket.name].ticket_type) &&
+                        ticketTypeClass(editState[ticket.name].ticket_type),
                     ]"
+                    :style="
+                      ticketTypeStyle(editState[ticket.name].ticket_type) ||
+                      null
+                    "
                     :disabled="isSaving(ticket.name)"
                     @change="
                       quickUpdate(
@@ -886,6 +918,12 @@ const dateRangeDraft = reactive({ from: "", to: "" });
 // don't flicker the UI on top of fast post-index responses.
 const showFilteringBanner = ref(false);
 let filteringBannerTimer = null;
+// True from request start until the get_tickets_summary response lands.
+// Drives "…" placeholders on the KPI cards so the user doesn't stare at
+// stale sessionStorage-cached numbers while the dashboard aggregate
+// refreshes in the background. Independent of the row-skeleton `loading`
+// flag because rows usually render seconds before cards.
+const summaryPending = ref(false);
 const filters = reactive({
   status: "",
   priority: "",
@@ -1854,37 +1892,93 @@ async function load({ append = false } = {}) {
   reloadPrompt.value = false;
   emptyMessage.value = "No tickets found.";
   try {
-    const data = await callWithRetry(
-      "helpdesk.api.unity_helpdesk.get_tickets",
-      {
-        view: props.view,
-        filters: cleanFilters(),
-        search: appliedSearch.value,
-        page_length: result.page_length,
-        start: append ? tickets.value.length : 0,
+    const params = {
+      view: props.view,
+      filters: cleanFilters(),
+      search: appliedSearch.value,
+      page_length: result.page_length,
+      start: append ? tickets.value.length : 0,
+    };
+    const callOptions = {
+      signal: activeController.signal,
+      timeoutMs: appliedSearch.value.trim() ? 20000 : 30000,
+      idempotent: true,
+      onAttempt: () => {
+        if (requestId === activeRequestId) reloading.value = true;
       },
-      {
-        signal: activeController.signal,
-        timeoutMs: appliedSearch.value.trim() ? 20000 : 30000,
-        idempotent: true,
-        onAttempt: () => {
-          if (requestId === activeRequestId) reloading.value = true;
-        },
-      }
+    };
+    // Fire the two split endpoints in parallel. The page response paints the
+    // list immediately; the summary response fills in the KPI cards a beat
+    // later. Both share the same per-request server-side context so there's
+    // no duplicate query work, just two TCP roundtrips overlapping.
+    const pagePromise = callWithRetry(
+      "helpdesk.api.unity_helpdesk.get_tickets_page",
+      params,
+      callOptions
     );
+    const summaryPromise = callWithRetry(
+      "helpdesk.api.unity_helpdesk.get_tickets_summary",
+      {
+        view: params.view,
+        filters: params.filters,
+        search: params.search,
+      },
+      callOptions
+    );
+    // Don't leave the unhandled-rejection warning if summary throws before
+    // we await it (e.g. page errors out first, we return early below).
+    summaryPromise.catch(() => undefined);
+
+    // Mark cards as pending until the summary lands. UI swaps stale
+    // cached values for "…" placeholders so the user doesn't see an
+    // out-of-date count for the 10+ seconds the dashboard aggregate
+    // can take on a cold buffer pool.
+    summaryPending.value = true;
+
+    const pageData = await pagePromise;
     if (requestId !== activeRequestId) return;
     if (append) {
-      result.data = [...result.data, ...(data.data || [])];
-      result.total_count = data.total_count || 0;
-      result.cards = data.cards || {};
-      result.start = data.start || result.start;
+      result.data = [...result.data, ...(pageData.data || [])];
+      result.start = pageData.start || result.start;
       // Do not overwrite result.page_length — user selection is source of truth.
     } else {
-      result.data = data.data || [];
-      result.total_count = data.total_count || 0;
-      result.cards = data.cards || {};
-      result.start = data.start || 0;
+      result.data = pageData.data || [];
+      result.start = pageData.start || 0;
       // Do not overwrite result.page_length — user selection is source of truth.
+    }
+    syncEditState(pageData.data || []);
+
+    // Page is on screen — drop the "Loading…" indicator now so the cards
+    // refresh feels independent of the row render.
+    if (requestId === activeRequestId && !append) {
+      loading.value = false;
+    }
+
+    // Cards arrive in their own beat. If they error, keep whatever cards we
+    // were showing rather than zero-ing them out.
+    let summaryData = null;
+    try {
+      summaryData = await summaryPromise;
+    } catch (summaryErr) {
+      if (
+        summaryErr instanceof AuthRedirectError ||
+        summaryErr?.code === "AUTH_REDIRECT" ||
+        summaryErr?.code === "REQUEST_ABORTED"
+      ) {
+        // Auth/abort already handled upstream — just bail.
+        return;
+      }
+      // Non-fatal: keep stale cards, don't blank the UI.
+      console.warn("[unity-helpdesk] cards summary failed:", summaryErr);
+    }
+    if (requestId !== activeRequestId) return;
+    if (summaryData) {
+      result.total_count = summaryData.total_count || 0;
+      result.cards = summaryData.cards || {};
+    }
+    summaryPending.value = false;
+
+    if (!append) {
       _writeListCache({
         data: result.data,
         total_count: result.total_count,
@@ -1892,7 +1986,6 @@ async function load({ append = false } = {}) {
         start: result.start,
       });
     }
-    syncEditState(data.data || []);
   } catch (err) {
     if (requestId !== activeRequestId || err.code === "REQUEST_ABORTED") {
       return;
@@ -1925,6 +2018,9 @@ async function load({ append = false } = {}) {
         loading.value = false;
       }
       reloading.value = false;
+      // Always clear summaryPending — without this an early-return after
+      // page-resolved would leave the cards stuck at "…" forever.
+      summaryPending.value = false;
       activeController = null;
     }
   }
@@ -2087,5 +2183,25 @@ function ticketTypeClass(ticketType) {
   if (["calling", "result"].includes(value)) return "pink";
   if (["walmiki"].includes(value)) return "yellow";
   return "green";
+}
+
+// Returns an inline style override when the HD Ticket Type has a
+// custom_color picked in Settings. Falls back to null so the caller
+// keeps the existing hardcoded ticketTypeClass tint for types
+// without a configured colour. The "+1a" suffix (~10% opacity) gives
+// a subtle background tint while the full colour drives the border
+// and text — same visual rhythm as the hardcoded classes.
+function ticketTypeStyle(ticketType) {
+  if (!ticketType) return null;
+  const match = (ticketTypes.value || []).find(
+    (t) => t && t.name === ticketType
+  );
+  const color = match?.custom_color;
+  if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return null;
+  return {
+    color: color,
+    background: color + "1a",
+    borderColor: color,
+  };
 }
 </script>

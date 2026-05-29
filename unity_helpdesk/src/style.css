@@ -2093,10 +2093,43 @@ tbody tr.bulk-email-ticket:hover {
 }
 
 .previous-ticket-row--outgoing td {
-  background: #eff6ff;
+  background: #dbeafe;
+}
+.previous-ticket-row--outgoing td:first-child {
+  box-shadow: inset 3px 0 0 #3b82f6;
 }
 .previous-ticket-row--reply td {
-  background: #ecfdf5;
+  background: #dcfce7;
+}
+.previous-ticket-row--reply td:first-child {
+  box-shadow: inset 3px 0 0 #16a34a;
+}
+
+/* Ticket-type pill rendering — circular color dot followed by the type
+   name. Used in the Previous Tickets panel of the ticket detail page and
+   anywhere else we want a compact visual category cue. Color comes from
+   HD Ticket Type.custom_color (admin-configurable via the Settings UI). */
+.ticket-type-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.ticket-type-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  flex: 0 0 auto;
+}
+/* Slightly larger swatch in the Settings table where the admin picks it. */
+.ticket-type-color-input {
+  width: 48px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  background: transparent;
 }
 
 .ticket-origin-tag {
@@ -2630,6 +2663,47 @@ tbody tr.bulk-email-ticket:hover {
 .skeleton-side-lg {
   min-height: 360px;
 }
+
+/* List-page skeleton — five rows of varied-width shimmer blocks that match
+   the cadence of the real ticket table. Used while the first page-load
+   query is in flight, so the SPA never shows the bare "Searching…" text
+   that previously stuck for the full 30 s timeout when the backend hung. */
+.skeleton-rows {
+  display: grid;
+  gap: 8px;
+  padding: 12px 16px 24px;
+}
+
+.skeleton-row {
+  display: grid;
+  grid-template-columns: 24px minmax(72px, 110px) minmax(0, 1fr) minmax(80px, 140px) minmax(80px, 140px) minmax(80px, 140px) minmax(80px, 110px);
+  gap: 12px;
+  align-items: center;
+  min-height: 36px;
+  border-radius: var(--radius, 6px);
+}
+
+.skeleton-row > span {
+  display: block;
+  height: 14px;
+  border-radius: 4px;
+  background:
+    linear-gradient(
+      90deg,
+      rgba(226, 232, 240, 0.7) 0%,
+      rgba(241, 245, 249, 0.95) 45%,
+      rgba(226, 232, 240, 0.7) 100%
+    );
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 1.25s linear infinite;
+}
+
+/* Stagger the shimmer phase so the rows don't pulse in unison — looks
+   livelier and less "loading bar"-like. */
+.skeleton-row:nth-child(2) > span { animation-delay: 0.08s; }
+.skeleton-row:nth-child(3) > span { animation-delay: 0.16s; }
+.skeleton-row:nth-child(4) > span { animation-delay: 0.24s; }
+.skeleton-row:nth-child(5) > span { animation-delay: 0.32s; }
 
 @keyframes skeleton-shimmer {
   from {

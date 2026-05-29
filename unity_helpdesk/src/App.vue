@@ -980,21 +980,70 @@ async function refreshGuardianEmails() {
   }
   guardiansLoading.value = true;
   try {
-    const result = await call(
+    const response = await call(
       "helpdesk.api.unity_helpdesk.get_student_guardian_emails",
       { student_emails: JSON.stringify(studentEmails) }
     );
+    // Backend now returns { mapping, diagnostic }. Old shape was a bare
+    // { email: [guardians] } dict — keep a defensive fallback so the SPA
+    // still renders if it talks to an older backend during a deploy.
+    const mapping =
+      response && response.mapping ? response.mapping : response || {};
+    const diagnostic = (response && response.diagnostic) || null;
+
     const seen = new Set();
     for (const studentEmail of studentEmails) {
-      const guardians = (result || {})[studentEmail] || [];
+      const guardians = mapping[studentEmail] || [];
       for (const g of guardians) {
         const email = (g || "").toLowerCase().trim();
         if (email && EMAIL_REGEX.test(email)) seen.add(email);
       }
     }
     guardianEmails.value = [...seen].join(", ");
-  } catch {
-    // Silent — keep current textarea content if lookup fails.
+
+    // Surface a non-blocking warning when the lookup yielded nothing.
+    // Replaces the previous silent catch — the user used to think the
+    // checkbox was broken when actually their Student records simply
+    // didn't have student_email_id set on this site.
+    if (diagnostic) {
+      if (diagnostic.input_count > 0 && diagnostic.students_matched === 0) {
+        bulkEmailWarning.value =
+          `Couldn't find guardians for any of the ${diagnostic.input_count} student email(s) ` +
+          `in BCC — verify each address is set on a Student.student_email_id ` +
+          `record. Run \`bench --site <site> execute helpdesk.api.unity_perf.diagnose_guardian_lookup ` +
+          `--kwargs '{"emails":[...]}'\` to see exactly which step fails.`;
+      } else if (
+        diagnostic.input_count > 0 &&
+        diagnostic.students_with_guardians === 0
+      ) {
+        bulkEmailWarning.value =
+          `Matched ${diagnostic.students_matched} student(s), but none have guardian ` +
+          `emails on file. Check the Student.guardians child table.`;
+      } else if (
+        diagnostic.unmatched_emails &&
+        diagnostic.unmatched_emails.length
+      ) {
+        // Partial match — let the user know which addresses didn't resolve.
+        bulkEmailWarning.value =
+          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} BCC ` +
+          `address(es) had no matching Student record: ` +
+          diagnostic.unmatched_emails.slice(0, 5).join(", ") +
+          (diagnostic.unmatched_emails.length > 5 ? ", ..." : "");
+      } else {
+        // Clear any stale warning from a previous attempt.
+        bulkEmailWarning.value = "";
+      }
+    }
+  } catch (err) {
+    // Don't blank the textarea if a network/auth error hits — keep the
+    // last known guardian list, but surface a hint so the user isn't
+    // left wondering why the checkbox seemed to do nothing.
+    if (err instanceof AuthRedirectError || err?.code === "AUTH_REDIRECT") {
+      return;
+    }
+    bulkEmailWarning.value =
+      "Couldn't load guardian emails — keeping previous list. " +
+      (err?.message || "Retry by toggling the checkbox.");
   } finally {
     guardiansLoading.value = false;
   }

@@ -51,12 +51,14 @@ def ensure_unity_custom_fields():
 		unity_helpdesk_student_search_fields,
 		unity_reply_link_field,
 		unity_ticket_message_search_fields,
+		unity_ticket_type_color_field,
 	)
 
 	unity_helpdesk_student_search_fields.execute()
 	unity_ticket_message_search_fields.execute()
 	unity_helpdesk_portal_origin_fields.execute()
 	unity_reply_link_field.execute()
+	unity_ticket_type_color_field.execute()
 
 
 def add_support_redirect_to_tickets():

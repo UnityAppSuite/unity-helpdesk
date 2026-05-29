@@ -373,7 +373,18 @@
                         </span>
                       </td>
                       <td>{{ row.subject || "-" }}</td>
-                      <td>{{ row.ticket_type || "-" }}</td>
+                      <td>
+                        <span v-if="row.ticket_type" class="ticket-type-pill">
+                          <span
+                            class="ticket-type-dot"
+                            :style="{
+                              background: ticketTypeColor(row.ticket_type),
+                            }"
+                          ></span>
+                          {{ row.ticket_type }}
+                        </span>
+                        <span v-else>-</span>
+                      </td>
                       <td>{{ formatDate(row.creation) }}</td>
                       <td>{{ row.status || "-" }}</td>
                     </tr>
@@ -1411,6 +1422,12 @@ async function loadTicket() {
       if (requestId === activeTicketRequestId) {
         loadPreviousTicketDetails();
         loadRepliedToSummary();
+        // Fire the student-context call separately so its ~10+ Education
+        // app frappe.get_all queries don't sit inside the get_ticket_detail
+        // response and push it over the 20 s timeout. The student panel
+        // fills in when this lands; the rest of the page is already
+        // visible by then.
+        loadStudentContext();
       }
     });
   } catch (err) {
@@ -1431,6 +1448,27 @@ async function loadTicket() {
       loading.value = false;
       reloading.value = false;
     }
+  }
+}
+
+async function loadStudentContext() {
+  // Render the page even if this hangs / errors — the rest of the ticket
+  // is independent of the Education-app joins. Times out at 15 s on the
+  // outside; failures fall back to the existing "unmatched" placeholder
+  // copy that the panel already handles.
+  if (!ticket.value?.name) return;
+  try {
+    const ctx = await call(
+      "helpdesk.api.unity_helpdesk.get_student_context",
+      { ticket_name: ticket.value.name },
+      { timeoutMs: 15000, idempotent: true }
+    );
+    if (ctx) {
+      ticket.value.student_context = ctx;
+    }
+  } catch (err) {
+    // Non-fatal — log once for debugging, keep the rest of the page usable.
+    console.warn("[unity-helpdesk] student-context load failed:", err);
   }
 }
 
@@ -1565,6 +1603,15 @@ function previousTicketRowClass(row) {
   if (isOutgoingTicket(row)) return "previous-ticket-row--outgoing";
   if (row?.custom_replied_to_ticket) return "previous-ticket-row--reply";
   return "";
+}
+
+function ticketTypeColor(name) {
+  // Look the colour up in the in-memory ticket-types list (already loaded
+  // by App.vue / loadLookups). Fallback to a muted grey when the type has
+  // no custom_color set or the lookup hasn't populated yet.
+  if (!name) return "#94a3b8";
+  const match = (ticketTypes.value || []).find((t) => t && t.name === name);
+  return (match && match.custom_color) || "#94a3b8";
 }
 
 async function saveTicket() {

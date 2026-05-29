@@ -22,7 +22,12 @@ import time
 
 import frappe
 
-BATCH_SIZE = 200
+BATCH_SIZE = 50
+# Idle gap between batches. Lets foreground SPA requests acquire row locks and
+# keeps the InnoDB buffer pool from being flooded by the backfill's UPDATE
+# stream. ~3× slower wall-clock for the full sweep, but the SPA's list-page
+# query stays responsive throughout.
+_BATCH_SLEEP_SEC = 0.2
 # Threshold for considering the backfill "done enough" to skip on subsequent
 # migrates. 0.5% covers cases where a few rows legitimately have an empty body
 # (no description, no replies) — those would otherwise keep tripping re-runs.
@@ -108,3 +113,5 @@ def run_message_search_rebuild():
 		if len(rows) < BATCH_SIZE:
 			break
 		start += BATCH_SIZE
+		# Yield to foreground requests + give InnoDB room to flush.
+		time.sleep(_BATCH_SLEEP_SEC)

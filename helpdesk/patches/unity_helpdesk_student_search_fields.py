@@ -17,6 +17,13 @@ import time
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+# Batched sweep size + inter-batch sleep. Tighter than the message-search
+# rebuild because populate_ticket_student_search_fields may hit the education
+# app (network round-trip) per ticket, so we don't want a single batch to
+# starve the RQ worker.
+_BATCH = 50
+_BATCH_SLEEP_SEC = 0.2
+
 # Index on raised_by accelerates both the backfill UPDATE and the runtime
 # guardian-family search path (full-table scan -> ~1ms). Cheap idempotent add.
 _RAISED_BY_INDEX = "raised_by_unity_idx"
@@ -174,7 +181,13 @@ def _backfill_is_complete():
 def run_student_search_backfill():
 	"""Background job: populate custom_search_student_* fields for tickets that
 	don't have them yet. Idempotent — re-running on a fully-populated DB is a
-	single COUNT(*) and then a return."""
+	single COUNT(*) and then a return.
+
+	Refactored to fetch in paginated batches instead of loading every pending
+	ticket into memory at once (the old `page_length=0` query loaded ~90K
+	rows on UAT). Each batch commits + sleeps briefly so foreground SPA
+	requests stay responsive while the sweep is running.
+	"""
 	if _backfill_is_complete():
 		frappe.logger().info(
 			"[unity-patch] student-search-backfill: already complete, skipping"
@@ -189,19 +202,20 @@ def run_student_search_backfill():
 	if not frappe.db.has_column("HD Ticket", "custom_search_student_names"):
 		return
 
-	tickets = frappe.get_all(
-		"HD Ticket",
-		filters=[["HD Ticket", "custom_search_student_names", "is", "not set"]],
-		fields=["name", "raised_by"],
-		page_length=0,
-	)
-
-	if not tickets:
-		return
-
-	_BATCH = 100
-	for i in range(0, len(tickets), _BATCH):
-		batch = tickets[i : i + _BATCH]
+	while True:
+		# Re-query each batch so as soon as the field is populated, the row
+		# drops out of the "pending" set — limit_start always points at the
+		# next pending head. Avoids needing to track offsets manually and
+		# survives concurrent runtime writes.
+		batch = frappe.get_all(
+			"HD Ticket",
+			filters=[["HD Ticket", "custom_search_student_names", "is", "not set"]],
+			fields=["name", "raised_by"],
+			order_by="modified desc",
+			page_length=_BATCH,
+		)
+		if not batch:
+			break
 		for t in batch:
 			try:
 				populate_ticket_student_search_fields(t.name)
@@ -211,3 +225,6 @@ def run_student_search_backfill():
 					"unity_helpdesk_student_search_fields backfill",
 				)
 		frappe.db.commit()
+		if len(batch) < _BATCH:
+			break
+		time.sleep(_BATCH_SLEEP_SEC)
