@@ -149,10 +149,13 @@ def get_ticket_detail(name):
     decorated.communications = thread_components.communications
     decorated.comments = thread_components.comments
     decorated.thread = thread_components.thread
-    decorated.student_context = get_student_context_for_ticket(
-        ticket_name=name,
-        raised_by=decorated.get("raised_by"),
-    )
+    # student_context used to be computed synchronously here, but its
+    # ~10+ frappe.get_all calls against Education-app DocTypes pushed the
+    # combined response over the SPA's 20s timeout, causing the ticket
+    # detail page to render as a permanent skeleton. The SPA now fires
+    # helpdesk.api.unity_helpdesk.get_student_context in parallel and
+    # fills the panel in when it lands; this endpoint returns as soon as
+    # the thread+history are ready.
 
     return decorated
 

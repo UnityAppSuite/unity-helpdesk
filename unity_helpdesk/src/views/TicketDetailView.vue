@@ -1422,6 +1422,12 @@ async function loadTicket() {
       if (requestId === activeTicketRequestId) {
         loadPreviousTicketDetails();
         loadRepliedToSummary();
+        // Fire the student-context call separately so its ~10+ Education
+        // app frappe.get_all queries don't sit inside the get_ticket_detail
+        // response and push it over the 20 s timeout. The student panel
+        // fills in when this lands; the rest of the page is already
+        // visible by then.
+        loadStudentContext();
       }
     });
   } catch (err) {
@@ -1442,6 +1448,27 @@ async function loadTicket() {
       loading.value = false;
       reloading.value = false;
     }
+  }
+}
+
+async function loadStudentContext() {
+  // Render the page even if this hangs / errors — the rest of the ticket
+  // is independent of the Education-app joins. Times out at 15 s on the
+  // outside; failures fall back to the existing "unmatched" placeholder
+  // copy that the panel already handles.
+  if (!ticket.value?.name) return;
+  try {
+    const ctx = await call(
+      "helpdesk.api.unity_helpdesk.get_student_context",
+      { ticket_name: ticket.value.name },
+      { timeoutMs: 15000, idempotent: true }
+    );
+    if (ctx) {
+      ticket.value.student_context = ctx;
+    }
+  } catch (err) {
+    // Non-fatal — log once for debugging, keep the rest of the page usable.
+    console.warn("[unity-helpdesk] student-context load failed:", err);
   }
 }
 

@@ -647,8 +647,13 @@
                     v-model="editState[ticket.name].ticket_type"
                     :class="[
                       'select-chip',
-                      ticketTypeClass(editState[ticket.name].ticket_type),
+                      !ticketTypeStyle(editState[ticket.name].ticket_type) &&
+                        ticketTypeClass(editState[ticket.name].ticket_type),
                     ]"
+                    :style="
+                      ticketTypeStyle(editState[ticket.name].ticket_type) ||
+                      null
+                    "
                     :disabled="isSaving(ticket.name)"
                     @change="
                       quickUpdate(
@@ -2178,5 +2183,25 @@ function ticketTypeClass(ticketType) {
   if (["calling", "result"].includes(value)) return "pink";
   if (["walmiki"].includes(value)) return "yellow";
   return "green";
+}
+
+// Returns an inline style override when the HD Ticket Type has a
+// custom_color picked in Settings. Falls back to null so the caller
+// keeps the existing hardcoded ticketTypeClass tint for types
+// without a configured colour. The "+1a" suffix (~10% opacity) gives
+// a subtle background tint while the full colour drives the border
+// and text — same visual rhythm as the hardcoded classes.
+function ticketTypeStyle(ticketType) {
+  if (!ticketType) return null;
+  const match = (ticketTypes.value || []).find(
+    (t) => t && t.name === ticketType
+  );
+  const color = match?.custom_color;
+  if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return null;
+  return {
+    color: color,
+    background: color + "1a",
+    borderColor: color,
+  };
 }
 </script>

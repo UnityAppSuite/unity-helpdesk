@@ -40,6 +40,14 @@ def execute():
 		if not frappe.db.exists("DocType", "HD Ticket Type"):
 			_report("INFO", "HD Ticket Type doctype not present yet — nothing to do")
 			return
+
+		# Short-circuit when the column is already there. This makes the
+		# patch genuinely idempotent even when its tabPatch Log entry has
+		# been deleted to force a re-run.
+		if frappe.db.has_column("HD Ticket Type", "custom_color"):
+			_report("INFO", "custom_color column already present on tabHD Ticket Type — skipping")
+			return
+
 		create_custom_fields(
 			{
 				"HD Ticket Type": [
@@ -58,7 +66,40 @@ def execute():
 			update=True,
 		)
 		frappe.clear_cache(doctype="HD Ticket Type")
-		_report("INFO", "custom_color field ensured on HD Ticket Type")
+		frappe.db.commit()
+
+		# Belt-and-braces: create_custom_fields inserts the Custom Field
+		# doc and relies on a deferred meta reload to materialise the
+		# column. On sites where that reload didn't fire (e.g.
+		# `bench migrate --skip-failing` swallowed the underlying error
+		# and still logged the patch as done), the Custom Field record
+		# exists but the column doesn't, so every list/save fails with
+		# 'Unknown column'. Force-add the column directly if it's still
+		# missing after the create_custom_fields call.
+		if not frappe.db.has_column("HD Ticket Type", "custom_color"):
+			_report(
+				"INFO",
+				"custom_color column missing after create_custom_fields; "
+				"falling back to ALTER TABLE",
+			)
+			# Frappe Color fields are stored as VARCHAR(140). Match the
+			# default so downstream Frappe code doesn't surprise itself.
+			frappe.db.sql(
+				"ALTER TABLE `tabHD Ticket Type` ADD COLUMN `custom_color` varchar(140) DEFAULT NULL"
+			)
+			frappe.db.commit()
+
+		if frappe.db.has_column("HD Ticket Type", "custom_color"):
+			_report("INFO", "custom_color field ensured on HD Ticket Type")
+		else:
+			# Both paths failed — surface loudly so the operator sees it
+			# in migrate output (rather than the SPA quietly skipping
+			# colour saves forever).
+			_report(
+				"ERROR",
+				"custom_color column still missing after fallback ALTER TABLE — "
+				"check tabPatch Log + tabCustom Field for inconsistent state",
+			)
 	except Exception as exc:
 		_report("ERROR", f"add_custom_field failed: {exc}")
 		frappe.log_error(

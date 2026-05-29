@@ -143,9 +143,18 @@ def run_endpoint_benchmark(view="all", page_length=20):
 	# per-request cache between cold/warm so we measure the underlying work
 	# cost, not the request-scoped memoization (which doesn't survive across
 	# real HTTP requests anyway).
+	def _clear_request_cache():
+		# `frappe.local` is a werkzeug Local proxy — it doesn't expose
+		# __dict__, but delattr is supported. Wrap in try/except because
+		# the attribute may not exist on the first call.
+		try:
+			delattr(frappe.local, "_unity_request_cache")
+		except AttributeError:
+			pass
+
 	def _time_call(label, fn, *args, **kwargs):
 		# Cold: clear the per-request cache so the first call pays the full cost.
-		frappe.local.__dict__.pop("_unity_request_cache", None)
+		_clear_request_cache()
 		t0 = time.perf_counter()
 		try:
 			fn(*args, **kwargs)

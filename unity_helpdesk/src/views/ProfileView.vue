@@ -94,7 +94,7 @@
                 <tr>
                   <th>Name</th>
                   <th>Priority</th>
-                  <th style="width: 90px">Color</th>
+                  <th v-if="colorColumnAvailable" style="width: 90px">Color</th>
                   <th>
                     Keywords
                     <small class="muted" style="font-weight: normal">
@@ -109,7 +109,7 @@
                 <tr v-for="ticketType in ticketTypes" :key="ticketType.name">
                   <td>{{ ticketType.name }}</td>
                   <td>{{ ticketType.priority || "-" }}</td>
-                  <td>
+                  <td v-if="colorColumnAvailable">
                     <template v-if="editingTicketType.name === ticketType.name">
                       <input
                         v-model="editingTicketType.colorInput"
@@ -185,7 +185,9 @@
                   </td>
                 </tr>
                 <tr v-if="!ticketTypes.length">
-                  <td colspan="5" class="empty">No ticket types found.</td>
+                  <td :colspan="colorColumnAvailable ? 5 : 4" class="empty">
+                    No ticket types found.
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -665,6 +667,17 @@ const creatingAgent = ref(false);
 const ticketTypes = ref([]);
 const ticketTypeError = ref("");
 const creatingTicketType = ref(false);
+// True when the backend's loaded ticket-type list includes a custom_color
+// key on at least one row. The backend strips that key when the
+// HD Ticket Type table doesn't have the custom_color column yet (e.g.
+// the schema patch hasn't applied), so this flag also gates whether we
+// expose the Color column in the UI — no half-working pickers, no
+// developer-facing "run bench migrate" prompts.
+const colorColumnAvailable = computed(() =>
+  ticketTypes.value.some((t) =>
+    Object.prototype.hasOwnProperty.call(t, "custom_color")
+  )
+);
 const savingTicketType = ref(false);
 const newTicketType = reactive({ name: "", description: "", priority: "" });
 const editingTicketType = reactive({
