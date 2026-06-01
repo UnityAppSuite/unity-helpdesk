@@ -1096,13 +1096,13 @@ tbody tr.portal-ticket:hover {
   background-color: #d1fae5;
 }
 
+/* Bulk emails use the same green as portal/single emails — no blue distinction. */
 tbody tr.bulk-email-ticket {
-  background-color: #eff6ff;
-  border-left: 3px solid #3b82f6;
+  background-color: #ecfdf5;
 }
 
 tbody tr.bulk-email-ticket:hover {
-  background-color: #dbeafe;
+  background-color: #d1fae5;
 }
 
 .cell-edit select {

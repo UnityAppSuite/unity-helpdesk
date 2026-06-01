@@ -811,6 +811,8 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			"program",
 			"custom_division",
 			"student_status",
+			"confirm_for_next_year",
+			"possible_dropout",
 			"student_mobile_number",
 			"primary_contact",
 			"whatsapp_number",
@@ -1001,6 +1003,8 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"class_number": _parse_class_number(student.get("program")),
 				"division": student.get("custom_division"),
 				"student_status": student.get("student_status"),
+				"confirm_for_next_year": student.get("confirm_for_next_year") or "",
+				"possible_dropout": bool(int(student.get("possible_dropout") or 0)),
 				"student_mobile_number": student.get("student_mobile_number"),
 				"primary_contact": student.get("primary_contact"),
 				"whatsapp_number": student.get("whatsapp_number"),
@@ -2768,17 +2772,12 @@ def _compute_tickets_page(context):
 			]
 		)
 		paginated_ids = ranked_ids[start : start + page_length]
-		row_map = {}
-		if paginated_ids:
-			row_map = {
-				row.name: row
-				for row in frappe.get_list(
-					TICKET_DOCTYPE,
-					fields=fields,
-					filters={"name": ["in", paginated_ids]},
-					page_length=len(paginated_ids),
-				)
-			}
+		# `candidate_rows` already holds every candidate with the same `fields`,
+		# and `paginated_ids` is a slice of names ranked *from* candidate_rows —
+		# so the page is already in memory. Slice it directly instead of paying a
+		# second DB round-trip (and an extra `IN (...)` scan) for rows we just
+		# fetched. row_map is keyed by name; we re-order it to the ranked slice.
+		row_map = {row.name: row for row in candidate_rows}
 		rows = [row_map[name] for name in paginated_ids if name in row_map]
 	else:
 		rows = frappe.get_list(
@@ -3713,6 +3712,32 @@ def send_open_ticket_reminders():
 			break
 
 
+def _default_bulk_recipients():
+	"""Addresses BCC'd on every bulk email, from HD Settings (blank = disabled).
+
+	Returns a de-duplicated, validated, lowercased list of strings. Surfaced to
+	the SPA via get_profile() and consumed by the bulk-email background job.
+	"""
+	# Guard against the field not yet existing on this site (it ships as an
+	# hd_settings docfield that lands on `bench migrate`). A missing OPTIONAL
+	# setting must never raise — get_profile() also carries available_columns /
+	# column_preferences, so a throw here blanks the entire ticket list.
+	if not frappe.get_meta("HD Settings").has_field("unity_bulk_email_default_recipients"):
+		return []
+	raw = frappe.db.get_single_value("HD Settings", "unity_bulk_email_default_recipients") or ""
+	out = []
+	seen = set()
+	for part in cstr(raw).replace(";", ",").replace("\n", ",").split(","):
+		email = part.strip().lower()
+		if not email or email in seen:
+			continue
+		if not frappe.utils.validate_email_address(email, throw=False):
+			continue
+		seen.add(email)
+		out.append(email)
+	return out
+
+
 @frappe.whitelist()
 def get_profile():
 	user = frappe.get_doc("User", _session_user())
@@ -3728,6 +3753,7 @@ def get_profile():
 		"settings": {
 			"unity_email_thread_layout": _default_thread_layout(),
 			"column_preferences": _load_column_preferences(),
+			"bulk_email_default_recipients": _default_bulk_recipients(),
 		},
 		"available_columns": _localized_available_columns(),
 	}
@@ -3988,18 +4014,34 @@ def get_student_guardian_emails(student_emails):
 	if not normalized:
 		return _empty()
 
+	# Match each input email against BOTH Student.student_email_id and
+	# Student.user — some sites store the contactable address on `user`.
 	students = frappe.get_all(
 		"Student",
-		fields=["name", "student_email_id"],
-		filters={"student_email_id": ["in", normalized]},
+		fields=["name", "student_email_id", "user"],
+		or_filters={
+			"student_email_id": ["in", normalized],
+			"user": ["in", normalized],
+		},
 		page_length=len(normalized) + 1,
 	)
 	if not students:
 		return _empty()
 
-	email_by_student_id = {
-		s.name: cstr(s.student_email_id or "").strip().lower() for s in students
-	}
+	normalized_set = set(normalized)
+	email_by_student_id = {}
+	for s in students:
+		email_id = cstr(s.student_email_id or "").strip().lower()
+		user_id = cstr(s.user or "").strip().lower()
+		# Key on whichever field actually matched one of the input emails.
+		if email_id in normalized_set:
+			email_by_student_id[s.name] = email_id
+		elif user_id in normalized_set:
+			email_by_student_id[s.name] = user_id
+		elif email_id:
+			email_by_student_id[s.name] = email_id
+		else:
+			email_by_student_id[s.name] = user_id
 	matched_emails = set(email_by_student_id.values())
 	unmatched_emails = [e for e in normalized if e not in matched_emails]
 	guardians_by_student_id = _guardian_emails_for_student_ids(list(email_by_student_id.keys()))

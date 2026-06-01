@@ -60,3 +60,13 @@ There are many ways you can contribute even if you don't code:
 ## License
 
 [GNU Affero General Public License v3.0](/licence.md)
+
+## Documentation
+
+Unity Helpdesk customizations on top of stock Frappe Helpdesk:
+
+- [Architecture & customizations overview](docs/) 
+- [Bulk email](docs/bulk-email.md)
+- [Configuration / HD Settings](docs/configuration.md)
+- [Education integration (students & guardians)](docs/education-integration.md)
+- [Performance](docs/performance.md)

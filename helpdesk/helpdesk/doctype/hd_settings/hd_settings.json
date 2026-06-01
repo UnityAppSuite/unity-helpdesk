@@ -39,6 +39,7 @@
   "column_break_unity_reminders",
   "unity_reminder_after_days",
   "unity_email_thread_layout",
+  "unity_bulk_email_default_recipients",
   "enable_auto_reply",
   "auto_reply_email_template",
   "misc_tab",
@@ -259,6 +260,12 @@
    "fieldtype": "Select",
    "label": "Unity Email Thread Layout",
    "options": "Classic\nChat Based"
+  },
+  {
+   "description": "Comma or newline separated addresses that receive a copy (BCC) of every bulk email. Leave blank to disable.",
+   "fieldname": "unity_bulk_email_default_recipients",
+   "fieldtype": "Small Text",
+   "label": "Default Bulk Email Recipients"
   },
   {
    "default": "0",

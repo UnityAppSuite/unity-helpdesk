@@ -61,7 +61,7 @@
         <div class="topbar-actions">
           <button class="btn" @click="openComposer = true">New Ticket</button>
           <button
-            v-if="canViewAllTickets"
+            v-if="canViewAllTickets && !route.params.ticketId"
             class="btn secondary"
             @click="openBulkEmailModal"
           >
@@ -300,11 +300,17 @@
             {{ bulkEmailWarning }}
           </p>
 
-          <label>
+          <label v-if="bulkEmail.recipients.length">
             Recipients
             <div class="recipient-multiselect recipient-multiselect--locked">
-              <span class="recipient-chip recipient-chip--locked">
-                <span class="recipient-chip-label">{{ FEEDBACK_EMAIL }}</span>
+              <span
+                v-for="chip in bulkEmail.recipients"
+                :key="chip.email"
+                class="recipient-chip recipient-chip--locked"
+              >
+                <span class="recipient-chip-label">{{
+                  chip.label || chip.email
+                }}</span>
               </span>
             </div>
           </label>
@@ -603,11 +609,15 @@ const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
-const FEEDBACK_EMAIL = "feedback@walnutedu.in";
+// Default bulk-email recipients come from HD Settings (via the profile),
+// not a hardcoded address. Returns chip objects for the recipient list.
+function defaultRecipientChips() {
+  const defaults = profile.value?.settings?.bulk_email_default_recipients;
+  if (!Array.isArray(defaults)) return [];
+  return defaults.map((email) => ({ email, name: email, label: email }));
+}
 const bulkEmail = reactive({
-  recipients: [
-    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
-  ],
+  recipients: defaultRecipientChips(),
   subject: "",
   ticket_type: "",
   message: "",
@@ -1008,25 +1018,23 @@ async function refreshGuardianEmails() {
     if (diagnostic) {
       if (diagnostic.input_count > 0 && diagnostic.students_matched === 0) {
         bulkEmailWarning.value =
-          `Couldn't find guardians for any of the ${diagnostic.input_count} student email(s) ` +
-          `in BCC — verify each address is set on a Student.student_email_id ` +
-          `record. Run \`bench --site <site> execute helpdesk.api.unity_perf.diagnose_guardian_lookup ` +
-          `--kwargs '{"emails":[...]}'\` to see exactly which step fails.`;
+          "We couldn't match any of the selected recipients to a student " +
+          "record, so no guardian emails were added.";
       } else if (
         diagnostic.input_count > 0 &&
         diagnostic.students_with_guardians === 0
       ) {
         bulkEmailWarning.value =
-          `Matched ${diagnostic.students_matched} student(s), but none have guardian ` +
-          `emails on file. Check the Student.guardians child table.`;
+          `Found ${diagnostic.students_matched} student(s), but none have a ` +
+          `guardian email on file.`;
       } else if (
         diagnostic.unmatched_emails &&
         diagnostic.unmatched_emails.length
       ) {
         // Partial match — let the user know which addresses didn't resolve.
         bulkEmailWarning.value =
-          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} BCC ` +
-          `address(es) had no matching Student record: ` +
+          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} ` +
+          `recipient(s) didn't match a student record: ` +
           diagnostic.unmatched_emails.slice(0, 5).join(", ") +
           (diagnostic.unmatched_emails.length > 5 ? ", ..." : "");
       } else {
@@ -1059,9 +1067,7 @@ function resetBulkEmail() {
   bulkEmailUploading.value = false;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  bulkEmail.recipients = [
-    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
-  ];
+  bulkEmail.recipients = defaultRecipientChips();
   bulkEmail.subject = "";
   bulkEmail.ticket_type = "";
   bulkEmail.message = "";

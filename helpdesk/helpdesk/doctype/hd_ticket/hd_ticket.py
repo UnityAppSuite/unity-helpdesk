@@ -786,9 +786,14 @@ class HDTicket(Document):
 		# Rebuild the message search index so new email content is immediately searchable.
 		# on_update only rebuilds when description/subject changes — it misses new Communications.
 		try:
-			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-			update_ticket_message_search_index(self.name)
+			# Defer the search-index rebuild to a background job so the reply
+			# request returns immediately instead of blocking on the rebuild.
+			frappe.enqueue(
+				"helpdesk.api.unity_helpdesk.update_ticket_message_search_index",
+				queue="short",
+				enqueue_after_commit=True,
+				ticket_name=self.name,
+			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "HD Ticket search index on_communication_update")
 
