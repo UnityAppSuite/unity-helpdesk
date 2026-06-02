@@ -59,7 +59,13 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <button class="btn" @click="openComposer = true">New Ticket</button>
+          <button
+            v-if="!route.params.ticketId"
+            class="btn"
+            @click="openComposer = true"
+          >
+            New Ticket
+          </button>
           <button
             v-if="canViewAllTickets && !route.params.ticketId"
             class="btn secondary"
@@ -171,17 +177,18 @@
           </label>
 
           <label>
-            Subject
+            Subject <span class="required-asterisk">*</span>
             <input
               v-model="composer.subject"
               type="text"
               placeholder="Enter ticket subject"
+              required
             />
           </label>
           <label>
-            Ticket Type
-            <select v-model="composer.ticket_type">
-              <option value="">Not set</option>
+            Ticket Type <span class="required-asterisk">*</span>
+            <select v-model="composer.ticket_type" required>
+              <option value="" disabled>Select ticket type…</option>
               <option
                 v-for="ticketType in ticketTypes"
                 :key="ticketType.name"
@@ -295,6 +302,9 @@
           <button class="btn secondary" @click="closeBulkEmail">Close</button>
         </div>
         <div class="modal-body stack">
+          <p v-if="bulkEmailSuccess" class="success-banner">
+            {{ bulkEmailSuccess }}
+          </p>
           <p v-if="bulkEmailError" class="error">{{ bulkEmailError }}</p>
           <p v-else-if="bulkEmailWarning" class="warning-banner">
             {{ bulkEmailWarning }}
@@ -314,6 +324,11 @@
               </span>
             </div>
           </label>
+          <p v-else class="muted bulk-email-default-note">
+            No default recipient is configured — this email will be sent from
+            your account. Students stay hidden in BCC. You can set a default
+            recipient in Settings.
+          </p>
 
           <label>
             Subject
@@ -607,6 +622,8 @@ const bulkEmailSending = ref(false);
 const bulkEmailUploading = ref(false);
 const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
+const bulkEmailSuccess = ref("");
+let bulkSuccessCloseTimer = null;
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
 // Default bulk-email recipients come from HD Settings (via the profile),
@@ -832,9 +849,17 @@ function removeComposerAttachment(name) {
 }
 
 async function createTicket() {
-  composerSaving.value = true;
   composerError.value = "";
   composerWarning.value = "";
+  if (!composer.subject || !composer.subject.trim()) {
+    composerError.value = "Subject is required.";
+    return;
+  }
+  if (!composer.ticket_type) {
+    composerError.value = "Ticket Type is required.";
+    return;
+  }
+  composerSaving.value = true;
   try {
     const result = await call("helpdesk.api.unity_helpdesk_ext.create_ticket", {
       subject: composer.subject,
@@ -1067,6 +1092,7 @@ function resetBulkEmail() {
   bulkEmailUploading.value = false;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
+  bulkEmailSuccess.value = "";
   bulkEmail.recipients = defaultRecipientChips();
   bulkEmail.subject = "";
   bulkEmail.ticket_type = "";
@@ -1083,6 +1109,10 @@ function resetBulkEmail() {
 }
 
 function closeBulkEmail() {
+  if (bulkSuccessCloseTimer) {
+    clearTimeout(bulkSuccessCloseTimer);
+    bulkSuccessCloseTimer = null;
+  }
   openBulkEmail.value = false;
   resetBulkEmail();
 }
@@ -1193,16 +1223,21 @@ async function sendBulkEmail() {
       bulkEmailWarning.value = result.warning;
       return;
     }
-    const message = result?.invalid_count
-      ? `Sent to ${result.queued} recipients. ${result.invalid_count} invalid email(s) were skipped.`
-      : `Sent to ${result?.queued || 0} recipients.`;
-    if (result?.ticket) {
-      sessionStorage.setItem(TICKET_NOTICE_KEY, message);
+    const count = result?.count || 0;
+    const noun = count === 1 ? "recipient" : "recipients";
+    let message = `Email queued — it will be sent to ${count} ${noun} shortly.`;
+    if (result?.invalid_count) {
+      message += ` ${result.invalid_count} invalid email address(es) were skipped.`;
     }
-    closeBulkEmail();
-    if (result?.ticket) {
-      router.push(`/tickets/${result.ticket}`);
-    }
+    // The send runs in the background (no ticket to open). Clear the form so a
+    // stray click can't re-send, show a green confirmation, then auto-close the
+    // modal shortly after so the user both sees the success and the window closes.
+    resetBulkEmail();
+    bulkEmailSuccess.value = message;
+    if (bulkSuccessCloseTimer) clearTimeout(bulkSuccessCloseTimer);
+    bulkSuccessCloseTimer = setTimeout(() => {
+      closeBulkEmail();
+    }, 2200);
   } catch (err) {
     bulkEmailError.value = err.message;
   } finally {

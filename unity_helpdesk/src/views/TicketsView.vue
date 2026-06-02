@@ -865,13 +865,9 @@ const PAGE_SIZE_OPTIONS = [20, 50, 100, 500];
 const PAGE_SIZE_STORAGE_KEY = "unity_helpdesk_page_size";
 
 function _initialPageSize() {
-  try {
-    const raw = window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
-    const n = Number(raw);
-    if (PAGE_SIZE_OPTIONS.includes(n)) return n;
-  } catch {
-    // localStorage unavailable (private mode, etc) — fall through to default.
-  }
+  // Always start at the smallest page size on load so the first paint is fast
+  // and can never inherit a stale large preference (e.g. 500) that times out.
+  // The user can still raise "Rows per page" for the rest of the session.
   return 20;
 }
 

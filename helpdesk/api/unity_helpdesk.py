@@ -40,6 +40,9 @@ MAX_SEARCH_CANDIDATES = 400
 # `_assign LIKE '%user%'` full-table scan, which is what made the SPA's
 # first paint hit 20–30 s.
 MAX_ASSIGNED_LOOKUP = 25000
+# Hard cap on rows returned by the ticket list endpoints — matches the largest
+# page-size option in the SPA and protects the query from unbounded fetches.
+MAX_TICKET_PAGE_LENGTH = 500
 UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
@@ -2654,6 +2657,12 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	repeat the work twice within a single request — only relevant for the
 	back-compat `get_tickets` wrapper, but harmless otherwise.
 	"""
+	# Clamp pagination defensively: a missing/zero value falls back to 20, and a
+	# huge value (a stale 500 preference, or a crafted request) is capped so the
+	# list query can never be asked for an unbounded number of rows and time out.
+	page_length = max(1, min(int(page_length or 20), MAX_TICKET_PAGE_LENGTH))
+	start = max(0, int(start or 0))
+
 	# Cache key embeds the inputs so different filter combinations don't
 	# collide within the same request.
 	cache_key = (
@@ -2669,13 +2678,11 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 		# Update pagination on each call so the same context object can be
 		# reused with different `start` / `page_length` values cheaply.
 		cached = dict(cached)
-		cached["page_length"] = int(page_length or 20)
-		cached["start"] = int(start or 0)
+		cached["page_length"] = page_length
+		cached["start"] = start
 		return cached
 
 	capabilities = _require_unity_access()
-	page_length = int(page_length or 20)
-	start = int(start or 0)
 	search = cstr(search or message_body or "").strip()
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
 	list_filters = _build_filters(

@@ -178,6 +178,8 @@ def create_ticket(
     _require_unity_access()
     if not subject:
         frappe.throw(_("Please enter a subject"))
+    if not ticket_type:
+        frappe.throw(_("Please select a ticket type"))
     if not raised_by:
         frappe.throw(_("Please enter customer email"))
     if not message:
@@ -564,14 +566,18 @@ def bulk_send_email(
         seen.add(email)
         valid_emails.append(email)
 
-    if not valid_emails:
-        frappe.throw(_("At least one valid email address is required"))
-
-    if len(valid_emails) > RECIPIENT_HARD_CAP:
-        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
-
     cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
     bcc_list, invalid_bcc_count = _split_email_list_with_counts(bcc)
+
+    # The default recipient (the "recipients" field, mirrored from HD Settings) is
+    # OPTIONAL — it is not mandatory to configure one. As long as there is at least
+    # one BCC student the email can be sent; when no default is configured the mail
+    # is sent from the sender's own account instead (see _bulk_send_email_job).
+    if not valid_emails and not bcc_list:
+        frappe.throw(_("Add at least one recipient (student) before sending"))
+
+    if len(valid_emails) > RECIPIENT_HARD_CAP or len(bcc_list) > RECIPIENT_HARD_CAP:
+        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
 
     if len(valid_emails) + len(cc_list) + len(bcc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
@@ -607,10 +613,13 @@ def bulk_send_email(
         ticket_type=ticket_type,
     )
 
+    # "count" is the real audience the email will reach: default recipients (TO)
+    # plus every student (BCC). The send happens in a background job, so there is
+    # no ticket to return here — the SPA shows a queued-success message instead.
     return {
         "ok": True,
         "queued": True,
-        "count": len(valid_emails),
+        "count": len(valid_emails) + len(bcc_list),
         "invalid_count": invalid_count,
         "invalid_cc_count": invalid_cc_count,
         "invalid_bcc_count": invalid_bcc_count,
@@ -665,10 +674,33 @@ def _bulk_send_email_job(
 
         sendmail_attachments = [{"file_url": name} for name in file_names]
 
-        # Log the bulk email as a Communication on the audit ticket.
-        recipients_display = ", ".join(recipients[:5])
-        if len(recipients) > 5:
-            recipients_display += f" (+{len(recipients) - 5} more)"
+        # Resolve the recipient list. Every address — the students plus the
+        # configured default/audit recipients (from HD Settings) — goes into one
+        # de-duplicated list. Frappe delivers each recipient an INDIVIDUAL email
+        # (the queue is sent one address at a time, and with expose_recipients=None
+        # the To header shows only that person's own address), so no recipient can
+        # ever see another's email. The sender (the logged-in agent) is NEVER added
+        # as a recipient — they only appear as the From address.
+        targets = []
+        target_seen = set()
+        for addr in list(bcc_list) + list(recipients) + _default_bulk_recipients():
+            key = (addr or "").lower()
+            if not key or key in target_seen:
+                continue
+            target_seen.add(key)
+            targets.append(addr)
+
+        if not targets:
+            frappe.log_error(
+                "Bulk email job had no valid recipients", "Unity Helpdesk _bulk_send_email_job"
+            )
+            return
+
+        # Log the bulk email as a Communication on the audit ticket, showing the
+        # real audience truncated for readability.
+        recipients_display = ", ".join(targets[:5])
+        if len(targets) > 5:
+            recipients_display += f" (+{len(targets) - 5} more)"
         try:
             from frappe.core.doctype.communication.email import make as make_comm
 
@@ -690,24 +722,11 @@ def _bulk_send_email_job(
                 "Unity Helpdesk bulk_send_email: Communication creation",
             )
 
-        # Build the BCC list: real recipients + extra bcc + configured default
-        # recipients (deduped). The audit ticket records the full recipient
-        # list, so default recipients can see who was emailed via that ticket.
-        bcc_recipients = []
-        seen = set()
-        for addr in list(recipients) + list(bcc_list) + _default_bulk_recipients():
-            key = addr.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            bcc_recipients.append(addr)
-
-        # ONE send: BCC to everyone so no recipient sees the others. The
-        # session user is the only visible TO recipient.
+        # Each recipient receives their own copy; expose_recipients=None hides every
+        # other recipient. CC (if any) is intentionally visible to all.
         frappe.sendmail(
-            recipients=[sender],
+            recipients=targets,
             cc=cc_list or None,
-            bcc=bcc_recipients,
             subject=subject,
             message=message,
             attachments=sendmail_attachments,
