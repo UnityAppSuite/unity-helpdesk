@@ -99,7 +99,7 @@ def execute():
 			title=f"{_PATCH_NAME}: unexpected failure",
 			message=traceback.format_exc(),
 		)
-		raise
+		# Logged above; do NOT re-raise — migrate must continue (deploy-safety).
 	finally:
 		elapsed = time.monotonic() - start
 		_report(

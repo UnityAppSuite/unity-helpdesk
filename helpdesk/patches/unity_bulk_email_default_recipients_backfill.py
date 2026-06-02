@@ -19,8 +19,14 @@ Idempotent and safe to re-run.
 
 import frappe
 
+from helpdesk.patches._unity_patch import run_patch
+
 
 def execute():
+	run_patch("unity_bulk_email_default_recipients_backfill", _run)
+
+
+def _run():
 	value = frappe.conf.get("bulk_email_default_recipients")
 	if not value:
 		return

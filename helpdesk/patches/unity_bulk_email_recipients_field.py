@@ -12,34 +12,32 @@ is enough.
 
 Hidden + read_only + no_copy. Safe to re-run.
 """
-import time
-
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+from helpdesk.patches._unity_patch import run_patch
+
 
 def execute():
-	start = time.monotonic()
-	try:
-		create_custom_fields(
-			{
-				"HD Ticket": [
-					{
-						"fieldname": "custom_bulk_email_recipients",
-						"fieldtype": "Long Text",
-						"label": "Bulk Email Recipients",
-						"read_only": 1,
-						"hidden": 1,
-						"no_copy": 1,
-						"print_hide": 1,
-						"insert_after": "custom_replied_to_ticket",
-					},
-				]
-			},
-			update=True,
-		)
-		frappe.clear_cache(doctype="HD Ticket")
-	finally:
-		frappe.logger().info(
-			f"[unity-patch] unity_bulk_email_recipients_field took {time.monotonic() - start:.2f}s"
-		)
+	run_patch("unity_bulk_email_recipients_field", _run)
+
+
+def _run():
+	create_custom_fields(
+		{
+			"HD Ticket": [
+				{
+					"fieldname": "custom_bulk_email_recipients",
+					"fieldtype": "Long Text",
+					"label": "Bulk Email Recipients",
+					"read_only": 1,
+					"hidden": 1,
+					"no_copy": 1,
+					"print_hide": 1,
+					"insert_after": "custom_replied_to_ticket",
+				},
+			]
+		},
+		update=True,
+	)
+	frappe.clear_cache(doctype="HD Ticket")

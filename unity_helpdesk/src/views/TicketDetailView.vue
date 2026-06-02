@@ -1380,33 +1380,35 @@ function threadContent(item) {
     return normalizeTicketLinksInHtml(item?.content || "");
   }
 
-  const parsedContent = parseTicketDescription(item.content || "");
-  const hasStructuredBlocks =
-    parsedContent.students.length ||
-    parsedContent.fees.length ||
-    parsedContent.previousTicketsHtml;
-  const trimmedThreadHtml = (parsedContent.remainingHtml || "").trim();
+  const raw = item.content || "";
+  const normalizedRaw = normalizeHtml(raw);
+  const isPrimary =
+    !!normalizedRaw &&
+    normalizedRaw === normalizeHtml(ticket.value?.description || "");
 
-  if (hasStructuredBlocks && hasMeaningfulHtml(trimmedThreadHtml)) {
-    return normalizeTicketLinksInHtml(trimmedThreadHtml);
-  }
-  if (hasStructuredBlocks) {
-    return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+  // ONLY the primary (first) message has its embedded student / fee / previous-
+  // ticket blocks lifted into the dedicated sections above. Every other message
+  // — agent replies and inbound customer emails — renders verbatim, so a real
+  // message can never be blanked out by the structured-block extractor. This is
+  // the guard against "missing customer content / agent reply" in the thread.
+  if (isPrimary) {
+    const parsed = parsedDescription.value || {};
+    const remaining = (parsed.remainingHtml || "").trim();
+    const hasStructuredBlocks =
+      (parsed.students && parsed.students.length) ||
+      (parsed.fees && parsed.fees.length) ||
+      parsed.previousTicketsHtml;
+    if (hasStructuredBlocks && hasMeaningfulHtml(remaining)) {
+      return normalizeTicketLinksInHtml(remaining);
+    }
+    if (hasStructuredBlocks) {
+      return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+    }
+    // No structured blocks parsed — fall back to the real content, never blank.
+    return normalizeTicketLinksInHtml(remaining || raw);
   }
 
-  const matchesDescription =
-    normalizeHtml(item.content) &&
-    normalizeHtml(item.content) === normalizeHtml(ticket.value.description);
-  if (
-    matchesDescription &&
-    hasMeaningfulHtml(parsedDescription.value.remainingHtml || "")
-  ) {
-    return normalizeTicketLinksInHtml(
-      (parsedDescription.value.remainingHtml || "").trim()
-    );
-  }
-
-  return normalizeTicketLinksInHtml(item.content || "");
+  return normalizeTicketLinksInHtml(raw);
 }
 
 function applyForm() {

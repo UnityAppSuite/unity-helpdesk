@@ -106,6 +106,6 @@ def execute():
 			title=f"{_PATCH_NAME}: add_custom_field",
 			message=traceback.format_exc(),
 		)
-		raise
+		# Logged above; do NOT re-raise — migrate must continue (deploy-safety).
 	finally:
 		_report("INFO", f"done in {time.monotonic() - start:.2f}s")

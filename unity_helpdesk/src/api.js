@@ -446,16 +446,9 @@ export async function getReplyTemplateDoc(name) {
 
 export async function searchUsers(query) {
   if (!query || query.length < 2) return [];
-  const rows = await call("frappe.client.get_list", {
-    doctype: "User",
-    fields: ["name", "full_name", "email"],
-    filters: [["enabled", "=", 1]],
-    or_filters: [
-      ["name", "like", `%${query}%`],
-      ["email", "like", `%${query}%`],
-      ["full_name", "like", `%${query}%`],
-    ],
-    page_length: 10,
+  // Access-gated, bounded, injection-safe server endpoint (prefix-ranked).
+  const rows = await call("helpdesk.api.unity_helpdesk.search_users", {
+    query,
   });
   return rows || [];
 }

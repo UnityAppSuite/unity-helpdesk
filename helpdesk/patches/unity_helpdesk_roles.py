@@ -1,22 +1,19 @@
-import time
-
 import frappe
 
+from helpdesk.patches._unity_patch import run_patch
 from helpdesk.setup.install import UNITY_HELPDESK_ROLES, ensure_unity_roles
 
 
 def execute():
-	start = time.monotonic()
-	try:
-		ensure_unity_roles()
+	run_patch("unity_helpdesk_roles", _run)
 
-		for agent_name in frappe.get_all("HD Agent", pluck="name"):
-			_assign_role_if_missing(agent_name, "Agent")
-			_assign_role_if_missing(agent_name, "Helpdesk User")
-	finally:
-		frappe.logger().info(
-			f"[unity-patch] unity_helpdesk_roles took {time.monotonic() - start:.2f}s"
-		)
+
+def _run():
+	ensure_unity_roles()
+
+	for agent_name in frappe.get_all("HD Agent", pluck="name"):
+		_assign_role_if_missing(agent_name, "Agent")
+		_assign_role_if_missing(agent_name, "Helpdesk User")
 
 
 def _assign_role_if_missing(user, role):
