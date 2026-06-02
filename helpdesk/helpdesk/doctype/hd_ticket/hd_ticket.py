@@ -536,6 +536,25 @@ class HDTicket(Document):
 			cc = cc or last_communication.cc
 			bcc = bcc or last_communication.bcc
 
+		# Unity: copy the configured default/audit recipients (HD Settings) on every
+		# outgoing reply, so a monitoring mailbox always receives a copy. They are
+		# added to BCC so the customer never sees them. De-duplicated against any
+		# existing BCC. A missing setting must never break sending.
+		try:
+			from helpdesk.api.unity_helpdesk import _default_bulk_recipients
+
+			audit_recipients = _default_bulk_recipients()
+			if audit_recipients:
+				existing = [e.strip() for e in (bcc or "").replace(";", ",").split(",") if e.strip()]
+				seen = {e.lower() for e in existing}
+				for addr in audit_recipients:
+					if addr.lower() not in seen:
+						existing.append(addr)
+						seen.add(addr.lower())
+				bcc = ", ".join(existing)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "Unity default audit-recipient BCC injection")
+
 		if recipients == "Administrator":
 			admin_email = frappe.get_value("User", "Administrator", "email")
 			recipients = admin_email
@@ -786,9 +805,14 @@ class HDTicket(Document):
 		# Rebuild the message search index so new email content is immediately searchable.
 		# on_update only rebuilds when description/subject changes — it misses new Communications.
 		try:
-			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-			update_ticket_message_search_index(self.name)
+			# Defer the search-index rebuild to a background job so the reply
+			# request returns immediately instead of blocking on the rebuild.
+			frappe.enqueue(
+				"helpdesk.api.unity_helpdesk.update_ticket_message_search_index",
+				queue="short",
+				enqueue_after_commit=True,
+				ticket_name=self.name,
+			)
 		except Exception:
 			frappe.log_error(frappe.get_traceback(), "HD Ticket search index on_communication_update")
 

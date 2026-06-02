@@ -1,5 +1,10 @@
 import DOMPurify from "dompurify";
 
+// Shown to (non-technical) users when the server fails without a human-readable
+// message. Never expose raw method paths or tracebacks in the UI.
+const GENERIC_ERROR =
+  "Something went wrong. Please try again, and contact support if it keeps happening.";
+
 export function sanitize(html) {
   return DOMPurify.sanitize(html || "", {
     ADD_ATTR: ["target", "rel"],
@@ -123,8 +128,7 @@ export async function call(method, params = {}, options = {}) {
               redirectToLogin();
               throw new AuthRedirectError();
             }
-            const message =
-              extractError(retryPayload) || `Request failed: ${method}`;
+            const message = extractError(retryPayload) || GENERIC_ERROR;
             const err = new Error(message);
             err.status = retry.status;
             err.payload = retryPayload;
@@ -140,7 +144,7 @@ export async function call(method, params = {}, options = {}) {
         redirectToLogin();
         throw new AuthRedirectError();
       }
-      const message = extractError(payload) || `Request failed: ${method}`;
+      const message = extractError(payload) || GENERIC_ERROR;
       const err = new Error(message);
       err.status = response.status;
       err.payload = payload;
@@ -442,18 +446,9 @@ export async function getReplyTemplateDoc(name) {
 
 export async function searchUsers(query) {
   if (!query || query.length < 2) return [];
-  const rows = await call("frappe.client.get_list", {
-    doctype: "User",
-    fields: ["name", "full_name", "email"],
-    filters: [
-      ["enabled", "=", 1],
-      ["user_type", "=", "System User"],
-    ],
-    or_filters: [
-      ["name", "like", `%${query}%`],
-      ["full_name", "like", `%${query}%`],
-    ],
-    page_length: 10,
+  // Access-gated, bounded, injection-safe server endpoint (prefix-ranked).
+  const rows = await call("helpdesk.api.unity_helpdesk.search_users", {
+    query,
   });
   return rows || [];
 }

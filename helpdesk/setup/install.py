@@ -39,26 +39,37 @@ def after_install():
 
 
 def ensure_unity_custom_fields():
-	"""Create Unity Helpdesk custom fields on a fresh install.
+	"""Create Unity Helpdesk custom fields (and base indexes) on a fresh install.
 
 	On `bench install-app`, Frappe marks patches in patches.txt as applied
 	without executing them — so the patches that create the unity custom
 	fields never run on a brand-new site. We invoke their execute() here
-	(both are idempotent, and their backfill loops are no-ops on a fresh
-	site that has no tickets yet)."""
+	(all are idempotent, wrapped in run_patch so one failure can't abort the
+	install, and their backfill loops are no-ops on a fresh site with no
+	tickets yet).
+
+	Order matters for `insert_after` chains: student-search fields →
+	portal-origin (custom_is_bulk_email) → reply-link (custom_replied_to_ticket)
+	→ bulk-email-recipients (inserts after custom_replied_to_ticket)."""
 	from helpdesk.patches import (
+		unity_bulk_email_recipients_field,
+		unity_canned_response_extension,
 		unity_helpdesk_portal_origin_fields,
 		unity_helpdesk_student_search_fields,
 		unity_reply_link_field,
 		unity_ticket_message_search_fields,
 		unity_ticket_type_color_field,
+		unity_ticket_type_index,
 	)
 
 	unity_helpdesk_student_search_fields.execute()
 	unity_ticket_message_search_fields.execute()
 	unity_helpdesk_portal_origin_fields.execute()
 	unity_reply_link_field.execute()
+	unity_bulk_email_recipients_field.execute()
 	unity_ticket_type_color_field.execute()
+	unity_canned_response_extension.execute()
+	unity_ticket_type_index.execute()
 
 
 def add_support_redirect_to_tickets():

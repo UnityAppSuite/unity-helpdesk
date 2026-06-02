@@ -32,3 +32,7 @@ helpdesk.patches.unity_ticket_list_indexes
 helpdesk.patches.unity_ticket_search_fulltext
 helpdesk.patches.unity_ticket_type_color_field
 helpdesk.patches.unity_post_migrate_warmup
+helpdesk.patches.unity_bulk_email_default_recipients_backfill
+helpdesk.patches.unity_owner_index
+helpdesk.patches.unity_strip_bulk_email_label
+helpdesk.patches.unity_ticket_type_index

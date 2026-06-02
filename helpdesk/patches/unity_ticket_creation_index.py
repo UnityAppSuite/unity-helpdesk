@@ -9,19 +9,17 @@ Idempotent — `frappe.db.add_index` is a no-op when the named index already
 exists, so it's safe to re-run.
 """
 
-import time
-
 import frappe
+
+from helpdesk.patches._unity_patch import run_patch
 
 
 def execute():
-	start = time.monotonic()
-	try:
-		if not frappe.db.exists("DocType", "HD Ticket"):
-			return
-		frappe.db.add_index("HD Ticket", ["creation"], index_name="creation_unity_idx")
-		frappe.db.commit()
-	finally:
-		frappe.logger().info(
-			f"[unity-patch] unity_ticket_creation_index took {time.monotonic() - start:.2f}s"
-		)
+	run_patch("unity_ticket_creation_index", _run)
+
+
+def _run():
+	if not frappe.db.exists("DocType", "HD Ticket"):
+		return
+	frappe.db.add_index("HD Ticket", ["creation"], index_name="creation_unity_idx")
+	frappe.db.commit()

@@ -877,10 +877,9 @@ const structuredStudentColumns = computed(() =>
 const structuredStudentRows = computed(() => {
   const rows = [
     ["Class", (student) => displayClassCell(student)],
-    ["PE Document Status", (student) => displayPEDocumentStatus(student)],
     ["Status", (student) => displayValue(student.student_status)],
+    ["Confirm for Next Year", (student) => displayConfirmNextYear(student)],
     ["Payment Plan", (student) => displayPaymentPlan(student)],
-    ["Fee Link", (student) => displayFeeLink(student)],
   ];
 
   return rows.map(([field, formatter]) => ({
@@ -1022,10 +1021,20 @@ function displayClassCell(student) {
   return school || location || "-";
 }
 
-function displayPEDocumentStatus(student) {
-  const enrollment = student?.enrollment;
-  if (!enrollment) return "-";
-  return displayValue(enrollment.docstatus_label);
+function displayConfirmNextYear(student) {
+  // A flagged dropout takes over this row entirely — show only the red badge so
+  // agents spot at-risk students instantly (the standalone Dropout row was removed).
+  if (student?.possible_dropout) {
+    return (
+      '<span style="display:inline-block;padding:2px 8px;border-radius:4px;' +
+      'background:#fee2e2;color:#991b1b;font-weight:600">⚠ Possible Dropout</span>'
+    );
+  }
+  const value = cleanText(String(student?.confirm_for_next_year || ""));
+  if (!value) return "-";
+  // Green for a confirmed "Yes", red otherwise.
+  const color = value.toLowerCase() === "yes" ? "#16a34a" : "#dc2626";
+  return `<strong style="color: ${color}">${value}</strong>`;
 }
 
 function displayValue(value) {
@@ -1033,23 +1042,61 @@ function displayValue(value) {
   return text || "-";
 }
 
+// Plan names look like "Single Installment Plan-(100)-...". Collapse them to just
+// the installment count, e.g. "1 Installment" / "3 Installments".
+const INSTALLMENT_WORDS = {
+  single: 1,
+  one: 1,
+  two: 2,
+  double: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+};
+
+function installmentLabel(n) {
+  return `${n} Installment${n > 1 ? "s" : ""}`;
+}
+
 function compactPaymentPlan(value) {
   const text = cleanText(String(value ?? ""));
   if (!text) return "-";
-  if (text.length <= 56) return text;
-  return `${text.slice(0, 56)}...`;
+  // Plan names vary ("Single Installment Plan-(100)-...", "P2-(50-50)-...",
+  // "Three Installment Plan-(34-33-33)-..."). The most reliable installment count
+  // is the number of parts in the first "(...)" group: (100)=1, (50-50)=2, (34-33-33)=3.
+  const paren = text.match(/\(([\d\s.,-]+)\)/);
+  if (paren) {
+    const parts = paren[1]
+      .split(/[-,]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parts.length) return installmentLabel(parts.length);
+  }
+  // Fallback 1: "<Word> Installment Plan-..." word form.
+  const word = text.match(/^([A-Za-z]+)\s+installment/i);
+  if (word && INSTALLMENT_WORDS[word[1].toLowerCase()]) {
+    return installmentLabel(INSTALLMENT_WORDS[word[1].toLowerCase()]);
+  }
+  // Fallback 2: "P2-..." code form.
+  const pcode = text.match(/^P(\d+)\b/i);
+  if (pcode && parseInt(pcode[1], 10) > 0) {
+    return installmentLabel(parseInt(pcode[1], 10));
+  }
+  // Last resort: short, safe truncation.
+  return text.length <= 56 ? text : `${text.slice(0, 56)}...`;
 }
 
 function displayPaymentPlan(student) {
   return compactPaymentPlan(
     student?.fees?.payment_plan || student?.enrollment?.payment_plan || ""
   );
-}
-
-function displayFeeLink(student) {
-  const link = cleanText(String(student?.fees?.link || ""));
-  if (!link) return "-";
-  return `<a href="${link}" target="_top" rel="noopener noreferrer">Open Fees</a>`;
 }
 
 function goBackToList() {
@@ -1333,33 +1380,35 @@ function threadContent(item) {
     return normalizeTicketLinksInHtml(item?.content || "");
   }
 
-  const parsedContent = parseTicketDescription(item.content || "");
-  const hasStructuredBlocks =
-    parsedContent.students.length ||
-    parsedContent.fees.length ||
-    parsedContent.previousTicketsHtml;
-  const trimmedThreadHtml = (parsedContent.remainingHtml || "").trim();
+  const raw = item.content || "";
+  const normalizedRaw = normalizeHtml(raw);
+  const isPrimary =
+    !!normalizedRaw &&
+    normalizedRaw === normalizeHtml(ticket.value?.description || "");
 
-  if (hasStructuredBlocks && hasMeaningfulHtml(trimmedThreadHtml)) {
-    return normalizeTicketLinksInHtml(trimmedThreadHtml);
-  }
-  if (hasStructuredBlocks) {
-    return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+  // ONLY the primary (first) message has its embedded student / fee / previous-
+  // ticket blocks lifted into the dedicated sections above. Every other message
+  // — agent replies and inbound customer emails — renders verbatim, so a real
+  // message can never be blanked out by the structured-block extractor. This is
+  // the guard against "missing customer content / agent reply" in the thread.
+  if (isPrimary) {
+    const parsed = parsedDescription.value || {};
+    const remaining = (parsed.remainingHtml || "").trim();
+    const hasStructuredBlocks =
+      (parsed.students && parsed.students.length) ||
+      (parsed.fees && parsed.fees.length) ||
+      parsed.previousTicketsHtml;
+    if (hasStructuredBlocks && hasMeaningfulHtml(remaining)) {
+      return normalizeTicketLinksInHtml(remaining);
+    }
+    if (hasStructuredBlocks) {
+      return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+    }
+    // No structured blocks parsed — fall back to the real content, never blank.
+    return normalizeTicketLinksInHtml(remaining || raw);
   }
 
-  const matchesDescription =
-    normalizeHtml(item.content) &&
-    normalizeHtml(item.content) === normalizeHtml(ticket.value.description);
-  if (
-    matchesDescription &&
-    hasMeaningfulHtml(parsedDescription.value.remainingHtml || "")
-  ) {
-    return normalizeTicketLinksInHtml(
-      (parsedDescription.value.remainingHtml || "").trim()
-    );
-  }
-
-  return normalizeTicketLinksInHtml(item.content || "");
+  return normalizeTicketLinksInHtml(raw);
 }
 
 function applyForm() {
@@ -1648,7 +1697,7 @@ async function sendReply() {
   saving.value = true;
   actionError.value = "";
   try {
-    await call("helpdesk.api.unity_helpdesk_ext.reply", {
+    const res = await call("helpdesk.api.unity_helpdesk_ext.reply", {
       name: props.ticketId,
       message: composerPayloadHtml(),
       attachments: composerAttachments.value.map(
@@ -1656,7 +1705,30 @@ async function sendReply() {
       ),
     });
     await resetComposer();
-    await loadTicket();
+    // Optimistically append the new communication so the thread updates
+    // immediately. The spinner clears as soon as the reply call returns —
+    // no blocking full ticket reload.
+    const comm = res && res.communication;
+    if (comm) {
+      // Shape the item to match get_ticket_thread_components() output so both
+      // the thread renderer (ticket.value.thread) and the fallback timeline
+      // (communications.value) can show it.
+      const threadItem = {
+        ...comm,
+        _type: "comm",
+        attachments: comm.attachments || [],
+      };
+      if (ticket.value && Array.isArray(ticket.value.thread)) {
+        ticket.value.thread = [...ticket.value.thread, threadItem];
+      }
+      communications.value = [...communications.value, threadItem];
+      // Fire-and-forget background refresh for eventual consistency
+      // (attachments, server-side mutations) without blocking the UI.
+      loadTicket();
+    } else {
+      // Fallback for older backends that don't return the communication.
+      await loadTicket();
+    }
   } catch (err) {
     actionError.value = err.message;
   } finally {

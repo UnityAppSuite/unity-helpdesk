@@ -102,6 +102,7 @@ def get_ticket_thread_components(ticket: str):
 			QBCommunication.bcc,
 			QBCommunication.cc,
 			QBCommunication.content,
+			QBCommunication.text_content,
 			QBCommunication.creation,
 			QBCommunication.name,
 			QBCommunication.recipients,
@@ -116,6 +117,14 @@ def get_ticket_thread_components(ticket: str):
 	)
 	for c in communications:
 		c._type = "comm"
+		# Legacy / imported emails sometimes have an empty rich `content` but a
+		# populated plain-text `text_content`. Fall back so the message never
+		# renders as a blank bubble in the UI (miscommunication risk).
+		if not (c.content or "").strip() and (c.text_content or "").strip():
+			c.content = "<pre style=\"white-space:pre-wrap;font-family:inherit;margin:0\">{0}</pre>".format(
+				frappe.utils.escape_html(c.text_content)
+			)
+		c.pop("text_content", None)
 		c.attachments = get_attachments("Communication", c.name)
 		c.user = get_user_info_for_avatar(c.sender)
 

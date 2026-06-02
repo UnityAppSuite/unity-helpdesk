@@ -59,9 +59,15 @@
           </div>
         </div>
         <div class="topbar-actions">
-          <button class="btn" @click="openComposer = true">New Ticket</button>
           <button
-            v-if="canViewAllTickets"
+            v-if="!route.params.ticketId"
+            class="btn"
+            @click="openComposer = true"
+          >
+            New Ticket
+          </button>
+          <button
+            v-if="canViewAllTickets && !route.params.ticketId"
             class="btn secondary"
             @click="openBulkEmailModal"
           >
@@ -171,17 +177,18 @@
           </label>
 
           <label>
-            Subject
+            Subject <span class="required-asterisk">*</span>
             <input
               v-model="composer.subject"
               type="text"
               placeholder="Enter ticket subject"
+              required
             />
           </label>
           <label>
-            Ticket Type
-            <select v-model="composer.ticket_type">
-              <option value="">Not set</option>
+            Ticket Type <span class="required-asterisk">*</span>
+            <select v-model="composer.ticket_type" required>
+              <option value="" disabled>Select ticket type…</option>
               <option
                 v-for="ticketType in ticketTypes"
                 :key="ticketType.name"
@@ -295,19 +302,33 @@
           <button class="btn secondary" @click="closeBulkEmail">Close</button>
         </div>
         <div class="modal-body stack">
+          <p v-if="bulkEmailSuccess" class="success-banner">
+            {{ bulkEmailSuccess }}
+          </p>
           <p v-if="bulkEmailError" class="error">{{ bulkEmailError }}</p>
           <p v-else-if="bulkEmailWarning" class="warning-banner">
             {{ bulkEmailWarning }}
           </p>
 
-          <label>
+          <label v-if="bulkEmail.recipients.length">
             Recipients
             <div class="recipient-multiselect recipient-multiselect--locked">
-              <span class="recipient-chip recipient-chip--locked">
-                <span class="recipient-chip-label">{{ FEEDBACK_EMAIL }}</span>
+              <span
+                v-for="chip in bulkEmail.recipients"
+                :key="chip.email"
+                class="recipient-chip recipient-chip--locked"
+              >
+                <span class="recipient-chip-label">{{
+                  chip.label || chip.email
+                }}</span>
               </span>
             </div>
           </label>
+          <p v-else class="muted bulk-email-default-note">
+            No default recipient is configured — this email will be sent from
+            your account. Students stay hidden in BCC. You can set a default
+            recipient in Settings.
+          </p>
 
           <label>
             Subject
@@ -601,13 +622,19 @@ const bulkEmailSending = ref(false);
 const bulkEmailUploading = ref(false);
 const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
+const bulkEmailSuccess = ref("");
+let bulkSuccessCloseTimer = null;
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
-const FEEDBACK_EMAIL = "feedback@walnutedu.in";
+// Default bulk-email recipients come from HD Settings (via the profile),
+// not a hardcoded address. Returns chip objects for the recipient list.
+function defaultRecipientChips() {
+  const defaults = profile.value?.settings?.bulk_email_default_recipients;
+  if (!Array.isArray(defaults)) return [];
+  return defaults.map((email) => ({ email, name: email, label: email }));
+}
 const bulkEmail = reactive({
-  recipients: [
-    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
-  ],
+  recipients: defaultRecipientChips(),
   subject: "",
   ticket_type: "",
   message: "",
@@ -822,9 +849,17 @@ function removeComposerAttachment(name) {
 }
 
 async function createTicket() {
-  composerSaving.value = true;
   composerError.value = "";
   composerWarning.value = "";
+  if (!composer.subject || !composer.subject.trim()) {
+    composerError.value = "Subject is required.";
+    return;
+  }
+  if (!composer.ticket_type) {
+    composerError.value = "Ticket Type is required.";
+    return;
+  }
+  composerSaving.value = true;
   try {
     const result = await call("helpdesk.api.unity_helpdesk_ext.create_ticket", {
       subject: composer.subject,
@@ -1008,25 +1043,23 @@ async function refreshGuardianEmails() {
     if (diagnostic) {
       if (diagnostic.input_count > 0 && diagnostic.students_matched === 0) {
         bulkEmailWarning.value =
-          `Couldn't find guardians for any of the ${diagnostic.input_count} student email(s) ` +
-          `in BCC — verify each address is set on a Student.student_email_id ` +
-          `record. Run \`bench --site <site> execute helpdesk.api.unity_perf.diagnose_guardian_lookup ` +
-          `--kwargs '{"emails":[...]}'\` to see exactly which step fails.`;
+          "We couldn't match any of the selected recipients to a student " +
+          "record, so no guardian emails were added.";
       } else if (
         diagnostic.input_count > 0 &&
         diagnostic.students_with_guardians === 0
       ) {
         bulkEmailWarning.value =
-          `Matched ${diagnostic.students_matched} student(s), but none have guardian ` +
-          `emails on file. Check the Student.guardians child table.`;
+          `Found ${diagnostic.students_matched} student(s), but none have a ` +
+          `guardian email on file.`;
       } else if (
         diagnostic.unmatched_emails &&
         diagnostic.unmatched_emails.length
       ) {
         // Partial match — let the user know which addresses didn't resolve.
         bulkEmailWarning.value =
-          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} BCC ` +
-          `address(es) had no matching Student record: ` +
+          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} ` +
+          `recipient(s) didn't match a student record: ` +
           diagnostic.unmatched_emails.slice(0, 5).join(", ") +
           (diagnostic.unmatched_emails.length > 5 ? ", ..." : "");
       } else {
@@ -1059,9 +1092,8 @@ function resetBulkEmail() {
   bulkEmailUploading.value = false;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  bulkEmail.recipients = [
-    { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },
-  ];
+  bulkEmailSuccess.value = "";
+  bulkEmail.recipients = defaultRecipientChips();
   bulkEmail.subject = "";
   bulkEmail.ticket_type = "";
   bulkEmail.message = "";
@@ -1077,6 +1109,10 @@ function resetBulkEmail() {
 }
 
 function closeBulkEmail() {
+  if (bulkSuccessCloseTimer) {
+    clearTimeout(bulkSuccessCloseTimer);
+    bulkSuccessCloseTimer = null;
+  }
   openBulkEmail.value = false;
   resetBulkEmail();
 }
@@ -1187,16 +1223,21 @@ async function sendBulkEmail() {
       bulkEmailWarning.value = result.warning;
       return;
     }
-    const message = result?.invalid_count
-      ? `Sent to ${result.queued} recipients. ${result.invalid_count} invalid email(s) were skipped.`
-      : `Sent to ${result?.queued || 0} recipients.`;
-    if (result?.ticket) {
-      sessionStorage.setItem(TICKET_NOTICE_KEY, message);
+    const count = result?.count || 0;
+    const noun = count === 1 ? "recipient" : "recipients";
+    let message = `Email queued — it will be sent to ${count} ${noun} shortly.`;
+    if (result?.invalid_count) {
+      message += ` ${result.invalid_count} invalid email address(es) were skipped.`;
     }
-    closeBulkEmail();
-    if (result?.ticket) {
-      router.push(`/tickets/${result.ticket}`);
-    }
+    // The send runs in the background (no ticket to open). Clear the form so a
+    // stray click can't re-send, show a green confirmation, then auto-close the
+    // modal shortly after so the user both sees the success and the window closes.
+    resetBulkEmail();
+    bulkEmailSuccess.value = message;
+    if (bulkSuccessCloseTimer) clearTimeout(bulkSuccessCloseTimer);
+    bulkSuccessCloseTimer = setTimeout(() => {
+      closeBulkEmail();
+    }, 2200);
   } catch (err) {
     bulkEmailError.value = err.message;
   } finally {

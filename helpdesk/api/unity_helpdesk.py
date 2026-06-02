@@ -30,7 +30,11 @@ PRIORITY_TARGETS = {
 	"Medium": "1-2 days",
 	"Low": "2-3 days",
 }
-MAX_SEARCH_CANDIDATES = 400
+# Candidate ticket rows fetched and ranked per search. Raised from 400 → 1000 so
+# broad/common queries are far less likely to silently drop the target ticket
+# below the cap. Ranking happens in Python over this bounded set, so the cost is
+# one indexed fetch + an O(n log n) sort — still fast at 1000.
+MAX_SEARCH_CANDIDATES = 1000
 # Top-N most-recently-assigned tickets we resolve via ToDo for the "My
 # Tickets" / "Assigned: X" filters. Set high enough that no real human
 # user can hit it (the typical agent has dozens to low-hundreds of open
@@ -40,6 +44,9 @@ MAX_SEARCH_CANDIDATES = 400
 # `_assign LIKE '%user%'` full-table scan, which is what made the SPA's
 # first paint hit 20–30 s.
 MAX_ASSIGNED_LOOKUP = 25000
+# Hard cap on rows returned by the ticket list endpoints — matches the largest
+# page-size option in the SPA and protects the query from unbounded fetches.
+MAX_TICKET_PAGE_LENGTH = 500
 UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
@@ -440,7 +447,12 @@ def _normalize_search_text(value):
 
 
 def _search_tokens(value):
-	return [token for token in re.findall(r"[a-z0-9@._-]+", _normalize_search_text(value)) if token]
+	# `\w` matches Unicode word characters, so accented names (e.g. "José",
+	# "Bhavnâ") tokenize as ONE whole word instead of being split/truncated at
+	# the accent the way the old [a-z0-9...] class did. Query-side only — the
+	# stored search index is unchanged, so no re-backfill is needed. `@ . -` are
+	# kept so emails and refs (ta-16@x.edu) stay intact.
+	return [token for token in re.findall(r"[\w@.-]+", _normalize_search_text(value)) if token]
 
 
 def _like_pattern(value):
@@ -811,6 +823,8 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			"program",
 			"custom_division",
 			"student_status",
+			"confirm_for_next_year",
+			"possible_dropout",
 			"student_mobile_number",
 			"primary_contact",
 			"whatsapp_number",
@@ -1001,6 +1015,8 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"class_number": _parse_class_number(student.get("program")),
 				"division": student.get("custom_division"),
 				"student_status": student.get("student_status"),
+				"confirm_for_next_year": student.get("confirm_for_next_year") or "",
+				"possible_dropout": bool(int(student.get("possible_dropout") or 0)),
 				"student_mobile_number": student.get("student_mobile_number"),
 				"primary_contact": student.get("primary_contact"),
 				"whatsapp_number": student.get("whatsapp_number"),
@@ -1812,6 +1828,87 @@ def _expand_email_to_family_emails(email):
 	return _expand_email_to_family_search_terms(email)["emails"]
 
 
+_PHONE_MIN_DIGITS = 8
+
+
+def _looks_like_phone(value):
+	"""True when the query is a phone number: at least 8 digits and predominantly
+	digits. The exact ticket-ID lookup runs BEFORE this in the caller, and ticket
+	IDs are <=6 digits, so a real ticket ID is never misread as a phone."""
+	raw = cstr(value or "").strip()
+	if not raw:
+		return False
+	digits = re.sub(r"\D", "", raw)
+	if len(digits) < _PHONE_MIN_DIGITS:
+		return False
+	compact = re.sub(r"\s", "", raw)
+	return bool(compact) and (len(digits) / len(compact)) >= 0.7
+
+
+def _expand_phone_to_family_search_terms(phone):
+	"""Resolve a guardian phone number to the whole family's search terms (same
+	shape as _expand_email_to_family_search_terms). Matches Guardian.mobile_number /
+	alternate_number on the last 10 digits (resilient to +91 / spacing), takes that
+	guardian's email, and reuses the email family-walk — so a phone search surfaces
+	every sibling's tickets. Returns empty terms (caller falls through to normal
+	search) when no guardian matches or the matched guardian has no email."""
+	empty = {"emails": set(), "student_refs": set(), "student_names": set(), "student_ids": set()}
+	digits = re.sub(r"\D", "", cstr(phone or ""))
+	if len(digits) < _PHONE_MIN_DIGITS or not _has_doctype("Guardian"):
+		return empty
+	tail = digits[-10:]
+	seed_email = None
+	for field in ("mobile_number", "alternate_number"):
+		if not frappe.db.has_column("Guardian", field):
+			continue
+		for row in frappe.get_all(
+			"Guardian",
+			fields=["email_address", "user"],
+			filters=[[field, "like", f"%{tail}"]],
+			page_length=100,
+		):
+			seed_email = cstr(row.email_address or row.user or "").strip().lower()
+			if seed_email:
+				break
+		if seed_email:
+			break
+	if not seed_email:
+		return empty
+	return _expand_email_to_family_search_terms(seed_email)
+
+
+def _family_terms_or_filters(terms):
+	"""OR-filters matching every ticket of a family, built from the expanded
+	{emails, student_refs, student_names, student_ids} term set. Shared by the
+	guardian-phone candidate branch (mirrors the inline email-branch logic)."""
+	or_filters = []
+	for email in terms.get("emails", set()):
+		or_filters.append([TICKET_DOCTYPE, "raised_by", "=", email])
+		if _has_field(TICKET_DOCTYPE, "custom_search_guardian_emails"):
+			or_filters.append(
+				[TICKET_DOCTYPE, "custom_search_guardian_emails", "like", f"%{email}%"]
+			)
+	if _has_field(TICKET_DOCTYPE, "custom_search_student_refs"):
+		for ref in terms.get("student_refs", set()):
+			or_filters.append([TICKET_DOCTYPE, "custom_search_student_refs", "like", f"%{ref}%"])
+	if _has_field(TICKET_DOCTYPE, "custom_search_student_names"):
+		for sname in terms.get("student_names", set()):
+			or_filters.append([TICKET_DOCTYPE, "custom_search_student_names", "like", f"%{sname}%"])
+	for student_id in terms.get("student_ids", set()):
+		or_filters.append([TICKET_DOCTYPE, "raised_by", "like", f"%{student_id}@%"])
+	return or_filters
+
+
+def _family_is_expanded(terms, seed_emails=0):
+	"""True when family expansion found identifiers beyond the seed query."""
+	return bool(
+		terms.get("student_refs")
+		or terms.get("student_names")
+		or terms.get("student_ids")
+		or len(terms.get("emails", set())) > seed_emails
+	)
+
+
 def _search_candidate_ticket_names(base_filters, search):
 	query = cstr(search or "").strip()
 	if not query:
@@ -1912,6 +2009,27 @@ def _search_candidate_ticket_names(base_filters, search):
 			)
 			return candidate_names
 
+	# Guardian phone family expansion — mirrors the email path above. When the
+	# query is a phone number that resolves to a guardian, surface every ticket
+	# belonging to the whole family (all siblings). Falls through to the normal
+	# token/body search when no guardian matches, preserving the incidental match
+	# on a phone that only appears inside a ticket body.
+	if _looks_like_phone(query):
+		phone_terms = _expand_phone_to_family_search_terms(query)
+		if _family_is_expanded(phone_terms):
+			_append_ticket_names(
+				candidate_names,
+				frappe.get_list(
+					TICKET_DOCTYPE,
+					fields=["name"],
+					filters=base_filters,
+					or_filters=_family_terms_or_filters(phone_terms),
+					order_by="modified desc",
+					page_length=MAX_SEARCH_CANDIDATES,
+				),
+			)
+			return candidate_names
+
 	# Tokenize the query the same way the index was tokenized (HTML-stripped,
 	# lowercase, alphanumerics + @._-). This makes pasted chunks of email body
 	# match even though the index has normalized whitespace and stripped tags.
@@ -1923,8 +2041,11 @@ def _search_candidate_ticket_names(base_filters, search):
 	# searches like "AC" still work.
 	if len(tokens) > 1:
 		tokens = [t for t in tokens if len(t) >= 3]
-	# Cap to keep the worst-case at MAX_SEARCH_TOKENS DB round-trips.
-	MAX_SEARCH_TOKENS = 8
+	# Cap the token count so a pasted paragraph can't build an unbounded filter.
+	# Raised 8 → 16 so longer pasted phrases keep more of their distinguishing
+	# words (the AND-of-OR is a single SQL statement, so more tokens just add
+	# AND clauses, not extra round-trips).
+	MAX_SEARCH_TOKENS = 16
 	tokens = tokens[:MAX_SEARCH_TOKENS]
 
 	if not tokens:
@@ -1954,7 +2075,12 @@ def _search_candidate_ticket_names(base_filters, search):
 	# scores partial matches and ignores stopwords automatically.
 	# Short queries like "TA16" stay on the legacy path (direct ticket-ID
 	# + Data-field LIKE handles them already).
-	is_long_query = len(tokens) >= 4 or len(cstr(query)) > 60
+	# Lowered from (≥4 tokens / >60 chars) to (≥3 tokens / >40 chars) so more
+	# multi-word content searches use the FULLTEXT index (relevance-scored,
+	# stopword-aware) instead of the slower AND-of-OR LIKE scan over the 12k-char
+	# body field. If FULLTEXT yields nothing (e.g. all tokens <4 chars), we fall
+	# straight through to the AND-of-OR path below — never a dead end.
+	is_long_query = len(tokens) >= 3 or len(cstr(query)) > 40
 	if is_long_query and _fulltext_index_available():
 		candidate_names = _fulltext_candidates(query, base_filters)
 		if candidate_names:
@@ -2650,6 +2776,12 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	repeat the work twice within a single request — only relevant for the
 	back-compat `get_tickets` wrapper, but harmless otherwise.
 	"""
+	# Clamp pagination defensively: a missing/zero value falls back to 20, and a
+	# huge value (a stale 500 preference, or a crafted request) is capped so the
+	# list query can never be asked for an unbounded number of rows and time out.
+	page_length = max(1, min(int(page_length or 20), MAX_TICKET_PAGE_LENGTH))
+	start = max(0, int(start or 0))
+
 	# Cache key embeds the inputs so different filter combinations don't
 	# collide within the same request.
 	cache_key = (
@@ -2665,13 +2797,11 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 		# Update pagination on each call so the same context object can be
 		# reused with different `start` / `page_length` values cheaply.
 		cached = dict(cached)
-		cached["page_length"] = int(page_length or 20)
-		cached["start"] = int(start or 0)
+		cached["page_length"] = page_length
+		cached["start"] = start
 		return cached
 
 	capabilities = _require_unity_access()
-	page_length = int(page_length or 20)
-	start = int(start or 0)
 	search = cstr(search or message_body or "").strip()
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
 	list_filters = _build_filters(
@@ -2684,9 +2814,12 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	search_family_terms = None
 	if search:
 		search_candidate_names = _search_candidate_ticket_names(list_filters, search)
-		# When the search is a guardian email, we expanded to the whole family.
-		# Pass the expansion to the ranker so it accepts family matches as
-		# Tier-2 hits even when the literal email isn't on the ticket.
+		# When the search is a guardian email OR a guardian phone, we expanded to
+		# the whole family. Pass the expansion to the ranker so it accepts family
+		# matches as Tier-2 hits even when the literal email/phone isn't on the
+		# ticket (e.g. a sibling's ticket that only carries the shared guardian
+		# email). Without this the ranker would drop family members that don't
+		# literally contain the query string.
 		if _looks_like_email(search):
 			expanded = _expand_email_to_family_search_terms(search)
 			if (
@@ -2695,6 +2828,10 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 				or expanded.get("student_names")
 				or expanded.get("student_ids")
 			):
+				search_family_terms = expanded
+		elif _looks_like_phone(search):
+			expanded = _expand_phone_to_family_search_terms(search)
+			if _family_is_expanded(expanded):
 				search_family_terms = expanded
 
 	context = {
@@ -2768,17 +2905,12 @@ def _compute_tickets_page(context):
 			]
 		)
 		paginated_ids = ranked_ids[start : start + page_length]
-		row_map = {}
-		if paginated_ids:
-			row_map = {
-				row.name: row
-				for row in frappe.get_list(
-					TICKET_DOCTYPE,
-					fields=fields,
-					filters={"name": ["in", paginated_ids]},
-					page_length=len(paginated_ids),
-				)
-			}
+		# `candidate_rows` already holds every candidate with the same `fields`,
+		# and `paginated_ids` is a slice of names ranked *from* candidate_rows —
+		# so the page is already in memory. Slice it directly instead of paying a
+		# second DB round-trip (and an extra `IN (...)` scan) for rows we just
+		# fetched. row_map is keyed by name; we re-order it to the ranked slice.
+		row_map = {row.name: row for row in candidate_rows}
 		rows = [row_map[name] for name in paginated_ids if name in row_map]
 	else:
 		rows = frappe.get_list(
@@ -3128,6 +3260,40 @@ def get_dashboard_summary(range="week", from_date=None, to_date=None, agent=None
 def get_agents():
 	_require_unity_access()
 	return list(_agent_map().values())
+
+
+@frappe.whitelist()
+def search_users(query=None):
+	"""Typeahead for the New-Ticket "Customer Email" field.
+
+	Access-gated to Unity users and bounded to 10 rows. Returns enabled users
+	(customers/website users AND agents) matching name/email/full_name, with
+	prefix matches ranked first. Wildcards in the query are stripped so a bare
+	'%' can't be used to dump the table. Replaces the broad
+	frappe.client.get_list call the SPA used before.
+	"""
+	_require_unity_access()
+	query = cstr(query or "").strip()
+	if len(query) < 2:
+		return []
+	safe = query.replace("%", "").replace("_", "")
+	if not safe:
+		return []
+	return frappe.db.sql(
+		"""
+		SELECT name, full_name, email
+		FROM `tabUser`
+		WHERE enabled = 1
+		  AND name NOT IN ('Administrator', 'Guest')
+		  AND (name LIKE %(like)s OR email LIKE %(like)s OR full_name LIKE %(like)s)
+		ORDER BY
+		  CASE WHEN name LIKE %(prefix)s OR email LIKE %(prefix)s THEN 0 ELSE 1 END,
+		  full_name
+		LIMIT 10
+		""",
+		{"like": f"%{safe}%", "prefix": f"{safe}%"},
+		as_dict=True,
+	)
 
 
 @frappe.whitelist()
@@ -3713,6 +3879,32 @@ def send_open_ticket_reminders():
 			break
 
 
+def _default_bulk_recipients():
+	"""Addresses BCC'd on every bulk email, from HD Settings (blank = disabled).
+
+	Returns a de-duplicated, validated, lowercased list of strings. Surfaced to
+	the SPA via get_profile() and consumed by the bulk-email background job.
+	"""
+	# Guard against the field not yet existing on this site (it ships as an
+	# hd_settings docfield that lands on `bench migrate`). A missing OPTIONAL
+	# setting must never raise — get_profile() also carries available_columns /
+	# column_preferences, so a throw here blanks the entire ticket list.
+	if not frappe.get_meta("HD Settings").has_field("unity_bulk_email_default_recipients"):
+		return []
+	raw = frappe.db.get_single_value("HD Settings", "unity_bulk_email_default_recipients") or ""
+	out = []
+	seen = set()
+	for part in cstr(raw).replace(";", ",").replace("\n", ",").split(","):
+		email = part.strip().lower()
+		if not email or email in seen:
+			continue
+		if not frappe.utils.validate_email_address(email, throw=False):
+			continue
+		seen.add(email)
+		out.append(email)
+	return out
+
+
 @frappe.whitelist()
 def get_profile():
 	user = frappe.get_doc("User", _session_user())
@@ -3728,6 +3920,7 @@ def get_profile():
 		"settings": {
 			"unity_email_thread_layout": _default_thread_layout(),
 			"column_preferences": _load_column_preferences(),
+			"bulk_email_default_recipients": _default_bulk_recipients(),
 		},
 		"available_columns": _localized_available_columns(),
 	}
@@ -3988,18 +4181,34 @@ def get_student_guardian_emails(student_emails):
 	if not normalized:
 		return _empty()
 
+	# Match each input email against BOTH Student.student_email_id and
+	# Student.user — some sites store the contactable address on `user`.
 	students = frappe.get_all(
 		"Student",
-		fields=["name", "student_email_id"],
-		filters={"student_email_id": ["in", normalized]},
+		fields=["name", "student_email_id", "user"],
+		or_filters={
+			"student_email_id": ["in", normalized],
+			"user": ["in", normalized],
+		},
 		page_length=len(normalized) + 1,
 	)
 	if not students:
 		return _empty()
 
-	email_by_student_id = {
-		s.name: cstr(s.student_email_id or "").strip().lower() for s in students
-	}
+	normalized_set = set(normalized)
+	email_by_student_id = {}
+	for s in students:
+		email_id = cstr(s.student_email_id or "").strip().lower()
+		user_id = cstr(s.user or "").strip().lower()
+		# Key on whichever field actually matched one of the input emails.
+		if email_id in normalized_set:
+			email_by_student_id[s.name] = email_id
+		elif user_id in normalized_set:
+			email_by_student_id[s.name] = user_id
+		elif email_id:
+			email_by_student_id[s.name] = email_id
+		else:
+			email_by_student_id[s.name] = user_id
 	matched_emails = set(email_by_student_id.values())
 	unmatched_emails = [e for e in normalized if e not in matched_emails]
 	guardians_by_student_id = _guardian_emails_for_student_ids(list(email_by_student_id.keys()))

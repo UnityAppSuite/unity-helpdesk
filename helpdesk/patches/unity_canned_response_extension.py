@@ -4,20 +4,14 @@ optionally substitute an email subject, and disable templates without deleting t
 
 Idempotent — safe to re-run on every migrate.
 """
-import time
-
 import frappe
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
+from helpdesk.patches._unity_patch import run_patch
+
 
 def execute():
-	start = time.monotonic()
-	try:
-		_execute()
-	finally:
-		frappe.logger().info(
-			f"[unity-patch] unity_canned_response_extension took {time.monotonic() - start:.2f}s"
-		)
+	run_patch("unity_canned_response_extension", _execute)
 
 
 def _execute():

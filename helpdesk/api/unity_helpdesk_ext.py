@@ -19,6 +19,7 @@ from frappe.utils import cstr
 # These helpers are in the cached unity_helpdesk.py — they were there from the start.
 from helpdesk.api.unity_helpdesk import (
     _decorate_ticket,
+    _default_bulk_recipients,
     _has_field,
     _log_hold_reason,
     _parse_json,
@@ -177,6 +178,8 @@ def create_ticket(
     _require_unity_access()
     if not subject:
         frappe.throw(_("Please enter a subject"))
+    if not ticket_type:
+        frappe.throw(_("Please select a ticket type"))
     if not raised_by:
         frappe.throw(_("Please enter customer email"))
     if not message:
@@ -408,7 +411,60 @@ def reply(name, message, cc=None, bcc=None, attachments=None):
             raise
     else:
         update_ticket_message_search_index(name, ticket_doc=ticket)
-    return {"ok": True}
+    # Return the just-created Communication so the SPA can append it to the
+    # thread optimistically, without a blocking full ticket reload.
+    return {"ok": True, "communication": _latest_communication_payload(name)}
+
+
+def _latest_communication_payload(ticket_name):
+    """Fetch the most recent Communication for a ticket as a thread-ready dict.
+
+    Shape matches what the Unity thread renderer expects (see
+    TicketDetailView.vue communications handling): name, content, sender,
+    sent_or_received, creation, communication_date.
+    """
+    rows = frappe.get_all(
+        "Communication",
+        filters={
+            "reference_doctype": TICKET_DOCTYPE,
+            "reference_name": ticket_name,
+        },
+        fields=[
+            "name",
+            "subject",
+            "content",
+            "sender",
+            "recipients",
+            "cc",
+            "bcc",
+            "sent_or_received",
+            "creation",
+            "communication_date",
+            "has_attachment",
+            "delivery_status",
+        ],
+        order_by="creation desc",
+        limit=1,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "name": row.get("name"),
+        "subject": row.get("subject"),
+        "content": row.get("content"),
+        "sender": row.get("sender"),
+        "recipients": row.get("recipients"),
+        "cc": row.get("cc"),
+        "bcc": row.get("bcc"),
+        "sent_or_received": row.get("sent_or_received"),
+        "creation": str(row.get("creation")) if row.get("creation") else None,
+        "communication_date": str(row.get("communication_date"))
+        if row.get("communication_date")
+        else None,
+        "has_attachment": row.get("has_attachment"),
+        "delivery_status": row.get("delivery_status"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -444,12 +500,6 @@ from frappe.utils import validate_email_address
 
 RECIPIENT_HARD_CAP = 1000
 TOTAL_ADDRESS_HARD_CAP = 1500
-# Mailbox that should receive an audit copy of every bulk email with the
-# full recipient list visible in the body. The same address is locked as
-# the default "Recipients" chip on the SPA composer (App.vue line ~606).
-# Real recipients (students + guardians) are BCC'd separately so they
-# never see this audit copy or each other.
-AUDIT_RECIPIENT_EMAIL = "feedback@walnutedu.in"
 
 
 @frappe.whitelist()
@@ -516,47 +566,28 @@ def bulk_send_email(
         seen.add(email)
         valid_emails.append(email)
 
-    if not valid_emails:
-        frappe.throw(_("At least one valid email address is required"))
-
-    if len(valid_emails) > RECIPIENT_HARD_CAP:
-        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
-
     cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
     bcc_list, invalid_bcc_count = _split_email_list_with_counts(bcc)
+
+    # The default recipient (the "recipients" field, mirrored from HD Settings) is
+    # OPTIONAL — it is not mandatory to configure one. As long as there is at least
+    # one BCC student the email can be sent; when no default is configured the mail
+    # is sent from the sender's own account instead (see _bulk_send_email_job).
+    if not valid_emails and not bcc_list:
+        frappe.throw(_("Add at least one recipient (student) before sending"))
+
+    if len(valid_emails) > RECIPIENT_HARD_CAP or len(bcc_list) > RECIPIENT_HARD_CAP:
+        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
 
     if len(valid_emails) + len(cc_list) + len(bcc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
             _("Total addresses (recipients + cc + bcc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
         )
 
-    audit_description = _bulk_email_audit_html(valid_emails, cc_list, bcc_list, message)
-    payload = {
-        "doctype": TICKET_DOCTYPE,
-        "subject": subject,
-        "raised_by": frappe.session.user,
-        "description": audit_description,
-        "status": "Open",
-        "ticket_type": ticket_type,
-    }
-    if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
-        payload["custom_via_unity_portal"] = 1
-    if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
-        payload["custom_is_bulk_email"] = 1
-    # Denormalised list of every recipient (TO + CC + BCC). Drives the
-    # "Previous Tickets" history lookup for each recipient — a LIKE on this
-    # field is cheaper than scanning the audit_description HTML on every
-    # ticket open.
-    if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
-        all_recipients = sorted(set(valid_emails) | set(cc_list) | set(bcc_list))
-        payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
-    doc = frappe.get_doc(payload).insert(ignore_permissions=True)
-
+    # Resolve attachment File names cheaply in-request (single IN(...) query),
+    # then hand all the heavy work (audit ticket insert + Communication + the
+    # actual send) to a background job so this request returns immediately.
     attachment_list = [n for n in (_parse_json(attachments, []) or []) if n]
-    # Single IN(...) query instead of one EXISTS per attachment — bulk email
-    # with 10 attachments was paying 10 sequential DB round-trips here. The
-    # ordered list comprehension preserves the user's intended attachment
-    # order rather than the set iteration order.
     if attachment_list:
         existing_files = set(
             frappe.get_all(
@@ -565,96 +596,152 @@ def bulk_send_email(
                 pluck="name",
             )
         )
-        sendmail_attachments = [
-            {"file_url": name} for name in attachment_list if name in existing_files
-        ]
+        file_names = [name for name in attachment_list if name in existing_files]
     else:
-        sendmail_attachments = []
+        file_names = []
 
-    # Create a Communication immediately so the sent message appears in the ticket thread.
-    # Use frappe's make() which handles linking/indexing correctly.
-    recipients_display = ", ".join(valid_emails[:5])
-    if len(valid_emails) > 5:
-        recipients_display += f" (+{len(valid_emails) - 5} more)"
-    try:
-        from frappe.core.doctype.communication.email import make as make_comm
-        make_comm(
-            doctype=TICKET_DOCTYPE,
-            name=doc.name,
-            subject=subject,
-            content=message,
-            sent_or_received="Sent",
-            sender=frappe.session.user,
-            recipients=recipients_display,
-            cc=", ".join(cc_list) if cc_list else "",
-            communication_medium="Email",
-            send_email=False,
-        )
-    except Exception:
-        frappe.log_error(frappe.get_traceback(), "Unity Helpdesk bulk_send_email: Communication creation")
+    frappe.enqueue(
+        "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
+        queue="short",
+        subject=subject,
+        message=message,
+        recipients=valid_emails,
+        cc_list=cc_list,
+        bcc_list=bcc_list,
+        sender=frappe.session.user,
+        file_names=file_names,
+        ticket_type=ticket_type,
+    )
 
-    # Split the recipient list so the audit mailbox can see who was emailed
-    # while real recipients stay hidden from each other. Two separate
-    # sendmail calls: clean BCC copy for students/guardians; visible-list
-    # copy for the audit mailbox.
-    audit_emails = [
-        e for e in valid_emails if e.lower() == AUDIT_RECIPIENT_EMAIL.lower()
-    ]
-    real_recipients = [
-        e for e in valid_emails if e.lower() != AUDIT_RECIPIENT_EMAIL.lower()
-    ] + list(bcc_list)
-
-    warning = ""
-    queued = 0
-    try:
-        if real_recipients:
-            # Hide-everyone-from-everyone copy. Students/guardians see TO=
-            # frappe.session.user, no other addresses visible (BCC is
-            # stripped from the headers Gmail / Outlook show).
-            frappe.sendmail(
-                recipients=[frappe.session.user],
-                cc=cc_list or None,
-                bcc=real_recipients,
-                subject=subject,
-                message=message,
-                attachments=sendmail_attachments,
-                delayed=True,
-            )
-            queued += len(real_recipients)
-
-        if audit_emails:
-            # Audit copy with the full recipient list visible in the body.
-            # Goes only to AUDIT_RECIPIENT_EMAIL (typically feedback@) so
-            # the audit mailbox owner can see who was emailed without
-            # leaking the list to real recipients.
-            audit_summary = _build_audit_summary_html(
-                real_recipients, cc_list, bcc_list
-            )
-            frappe.sendmail(
-                recipients=audit_emails,
-                cc=cc_list or None,
-                subject=f"[Audit] {subject}",
-                message=audit_summary + message,
-                attachments=sendmail_attachments,
-                delayed=True,
-            )
-            queued += len(audit_emails)
-    except Exception as exc:
-        if _is_missing_sender_error(exc):
-            warning = _("Audit-trail ticket created, but no outgoing email account is configured. No email was sent.")
-        else:
-            warning = _("Audit-trail ticket created, but the email could not be queued: {0}").format(exc)
-            frappe.log_error(frappe.get_traceback(), "Unity Helpdesk bulk_send_email")
-
+    # "count" is the real audience the email will reach: default recipients (TO)
+    # plus every student (BCC). The send happens in a background job, so there is
+    # no ticket to return here — the SPA shows a queued-success message instead.
     return {
         "ok": True,
-        "ticket": doc.name,
-        "queued": queued,
+        "queued": True,
+        "count": len(valid_emails) + len(bcc_list),
         "invalid_count": invalid_count,
         "invalid_cc_count": invalid_cc_count,
         "invalid_bcc_count": invalid_bcc_count,
-        "warning": warning,
     }
+
+
+def _bulk_send_email_job(
+    subject,
+    message,
+    recipients,
+    cc_list=None,
+    bcc_list=None,
+    sender=None,
+    file_names=None,
+    ticket_type=None,
+):
+    """Background worker for bulk_send_email.
+
+    Receives already-validated data, creates the audit HD Ticket and a
+    Communication, then sends ONE BCC email to all real recipients plus the
+    configured default recipients. Runs with ignore_permissions and passes
+    `sender` explicitly because there is no request user in a worker. Any
+    failure is logged via frappe.log_error, never raised silently.
+    """
+    try:
+        recipients = recipients or []
+        cc_list = cc_list or []
+        bcc_list = bcc_list or []
+        file_names = file_names or []
+
+        audit_description = _bulk_email_audit_html(
+            recipients, cc_list, bcc_list, message
+        )
+        payload = {
+            "doctype": TICKET_DOCTYPE,
+            "subject": subject,
+            "raised_by": sender,
+            "description": audit_description,
+            "status": "Open",
+            "ticket_type": ticket_type,
+        }
+        if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
+            payload["custom_via_unity_portal"] = 1
+        if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
+            payload["custom_is_bulk_email"] = 1
+        # Denormalised list of every recipient (TO + CC + BCC) for the
+        # "Previous Tickets" history lookup.
+        if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
+            all_recipients = sorted(set(recipients) | set(cc_list) | set(bcc_list))
+            payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
+        doc = frappe.get_doc(payload).insert(ignore_permissions=True)
+
+        sendmail_attachments = [{"file_url": name} for name in file_names]
+
+        # Resolve the recipient list. Every address — the students plus the
+        # configured default/audit recipients (from HD Settings) — goes into one
+        # de-duplicated list. Frappe delivers each recipient an INDIVIDUAL email
+        # (the queue is sent one address at a time, and with expose_recipients=None
+        # the To header shows only that person's own address), so no recipient can
+        # ever see another's email. The sender (the logged-in agent) is NEVER added
+        # as a recipient — they only appear as the From address.
+        targets = []
+        target_seen = set()
+        for addr in list(bcc_list) + list(recipients) + _default_bulk_recipients():
+            key = (addr or "").lower()
+            if not key or key in target_seen:
+                continue
+            target_seen.add(key)
+            targets.append(addr)
+
+        if not targets:
+            frappe.log_error(
+                "Bulk email job had no valid recipients", "Unity Helpdesk _bulk_send_email_job"
+            )
+            return
+
+        # Log the bulk email as a Communication on the audit ticket, showing the
+        # real audience truncated for readability.
+        recipients_display = ", ".join(targets[:5])
+        if len(targets) > 5:
+            recipients_display += f" (+{len(targets) - 5} more)"
+        try:
+            from frappe.core.doctype.communication.email import make as make_comm
+
+            make_comm(
+                doctype=TICKET_DOCTYPE,
+                name=doc.name,
+                subject=subject,
+                content=message,
+                sent_or_received="Sent",
+                sender=sender,
+                recipients=recipients_display,
+                cc=", ".join(cc_list) if cc_list else "",
+                communication_medium="Email",
+                send_email=False,
+            )
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                "Unity Helpdesk bulk_send_email: Communication creation",
+            )
+
+        # Each recipient receives their own copy; expose_recipients=None hides every
+        # other recipient. CC (if any) is intentionally visible to all.
+        frappe.sendmail(
+            recipients=targets,
+            cc=cc_list or None,
+            subject=subject,
+            message=message,
+            attachments=sendmail_attachments,
+            delayed=True,
+            reference_doctype=TICKET_DOCTYPE,
+            reference_name=doc.name,
+            expose_recipients=None,
+        )
+
+        frappe.db.commit()
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            "Unity Helpdesk _bulk_send_email_job",
+        )
 
 
 def _split_email_list(value):
@@ -706,13 +793,13 @@ def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
     recipient_block = (
         f"<details style='margin:6px 0'>"
         f"<summary style='cursor:pointer;font-weight:600;color:#3730a3'>"
-        f"📧 {len(recipients)} recipient{'s' if len(recipients) != 1 else ''} (click to expand)"
+        f"Recipients ({len(recipients)})"
         f"</summary>"
         f"<ul style='margin:6px 0 0 16px;padding:0'>{recipient_items}</ul>"
         f"</details>"
     )
+    # No "📢 Bulk Email" speaker header — bulk emails should read like normal mail.
     sections = [
-        "<p><strong>📢 Bulk Email</strong></p>",
         recipient_block,
     ]
     if cc_list:
@@ -722,46 +809,6 @@ def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
     sections.append("<hr style='margin:12px 0'>")
     sections.append("<p><strong>Message sent:</strong></p>")
     sections.append(message)
-    return "".join(sections)
-
-
-def _build_audit_summary_html(real_recipients, cc_list, bcc_list):
-    """Audit banner prepended to the email body sent to the AUDIT_RECIPIENT
-    mailbox. Same shape as the audit-ticket description but lives inside
-    the email body, so the feedback inbox owner can see the full recipient
-    list at a glance.
-
-    This content is ONLY sent to AUDIT_RECIPIENT_EMAIL — never to the real
-    recipients (students/guardians). The dual-sendmail split in
-    bulk_send_email enforces that separation."""
-    recipient_items = "".join(
-        f"<li style='font-size:12px;color:#475569'>{frappe.utils.escape_html(e)}</li>"
-        for e in real_recipients
-    )
-    recipient_count = len(real_recipients)
-    recipient_block = (
-        f"<details open style='margin:6px 0'>"
-        f"<summary style='cursor:pointer;font-weight:600;color:#3730a3'>"
-        f"📧 {recipient_count} recipient{'s' if recipient_count != 1 else ''}"
-        f"</summary>"
-        f"<ul style='margin:6px 0 0 16px;padding:0'>{recipient_items}</ul>"
-        f"</details>"
-    )
-    sections = [
-        "<div style='border:1px solid #c7d2fe;background:#eef2ff;padding:12px;border-radius:6px;margin:0 0 16px'>",
-        "<p style='margin:0 0 8px'><strong>🗂 Audit copy</strong> &mdash; full recipient list below. "
-        "Real recipients did NOT receive this banner; they got the message via BCC and can only see their own address.</p>",
-        recipient_block,
-    ]
-    if cc_list:
-        sections.append(
-            f"<p style='margin:6px 0'><strong>CC:</strong> {frappe.utils.escape_html(', '.join(cc_list))}</p>"
-        )
-    if bcc_list:
-        sections.append(
-            f"<p style='margin:6px 0'><strong>Additional BCC:</strong> {frappe.utils.escape_html(', '.join(bcc_list))}</p>"
-        )
-    sections.append("</div>")
     return "".join(sections)
 
 
