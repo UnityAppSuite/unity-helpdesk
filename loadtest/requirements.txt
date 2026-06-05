@@ -1,0 +1,4 @@
+# Load-test deps — install into a dedicated venv, NOT the bench env:
+#   python -m venv loadtest/.venv
+#   loadtest/.venv/bin/pip install -r loadtest/requirements.txt
+locust>=2.31,<3

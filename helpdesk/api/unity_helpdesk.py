@@ -3787,10 +3787,11 @@ def update_unity_settings(unity_email_thread_layout=None):
 	if layout not in {"Classic", "Chat Based"}:
 		frappe.throw(_("Invalid email thread layout"))
 
-	settings = frappe.get_doc("HD Settings")
-	settings.unity_email_thread_layout = layout
-	settings.save(ignore_permissions=True)
-	return {"unity_email_thread_layout": settings.unity_email_thread_layout}
+	# Set only the Unity field via db, instead of a full HD Settings doc save:
+	# a full save validates unrelated required fields (e.g. default_ticket_status,
+	# ticket_reopen_status) that can be unset on sites migrated from older Helpdesk.
+	frappe.db.set_single_value("HD Settings", "unity_email_thread_layout", layout)
+	return {"unity_email_thread_layout": layout}
 
 
 @frappe.whitelist()

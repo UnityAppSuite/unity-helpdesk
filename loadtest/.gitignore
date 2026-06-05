@@ -1,0 +1,13 @@
+# Real credentials must never be committed.
+users.csv
+
+# Local virtualenv for locust.
+.venv/
+__pycache__/
+
+# Locust output artifacts.
+*.html
+*_stats.csv
+*_stats_history.csv
+*_failures.csv
+*_exceptions.csv
