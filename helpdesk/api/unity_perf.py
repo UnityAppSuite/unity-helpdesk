@@ -315,7 +315,7 @@ def diagnose_guardian_lookup(emails):
 
 	Usage:
 	    bench --site <site> execute helpdesk.api.unity_perf.diagnose_guardian_lookup \\
-	        --kwargs '{"emails": ["sample.student@walnutedu.in"]}'
+	        --kwargs '{"emails": ["sample.student@example.com"]}'
 	"""
 	_require_admin()
 	# Accept JSON-string (via bench --kwargs) or list/tuple.

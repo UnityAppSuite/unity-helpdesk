@@ -514,8 +514,8 @@ def _group_by(items, key):
 
 
 def _parse_class_number(program):
-	# Program names follow "<class>-<school descriptor>", e.g. "4-Walnut School at Shivane"
-	# or "PG-1-Walnut" — the class segment itself may contain hyphens. rsplit
+	# Program names follow "<class>-<school descriptor>", e.g. "4-Example School"
+	# or "PG-1-Example" — the class segment itself may contain hyphens. rsplit
 	# strips only the final descriptor and preserves multi-segment class labels.
 	raw = cstr(program or "").strip()
 	if not raw:

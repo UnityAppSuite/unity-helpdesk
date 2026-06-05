@@ -82,11 +82,11 @@ cd /home/ankit/frappe-bench/apps/helpdesk
 
 # a) Test-account pool (LOCAL site only — creates real login-capable agents)
 cat loadtest/setup_test_users.py | bench --site unity.local console
-#    -> 30 users loadtest1..30@walnutedu.in, each a Helpdesk Admin + HD Agent
+#    -> 30 users loadtest1..30@example.com, each a Helpdesk Admin + HD Agent
 
 # b) users.csv (git-ignored)
 printf 'usr,pwd\n' > loadtest/users.csv
-for i in $(seq 1 30); do printf 'loadtest%s@walnutedu.in,Loadtest@123\n' "$i" >> loadtest/users.csv; done
+for i in $(seq 1 30); do printf 'loadtest%s@example.com,Loadtest@123\n' "$i" >> loadtest/users.csv; done
 
 # c) locust venv (once)
 python -m venv loadtest/.venv && loadtest/.venv/bin/pip install -r loadtest/requirements.txt

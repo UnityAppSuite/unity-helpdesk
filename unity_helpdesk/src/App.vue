@@ -603,7 +603,7 @@ const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
-const FEEDBACK_EMAIL = "feedback@walnutedu.in";
+const FEEDBACK_EMAIL = "feedback@example.com";
 const bulkEmail = reactive({
   recipients: [
     { email: FEEDBACK_EMAIL, name: FEEDBACK_EMAIL, label: FEEDBACK_EMAIL },

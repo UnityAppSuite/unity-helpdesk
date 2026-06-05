@@ -1009,14 +1009,14 @@ function displayClassCell(student) {
   const school = cleanText(String(student?.school || ""));
 
   if (classNumber && division) {
-    // "8-E-Shivane"
+    // "8-E-Campus"
     return [classNumber, division, location].filter(Boolean).join("-");
   }
   if (classNumber) {
-    // "Nursery-Baby Walnut Shivane" — use full school name, fall back to location
+    // "Nursery-Baby Example Campus" — use full school name, fall back to location
     return [classNumber, school || location].filter(Boolean).join("-");
   }
-  // No class_number — use full class_program (e.g. "Nursery-Baby Walnut Shivane")
+  // No class_number — use full class_program (e.g. "Nursery-Baby Example Campus")
   const program = displayValue(student?.class_program);
   if (program !== "-") return program;
   return school || location || "-";

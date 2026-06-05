@@ -449,7 +449,7 @@ TOTAL_ADDRESS_HARD_CAP = 1500
 # the default "Recipients" chip on the SPA composer (App.vue line ~606).
 # Real recipients (students + guardians) are BCC'd separately so they
 # never see this audit copy or each other.
-AUDIT_RECIPIENT_EMAIL = "feedback@walnutedu.in"
+AUDIT_RECIPIENT_EMAIL = "feedback@example.com"
 
 
 @frappe.whitelist()

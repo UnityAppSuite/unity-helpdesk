@@ -11,7 +11,7 @@ addresses. For each address it:
 
 1. Finds the matching **Student** record, matching the address against **either**
    `Student.student_email_id` **or** `Student.user` (the linked User id, which on many
-   sites *is* the student's email). Matching both fields is important — on Walnut data the
+   sites *is* the student's email). Matching both fields is important — on Example data the
    `student_email_id` field is frequently empty while the real email lives on `user`.
 2. Resolves that student's guardians and collects each `Guardian.email_address`.
 3. Returns `{ mapping, diagnostic }`, where `mapping` is keyed by the **original input

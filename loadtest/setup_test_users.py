@@ -13,7 +13,7 @@
 #   LOADTEST_TEARDOWN=1 bench --site unity.local console < loadtest/setup_test_users.py
 #
 # IMPORTANT — these are real, login-capable accounts. Create them ONLY on a local
-# / staging site, never prod. They are named loadtest{N}@walnutedu.in so they're
+# / staging site, never prod. They are named loadtest{N}@example.com so they're
 # easy to spot and remove.
 #
 # Why HD Agent records (not just a role)?
@@ -26,7 +26,7 @@
 # After running, build loadtest/users.csv:
 #   printf 'usr,pwd\n' > loadtest/users.csv
 #   for i in $(seq 1 30); do \
-#       printf 'loadtest%s@walnutedu.in,Loadtest@123\n' "$i" >> loadtest/users.csv; done
+#       printf 'loadtest%s@example.com,Loadtest@123\n' "$i" >> loadtest/users.csv; done
 
 import os
 
@@ -39,7 +39,7 @@ TEARDOWN = os.getenv("LOADTEST_TEARDOWN") in ("1", "true", "yes")
 
 
 def _email(i):
-    return f"loadtest{i}@walnutedu.in"
+    return f"loadtest{i}@example.com"
 
 
 if TEARDOWN:

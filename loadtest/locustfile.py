@@ -55,7 +55,7 @@ M_STUDENT_CONTEXT = "/api/method/helpdesk.api.unity_helpdesk.get_student_context
 VIEWS = ["all", "all", "all", "my", "my", "unassigned"]
 # A few representative search strings — short tokens + an email-ish term so we
 # exercise both the LIKE and the family/guardian-expansion search paths.
-SEARCH_TERMS = ["fee", "leave", "bus", "exam", "admission", "walnutedu.in"]
+SEARCH_TERMS = ["fee", "leave", "bus", "exam", "admission", "example.com"]
 
 PAGE_LENGTH = 20
 

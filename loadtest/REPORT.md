@@ -149,7 +149,7 @@ Shipped as patch `helpdesk/patches/unity_owner_index.py` (registered in `patches
 - **New:** `helpdesk/patches/unity_owner_index.py` + `patches.txt` entry.
 - **Edit:** `helpdesk/api/unity_helpdesk.py` — search double-fetch removed.
 - **Applied to local DB:** `owner_unity_idx` index; 30 test users + HD Agent records
-  (`loadtest{1..30}@walnutedu.in`). Teardown:
+  (`loadtest{1..30}@example.com`). Teardown:
   `LOADTEST_TEARDOWN=1 bench --site unity.local console < loadtest/setup_test_users.py`
 
 ## 9. Open items (need deployer)

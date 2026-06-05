@@ -48,7 +48,7 @@ Use the provided script (LOCAL site only — it creates real login-capable accou
 cat loadtest/setup_test_users.py | bench --site unity.local console
 ```
 
-This creates 30 `loadtest{N}@walnutedu.in` accounts, each with the **"Helpdesk Admin"
+This creates 30 `loadtest{N}@example.com` accounts, each with the **"Helpdesk Admin"
 role AND an HD Agent record**. Both matter: helpdesk's HD Ticket permission filter
 (`hd_ticket.permission_query`) treats a non-agent as a *customer* and restricts + slows
 the query — `is_agent()` is true only when an HD Agent record exists. Without the HD
@@ -59,7 +59,7 @@ see [`RUNBOOK.md`](./RUNBOOK.md) §0.)
 Then build `users.csv`:
 ```bash
 printf 'usr,pwd\n' > loadtest/users.csv
-for i in $(seq 1 30); do printf 'loadtest%s@walnutedu.in,Loadtest@123\n' "$i" >> loadtest/users.csv; done
+for i in $(seq 1 30); do printf 'loadtest%s@example.com,Loadtest@123\n' "$i" >> loadtest/users.csv; done
 ```
 Tear them down later with: `LOADTEST_TEARDOWN=1 bench --site unity.local console < loadtest/setup_test_users.py`
 
@@ -99,7 +99,7 @@ gated on failure ratio and p95. Tune with `LOADTEST_MAX_FAIL_RATIO` (default `0.
   silently yields `HTTP 0` connection errors. The dev server serves the default site
   regardless of Host header.
 - **Capacity testing:** a gunicorn-backed local server or a staging box — see RUNBOOK §1.
-- **UAT** (`https://uat.unityedu.tech`) — **only in a coordinated, off-hours window.**
+- **UAT** (`https://your-uat-host.example.com`) — **only in a coordinated, off-hours window.**
   Hammering UAT causes the very downtime we're trying to prevent. Agree a slot with
   the deployer first.
 
