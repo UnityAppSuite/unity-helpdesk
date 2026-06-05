@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from datetime import timedelta
 from email.utils import parseaddr
@@ -43,6 +44,51 @@ from helpdesk.utils import (
 
 from ..hd_notification.utils import clear as clear_notifications
 from ..hd_service_level_agreement.utils import get_sla
+
+_KEYWORD_CACHE_KEY = "hd_ticket_type_keywords"
+
+
+def _get_ticket_type_keyword_map():
+    cached = frappe.cache().get_value(_KEYWORD_CACHE_KEY)
+    if cached is not None:
+        return cached
+    rows = frappe.get_all(
+        "HD Ticket Type",
+        filters=[["keywords", "!=", ""]],
+        fields=["name", "keywords"],
+        order_by="name asc",
+    )
+    result = []
+    for row in rows:
+        kws = [k.strip().lower() for k in (row.keywords or "").split(",") if k.strip()]
+        if kws:
+            result.append((row.name, kws))
+    frappe.cache().set_value(_KEYWORD_CACHE_KEY, result, expires_in_sec=3600)
+    return result
+
+
+def _match_ticket_type_by_keywords(text, keyword_map):
+    """Return (type_name, matched_keyword) for the longest matching keyword across all types.
+
+    Word-boundary aware: keyword "pay" does NOT match "happy" or "display".
+    Deterministic tie-break: longest keyword wins; ties broken by type name asc.
+    """
+    if not text or not keyword_map:
+        return None
+    text_lower = text.lower()
+    best = None  # (sort_key, type_name, kw)
+    for type_name, keywords in keyword_map:
+        for kw in keywords:
+            if not kw:
+                continue
+            pattern = re.compile(r"(?<!\w)" + re.escape(kw) + r"(?!\w)")
+            if pattern.search(text_lower):
+                sort_key = (-len(kw), type_name)
+                if best is None or sort_key < best[0]:
+                    best = (sort_key, type_name, kw)
+    if best is None:
+        return None
+    return best[1], best[2]
 
 
 class HDTicket(Document):
@@ -188,6 +234,9 @@ class HDTicket(Document):
         ):
             self.send_acknowledgement_email()
 
+        # Unity: optional auto-reply when enabled in HD Settings
+        self.validate_auto_reply()
+
     def capture_ticket_created_telemetry_events(self):
         if self.subject == "Welcome to Helpdesk":
             return
@@ -248,8 +297,58 @@ class HDTicket(Document):
     def set_ticket_type(self):
         if self.ticket_type:
             return
+        # Unity: keyword-based auto-assignment takes priority over the default.
+        self.auto_assign_ticket_type()
+        if self.ticket_type:
+            return
         self.ticket_type = (
             frappe.db.get_single_value("HD Settings", "default_ticket_type") or ""
+        )
+
+    def auto_assign_ticket_type(self):
+        if self.ticket_type:
+            return
+        text = f"{self.subject or ''} {self.description or ''}"
+        if not text.strip():
+            return
+        match = _match_ticket_type_by_keywords(text, _get_ticket_type_keyword_map())
+        if match:
+            self.ticket_type = match[0]
+
+    def validate_auto_reply(self):
+        try:
+            settings = frappe.get_single("HD Settings")
+            template_name = getattr(settings, "auto_reply_email_template", None)
+            if getattr(settings, "enable_auto_reply", 0) and template_name:
+                self._send_auto_reply(template_name)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "HD Ticket auto reply")
+
+    def _send_auto_reply(self, template_name):
+        from frappe.core.doctype.communication.email import make
+
+        template = frappe.get_doc("Email Template", template_name)
+        context = self.as_dict()
+        subject = frappe.render_template(template.subject, context=context)
+        message = frappe.render_template(template.response, context=context)
+        email_accounts = frappe.get_all(
+            "Email Account", filters={"enable_outgoing": 1}, limit=1
+        )
+        if not email_accounts:
+            return
+        email_account = frappe.get_doc("Email Account", email_accounts[0].name)
+        make(
+            doctype=self.doctype,
+            name=self.name,
+            subject=subject,
+            content=message,
+            sender=email_account.email_id,
+            sender_full_name=email_account.name,
+            send_email=True,
+            recipients=self.raised_by,
+            sent_or_received="Sent",
+            communication_type="Communication",
+            now=True,
         )
 
     def set_raised_by(self):

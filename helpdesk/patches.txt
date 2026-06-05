@@ -38,3 +38,19 @@ helpdesk.patches.set_last_customer_agent_response
 helpdesk.patches.add_agent_manager_perms_in_assignment_rule
 helpdesk.patches.set_std_views_non_public
 helpdesk.patches.rename_and_update_std_views #v2
+# --- Unity Helpdesk patches (forward-ported onto frappe/main) ---
+helpdesk.patches.unity_helpdesk_roles
+helpdesk.patches.unity_ticket_message_search_fields
+helpdesk.patches.unity_helpdesk_student_search_fields
+helpdesk.patches.unity_helpdesk_portal_origin_fields
+helpdesk.patches.unity_ticket_message_search_rebuild
+helpdesk.patches.unity_canned_response_extension
+helpdesk.patches.unity_ticket_creation_index
+helpdesk.patches.unity_reply_link_field
+helpdesk.patches.unity_bulk_email_recipients_field
+helpdesk.patches.unity_bulk_email_recipients_backfill
+helpdesk.patches.unity_raised_by_index
+helpdesk.patches.unity_ticket_list_indexes
+helpdesk.patches.unity_ticket_search_fulltext
+helpdesk.patches.unity_ticket_type_color_field
+helpdesk.patches.unity_post_migrate_warmup

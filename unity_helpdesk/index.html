@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/assets/helpdesk/unity_helpdesk/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Unity Helpdesk</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script>
+      window.csrf_token = "{{ csrf_token }}"
+      window.frappe_version = "{{ frappe_version }}"
+      window.helpdesk_version = "{{ helpdesk_version }}"
+      window.site_name = "{{ site_name }}"
+    </script>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

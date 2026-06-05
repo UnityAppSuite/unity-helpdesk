@@ -12,13 +12,20 @@
   "is_system",
   "disabled",
   "description",
-  "priority"
+  "priority",
+  "keywords"
  ],
  "fields": [
   {
    "fieldname": "description",
    "fieldtype": "Small Text",
    "label": "Description"
+  },
+  {
+   "fieldname": "keywords",
+   "fieldtype": "Small Text",
+   "label": "Auto-assign Keywords (comma-separated)",
+   "description": "If any of these words appear in a new ticket subject or message, the ticket type is auto-set to this type."
   },
   {
    "fieldname": "priority",

@@ -13,6 +13,12 @@ from .ticket_feedback import create_ticket_feedback_options
 from .ticket_type import create_fallback_ticket_type, create_ootb_ticket_types
 from .welcome_ticket import create_welcome_ticket
 
+UNITY_HELPDESK_ROLES = [
+	"Helpdesk User",
+	"Helpdesk Admin",
+	"Helpdesk Super Admin",
+]
+
 
 def after_install():
     create_custom_fields(get_custom_fields())
@@ -34,8 +40,54 @@ def after_install():
     add_website_settings_permission()
     add_default_views()
     add_email_template_perms_for_agent_and_agent_manager()
+    # Unity Helpdesk: roles + custom fields (idempotent). Needed because
+    # `bench install-app` marks patches.txt as applied without running them,
+    # so the unity field patches never execute on a brand-new site.
+    ensure_unity_roles()
+    ensure_unity_custom_fields()
     # Always keep this at last, because sql_ddl makes the db commit
     add_fts_index()
+
+
+def ensure_unity_custom_fields():
+    """Create Unity Helpdesk custom fields on a fresh install.
+
+    On `bench install-app`, Frappe marks patches in patches.txt as applied
+    without executing them — so the patches that create the unity custom
+    fields never run on a brand-new site. We invoke their execute() here
+    (both are idempotent, and their backfill loops are no-ops on a fresh
+    site that has no tickets yet)."""
+    from helpdesk.patches import (
+        unity_helpdesk_portal_origin_fields,
+        unity_helpdesk_student_search_fields,
+        unity_reply_link_field,
+        unity_ticket_message_search_fields,
+        unity_ticket_type_color_field,
+    )
+
+    unity_helpdesk_student_search_fields.execute()
+    unity_ticket_message_search_fields.execute()
+    unity_helpdesk_portal_origin_fields.execute()
+    unity_reply_link_field.execute()
+    unity_ticket_type_color_field.execute()
+
+
+def add_support_redirect_to_tickets():
+    website_settings = frappe.get_doc("Website Settings")
+
+    for route_redirects in website_settings.route_redirects:
+        if route_redirects.source == "support":
+            return
+
+    website_settings.append(
+        "route_redirects",
+        {
+            "source": "support",
+            "target": "support/tickets",
+            "redirect_http_status": 301,
+        },
+    )
+    website_settings.save()
 
 
 def add_default_categories_and_articles():
@@ -231,6 +283,24 @@ def add_email_template_perms_for_agent_and_agent_manager():
         add_permission("Email Template", role)
         for perm in permissions:
             update_permission_property("Email Template", role, 0, perm, 1)
+
+
+def ensure_unity_roles():
+	for role_name in UNITY_HELPDESK_ROLES:
+		if frappe.db.exists("Role", role_name):
+			continue
+		role_doc = frappe.new_doc("Role")
+		role_doc.role_name = role_name
+		role_doc.desk_access = 1
+		role_doc.search_bar = True
+		role_doc.notifications = True
+		role_doc.list_sidebar = True
+		role_doc.bulk_actions = True
+		role_doc.view_switcher = True
+		role_doc.form_sidebar = True
+		role_doc.timeline = True
+		role_doc.dashboard = True
+		role_doc.insert(ignore_permissions=True)
 
 
 def add_default_assignment_rule():

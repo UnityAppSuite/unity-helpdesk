@@ -33,7 +33,10 @@ share/python-wheels/
 helpdesk/docs/current
 helpdesk/public/desk
 helpdesk/public/frontend
+helpdesk/public/unity_desk
+helpdesk/public/unity_helpdesk
 helpdesk/public/node_modules
 helpdesk/www/helpdesk/index.html
+helpdesk/www/unity_helpdesk/index.html
 desk/components.d.ts
 desk/stats.html

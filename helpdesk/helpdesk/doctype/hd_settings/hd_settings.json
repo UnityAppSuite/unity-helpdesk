@@ -53,6 +53,14 @@
   "brand_logo",
   "favicon",
   "images_column",
+  "unity_helpdesk_section",
+  "helpdesk_ui",
+  "enable_unity_ticket_reminders",
+  "column_break_unity_reminders",
+  "unity_reminder_after_days",
+  "unity_email_thread_layout",
+  "enable_auto_reply",
+  "auto_reply_email_template",
   "misc_tab",
   "setup_section",
   "setup_complete",
@@ -203,6 +211,56 @@
   {
    "fieldname": "column_break_fsjn",
    "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "unity_helpdesk_section",
+   "fieldtype": "Section Break",
+   "label": "Unity Helpdesk"
+  },
+  {
+   "default": "Default Helpdesk",
+   "fieldname": "helpdesk_ui",
+   "fieldtype": "Select",
+   "label": "Preferred Helpdesk UI",
+   "options": "Default Helpdesk\nUnity Helpdesk"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_unity_ticket_reminders",
+   "fieldtype": "Check",
+   "label": "Enable Unity Ticket Reminders"
+  },
+  {
+   "fieldname": "column_break_unity_reminders",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "3",
+   "depends_on": "enable_unity_ticket_reminders",
+   "fieldname": "unity_reminder_after_days",
+   "fieldtype": "Int",
+   "label": "Reminder After Days",
+   "non_negative": 1
+  },
+  {
+   "default": "Classic",
+   "fieldname": "unity_email_thread_layout",
+   "fieldtype": "Select",
+   "label": "Unity Email Thread Layout",
+   "options": "Classic\nChat Based"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_auto_reply",
+   "fieldtype": "Check",
+   "label": "Enable Auto Reply on New Ticket"
+  },
+  {
+   "depends_on": "eval:doc.enable_auto_reply",
+   "fieldname": "auto_reply_email_template",
+   "fieldtype": "Link",
+   "label": "Auto Reply Email Template",
+   "options": "Email Template"
   },
   {
    "default": "0",
@@ -509,7 +567,7 @@
  "grid_page_length": 50,
  "issingle": 1,
  "links": [],
- "modified": "2025-12-18 10:37:02.103507",
+ "modified": "2026-05-07 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Helpdesk",
  "name": "HD Settings",

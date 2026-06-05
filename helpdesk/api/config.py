@@ -7,6 +7,7 @@ def get_config():
         "brand_name",
         "brand_logo",
         "favicon",
+        "helpdesk_ui",
         "prefer_knowledge_base",
         "setup_complete",
         "skip_email_workflow",
@@ -16,11 +17,12 @@ def get_config():
         "disable_saved_replies_global_scope",
         "enable_comment_reactions",
     ]
-    res = frappe.get_value(doctype="HD Settings", fieldname=fields, as_dict=True)
+    res = frappe.get_value(doctype="HD Settings", fieldname=fields, as_dict=True) or frappe._dict()
 
     res.favicon = (
         res.favicon
         or frappe.db.get_single_value("Website Settings", "favicon")
         or "/assets/helpdesk/desk/favicon.svg"
     )
+    res.helpdesk_ui = res.helpdesk_ui or "Default Helpdesk"
     return res

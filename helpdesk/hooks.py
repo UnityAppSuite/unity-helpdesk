@@ -38,7 +38,8 @@ scheduler_events = {
         "helpdesk.search.download_corpus",
     ],
     "daily": [
-        "helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.close_tickets_after_n_days"
+        "helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.close_tickets_after_n_days",
+        "helpdesk.api.unity_helpdesk.send_open_ticket_reminders",
     ],
     "hourly_long": [
         "helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.update_sla_status_in_ticket"
@@ -50,6 +51,14 @@ website_route_rules = [
     {
         "from_route": "/helpdesk/<path:app_path>",
         "to_route": "helpdesk",
+    },
+    {
+        "from_route": "/unity-helpdesk",
+        "to_route": "unity_helpdesk",
+    },
+    {
+        "from_route": "/unity-helpdesk/<path:app_path>",
+        "to_route": "unity_helpdesk",
     },
 ]
 
@@ -68,6 +77,22 @@ doc_events = {
     "Assignment Rule": {
         "on_trash": "helpdesk.extends.assignment_rule.on_assignment_rule_trash",
         "validate": "helpdesk.extends.assignment_rule.on_assignment_rule_validate",
+    },
+    # Unity search index: resilient to overrides another app installs on
+    # HD Ticket / Communication / HD Ticket Comment.
+    "HD Ticket": {
+        "after_insert": "helpdesk.helpdesk.hooks.search_index.on_ticket_after_insert",
+    },
+    "Communication": {
+        "after_insert": [
+            "helpdesk.helpdesk.hooks.search_index.on_communication_after_insert",
+            "helpdesk.helpdesk.hooks.reply_link.on_communication_after_insert",
+        ],
+        "on_update": "helpdesk.helpdesk.hooks.search_index.on_communication_on_update",
+    },
+    "HD Ticket Comment": {
+        "after_insert": "helpdesk.helpdesk.hooks.search_index.on_comment_after_insert",
+        "on_update": "helpdesk.helpdesk.hooks.search_index.on_comment_on_update",
     },
 }
 

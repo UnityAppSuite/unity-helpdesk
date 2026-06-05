@@ -12,6 +12,11 @@
   "subject",
   "raised_by",
   "status",
+  "unity_hold_section",
+  "custom_is_on_hold",
+  "custom_hold_from",
+  "custom_hold_to",
+  "custom_hold_reason",
   "priority",
   "status_category",
   "cb00",
@@ -105,6 +110,36 @@
    "oldfieldtype": "Select",
    "options": "HD Ticket Status",
    "search_index": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "unity_hold_section",
+   "fieldtype": "Section Break",
+   "label": "Unity Hold Details"
+  },
+  {
+   "default": "0",
+   "fieldname": "custom_is_on_hold",
+   "fieldtype": "Check",
+   "label": "On Hold"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_from",
+   "fieldtype": "Date",
+   "label": "Hold From"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_to",
+   "fieldtype": "Date",
+   "label": "Hold To"
+  },
+  {
+   "depends_on": "custom_is_on_hold",
+   "fieldname": "custom_hold_reason",
+   "fieldtype": "Small Text",
+   "label": "Hold Reason"
   },
   {
    "fieldname": "priority",
@@ -470,7 +505,7 @@
  "icon": "fa fa-issue",
  "idx": 61,
  "links": [],
- "modified": "2026-04-30 19:58:44.919596",
+ "modified": "2026-05-07 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Helpdesk",
  "name": "HD Ticket",

@@ -1,0 +1,21 @@
+{
+  "name": "unity-helpdesk-ui",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "NODE_PATH=../desk/node_modules ../desk/node_modules/.bin/vite --host 0.0.0.0",
+    "preview": "NODE_PATH=../desk/node_modules ../desk/node_modules/.bin/vite preview",
+    "build": "NODE_PATH=../desk/node_modules ../desk/node_modules/.bin/vite build --base=/assets/helpdesk/unity_helpdesk/ && yarn copy-html-entry",
+    "copy-html-entry": "cp ../helpdesk/public/unity_helpdesk/index.html ../helpdesk/www/unity_helpdesk/index.html"
+  },
+  "dependencies": {
+    "@tinymce/tinymce-vue": "^6.2.1",
+    "@vitejs/plugin-vue": "^4.0.0",
+    "dompurify": "^3.1.6",
+    "tinymce": "^7.9.1",
+    "vite": "^4.1.4",
+    "vue": "^3.3.4",
+    "vue-router": "^4.2.2"
+  },
+  "devDependencies": {}
+}
