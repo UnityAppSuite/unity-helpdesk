@@ -2359,20 +2359,24 @@ tbody tr.bulk-email-ticket:hover {
   padding: 4px 0;
 }
 
+/* Agent (the support team — "us") sits on the right like sent messages;
+   the customer sits on the left. */
 .thread-layout-chat-based .chat-msg--customer {
+  align-self: flex-start;
+  border-bottom-left-radius: 6px;
+}
+
+.thread-layout-chat-based .chat-msg--agent {
   align-self: flex-end;
   border-bottom-right-radius: 6px;
 }
 
-.thread-layout-chat-based .chat-msg--agent {
-  align-self: flex-start;
-  border-bottom-left-radius: 6px;
-}
-
+/* Internal notes belong to the agent ("our") side — keep them on the right
+   with the agent replies, WhatsApp-style. */
 .thread-layout-chat-based .chat-msg--comment {
-  align-self: flex-start;
+  align-self: flex-end;
   max-width: min(68%, 620px);
-  border-bottom-left-radius: 6px;
+  border-bottom-right-radius: 6px;
 }
 
 .thread-layout-chat-based .chat-msg-time {
