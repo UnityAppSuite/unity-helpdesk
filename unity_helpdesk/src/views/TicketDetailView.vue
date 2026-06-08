@@ -463,16 +463,6 @@
                 }}</span>
               </div>
               <div
-                v-if="
-                  item._type === 'comm' &&
-                  item.sent_or_received === 'Sent' &&
-                  item.recipients
-                "
-                class="chat-msg-recipients"
-              >
-                <span class="chat-msg-to-label">To:</span>{{ item.recipients }}
-              </div>
-              <div
                 class="chat-msg-body safe-html"
                 v-html="sanitize(threadContent(item))"
               ></div>
@@ -810,23 +800,27 @@ const form = reactive({
 const history = computed(() => ticket.value.history || []);
 const assignmentHistory = computed(() => ticket.value.assignment_history || []);
 const timeline = computed(() => {
+  let items;
   if (Array.isArray(ticket.value.thread) && ticket.value.thread.length) {
-    return [...ticket.value.thread].sort(
-      (a, b) => new Date(a.creation) - new Date(b.creation)
-    );
+    items = [...ticket.value.thread];
+  } else {
+    const comms = communications.value.map((c) => ({
+      ...c,
+      _type: "comm",
+    }));
+    const notes = comments.value.map((c) => ({
+      ...c,
+      _type: "comment",
+      sender: c.commented_by,
+    }));
+    items = [...comms, ...notes];
   }
-  const comms = communications.value.map((c) => ({
-    ...c,
-    _type: "comm",
-  }));
-  const notes = comments.value.map((c) => ({
-    ...c,
-    _type: "comment",
-    sender: c.commented_by,
-  }));
-  return [...comms, ...notes].sort(
-    (a, b) => new Date(a.creation) - new Date(b.creation)
-  );
+  // Drop the auto-generated intake message when all it carries is the
+  // student / sibling / fee / previous-ticket template that's already shown in
+  // the dedicated sections above (see isRedundantPrimaryMessage).
+  return items
+    .filter((item) => !isRedundantPrimaryMessage(item))
+    .sort((a, b) => new Date(a.creation) - new Date(b.creation));
 });
 const filteredPreviousTickets = computed(() =>
   previousTicketRows.value.filter((item) =>
@@ -1402,13 +1396,37 @@ function threadContent(item) {
       return normalizeTicketLinksInHtml(remaining);
     }
     if (hasStructuredBlocks) {
-      return `<p class="thread-summary-note">Student, sibling, fee, and previous ticket details are shown in the sections above.</p>`;
+      // Pure intake template — the blocks are shown in the sections above and
+      // this message is dropped from the timeline by isRedundantPrimaryMessage.
+      // Return empty as a defensive guard so no "shown above" note ever renders.
+      return "";
     }
     // No structured blocks parsed — fall back to the real content, never blank.
     return normalizeTicketLinksInHtml(remaining || raw);
   }
 
   return normalizeTicketLinksInHtml(raw);
+}
+
+// True only for the auto-generated intake message (equals ticket.description)
+// whose student / sibling / fee / previous-ticket blocks are already surfaced in
+// the dedicated sections above AND which has no human-written text left once
+// those blocks are lifted out. Such a message is pure duplication, so the
+// timeline drops it entirely rather than showing an empty bubble or a redundant
+// "details shown above" note. A primary message carrying real text is kept.
+function isRedundantPrimaryMessage(item) {
+  if (item?._type !== "comm") return false;
+  const normalizedRaw = normalizeHtml(item.content || "");
+  if (!normalizedRaw) return false;
+  if (normalizedRaw !== normalizeHtml(ticket.value?.description || "")) {
+    return false;
+  }
+  const parsed = parsedDescription.value || {};
+  const hasStructuredBlocks =
+    (parsed.students && parsed.students.length) ||
+    (parsed.fees && parsed.fees.length) ||
+    parsed.previousTicketsHtml;
+  return hasStructuredBlocks && !hasMeaningfulHtml(parsed.remainingHtml || "");
 }
 
 function applyForm() {

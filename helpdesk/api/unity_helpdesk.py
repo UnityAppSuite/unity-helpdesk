@@ -55,6 +55,13 @@ UNITY_TICKET_FIELDS = [
 	"priority",
 	"ticket_type",
 	"agent_group",
+	# `description` is the full ticket HTML (often tens of KB of student/fee
+	# tables). It's fetched because the single-ticket / detail callers of
+	# _ticket_fields() (TicketDetailView renders it for bulk-email tickets) need
+	# it — but it's stripped from the *list* response via
+	# LIST_RESPONSE_EXCLUDED_FIELDS, since the ticket list never renders it and
+	# shipping it per row made a guardian-email search return ~1 MB/page and blow
+	# the SPA's 20 s search timeout.
 	"description",
 	"creation",
 	"modified",
@@ -84,6 +91,32 @@ OPTIONAL_TICKET_FIELDS = [
 	# resolves back to a bulk audit ticket — used by SPA for color + banner.
 	"custom_replied_to_ticket",
 ]
+
+# Fields fetched for the candidate set because search ranking reads them
+# (`legacy_content_fields` in _ticket_search_documents) or because they are the
+# raw/HTML twin of a lighter field the SPA does use — but which the ticket *list*
+# never renders. They are stripped from the page response, after ranking has
+# already consumed them, so a search matching hundreds of tickets doesn't ship
+# megabytes of unused HTML to the browser (the root cause of the search timeout).
+# The detail view fetches its own copy of these via the single-ticket endpoint.
+# Anything here MUST stay out of AVAILABLE_TICKET_COLUMNS (none are user columns).
+LIST_RESPONSE_EXCLUDED_FIELDS = (
+	# Full ticket HTML — only the detail view (_decorate_ticket, singular) renders
+	# it; the list never does. Biggest single contributor to the search payload.
+	"description",
+	"custom_list_of_student",
+	"custom_all_fees_details_of_students",
+	"custom_payment_schedule",
+	"custom_student_remark",
+	"custom_previous_ticket_details",
+	# Heavy HTML twin of custom_primary_message_text (which the SPA *does* use).
+	"custom_primary_message_html",
+	# Ranking-only index fields the list SPA never reads (it uses
+	# custom_search_student_names for the student chips, nothing else here).
+	"custom_search_message_body",
+	"custom_search_student_refs",
+	"custom_search_guardian_emails",
+)
 
 
 def _session_user():
@@ -434,6 +467,11 @@ def _decorate_ticket_rows(rows):
 			row_dict.assignee = None
 		row_dict.status_indicator = _status_indicator(row_dict)
 		row_dict.priority_target = PRIORITY_TARGETS.get(row_dict.get("priority"), "")
+		# Drop the heavy ranking-only / HTML fields before they hit the wire.
+		# Ranking already ran on the candidate rows (search path) and the
+		# non-search path never needed them — see LIST_RESPONSE_EXCLUDED_FIELDS.
+		for excluded in LIST_RESPONSE_EXCLUDED_FIELDS:
+			row_dict.pop(excluded, None)
 		decorated.append(row_dict)
 	return decorated
 
