@@ -502,6 +502,87 @@ RECIPIENT_HARD_CAP = 1000
 TOTAL_ADDRESS_HARD_CAP = 1500
 
 
+def _safe_render(text, context):
+    """Render a Jinja string against `context` for bulk-email mail-merge.
+
+    Renders through Frappe's SANDBOXED jinja environment (SSTI-safe) but overlays
+    ``jinja2.ChainableUndefined`` so a missing name OR a missing attribute/key
+    (``{{first_name}}`` or ``{{a.b.c}}``) renders BLANK instead of raising — the
+    "render blank, still send" rule. Plain text with no Jinja is returned as-is;
+    any unexpected failure falls back to the unrendered text so a bad template can
+    never drop a recipient.
+    """
+    text = cstr(text or "")
+    if "{{" not in text and "{%" not in text:
+        return text
+    try:
+        from jinja2 import ChainableUndefined
+
+        from frappe.utils.jinja import get_jenv
+
+        jenv = get_jenv().overlay(undefined=ChainableUndefined)
+        return jenv.from_string(text).render(context or {})
+    except Exception:
+        return text
+
+
+def _students_by_email(emails):
+    """Map lowercased email -> Student field dict for a batch of recipient emails
+    (matched on student_email_id OR user) in ONE query, so per-recipient merge
+    context can include Student fields (walsh-admin style ``{**student, **row}``).
+    Returns {} for sites without the education app; best-effort, never raises."""
+    normalized = {e for e in (cstr(x or "").strip().lower() for x in (emails or [])) if e}
+    if not normalized or not frappe.db.exists("DocType", "Student"):
+        return {}
+    out = {}
+    try:
+        rows = frappe.get_all(
+            "Student",
+            or_filters={
+                "student_email_id": ["in", list(normalized)],
+                "user": ["in", list(normalized)],
+            },
+            fields=["*"],
+        )
+    except Exception:
+        return {}
+    for row in rows:
+        for key in ("student_email_id", "user"):
+            value = cstr(row.get(key) or "").strip().lower()
+            if value in normalized and value not in out:
+                out[value] = row
+    return out
+
+
+def _students_by_name(names):
+    """Map lowercased Student.name -> a small student field dict (one query) for
+    resolving a CSV student-ID column to a recipient email + display name. The
+    name PK match is collation-insensitive, so "wacb39" finds "WACB39". Returns {}
+    on sites without the education app; best-effort, never raises."""
+    normalized = {n for n in (cstr(x or "").strip() for x in (names or [])) if n}
+    if not normalized or not frappe.db.exists("DocType", "Student"):
+        return {}
+    out = {}
+    try:
+        rows = frappe.get_all(
+            "Student",
+            filters={"name": ["in", list(normalized)]},
+            fields=[
+                "name",
+                "student_email_id",
+                "user",
+                "first_name",
+                "last_name",
+                "student_name",
+            ],
+        )
+    except Exception:
+        return {}
+    for row in rows:
+        out[cstr(row.get("name")).strip().lower()] = row
+    return out
+
+
 @frappe.whitelist()
 def bulk_send_email(
     subject,
@@ -511,6 +592,7 @@ def bulk_send_email(
     bcc=None,
     attachments=None,
     ticket_type=None,
+    merge_data=None,
 ):
     capabilities = _require_unity_access()
     if not capabilities.get("can_view_all_tickets"):
@@ -600,9 +682,19 @@ def bulk_send_email(
     else:
         file_names = []
 
+    # Per-recipient mail-merge context: a JSON map {email_lower: {col: val, ...}}
+    # from the imported CSV. Optional — absent for a plain (non-personalized) blast.
+    merge_map = {}
+    raw_merge = _parse_json(merge_data, {}) or {}
+    if isinstance(raw_merge, dict):
+        for key, row in raw_merge.items():
+            email_key = cstr(key or "").strip().lower()
+            if email_key and isinstance(row, dict):
+                merge_map[email_key] = {cstr(col).strip(): row[col] for col in row}
+
     frappe.enqueue(
         "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
-        queue="short",
+        queue="long",
         subject=subject,
         message=message,
         recipients=valid_emails,
@@ -611,6 +703,7 @@ def bulk_send_email(
         sender=frappe.session.user,
         file_names=file_names,
         ticket_type=ticket_type,
+        merge_data=merge_map,
     )
 
     # "count" is the real audience the email will reach: default recipients (TO)
@@ -635,20 +728,25 @@ def _bulk_send_email_job(
     sender=None,
     file_names=None,
     ticket_type=None,
+    merge_data=None,
 ):
     """Background worker for bulk_send_email.
 
-    Receives already-validated data, creates the audit HD Ticket and a
-    Communication, then sends ONE BCC email to all real recipients plus the
-    configured default recipients. Runs with ignore_permissions and passes
-    `sender` explicitly because there is no request user in a worker. Any
-    failure is logged via frappe.log_error, never raised silently.
+    Creates the audit HD Ticket + one Communication (storing the UNRENDERED
+    template), then delivers the email. When the subject/body carry Jinja
+    placeholders or a CSV merge map was supplied, it renders and sends ONE email
+    PER recipient (context = {**student, **csv_row, "email"}) so every copy is
+    personalized AND each recipient's To shows only their own address. Otherwise it
+    sends a single hidden-recipient blast. CC is always sent ONCE, separately,
+    un-personalized. Runs ignore_permissions with an explicit `sender`; never
+    raises — failures are logged.
     """
     try:
         recipients = recipients or []
         cc_list = cc_list or []
         bcc_list = bcc_list or []
         file_names = file_names or []
+        merge_data = merge_data or {}
 
         audit_description = _bulk_email_audit_html(
             recipients, cc_list, bcc_list, message
@@ -672,15 +770,16 @@ def _bulk_send_email_job(
             payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
         doc = frappe.get_doc(payload).insert(ignore_permissions=True)
 
-        sendmail_attachments = [{"file_url": name} for name in file_names]
+        # Attach by File docname via "fid". The old {"file_url": name} passed a
+        # docname where frappe.sendmail expects an actual URL, so it matched no File
+        # and attachments silently never sent. File.get_content() reads from disk
+        # with no permission check, so private orphan files attach fine in the worker.
+        sendmail_attachments = [{"fid": name} for name in file_names]
 
         # Resolve the recipient list. Every address — the students plus the
         # configured default/audit recipients (from HD Settings) — goes into one
-        # de-duplicated list. Frappe delivers each recipient an INDIVIDUAL email
-        # (the queue is sent one address at a time, and with expose_recipients=None
-        # the To header shows only that person's own address), so no recipient can
-        # ever see another's email. The sender (the logged-in agent) is NEVER added
-        # as a recipient — they only appear as the From address.
+        # de-duplicated list. The sender (the logged-in agent) is NEVER added as a
+        # recipient — they only appear as the From address.
         targets = []
         target_seen = set()
         for addr in list(bcc_list) + list(recipients) + _default_bulk_recipients():
@@ -722,19 +821,56 @@ def _bulk_send_email_job(
                 "Unity Helpdesk bulk_send_email: Communication creation",
             )
 
-        # Each recipient receives their own copy; expose_recipients=None hides every
-        # other recipient. CC (if any) is intentionally visible to all.
-        frappe.sendmail(
-            recipients=targets,
-            cc=cc_list or None,
-            subject=subject,
-            message=message,
-            attachments=sendmail_attachments,
-            delayed=True,
-            reference_doctype=TICKET_DOCTYPE,
-            reference_name=doc.name,
-            expose_recipients=None,
-        )
+        # Personalize only when there's something to merge; otherwise one efficient
+        # blast. BOTH paths hide co-recipients (expose_recipients=None + single-address
+        # delivery) and carry the attachments.
+        needs_merge = bool(merge_data) or ("{{" in subject) or ("{{" in message)
+        if needs_merge:
+            students = _students_by_email(targets)
+            for addr in targets:
+                key = (addr or "").strip().lower()
+                context = {
+                    **(students.get(key) or {}),
+                    **(merge_data.get(key) or {}),
+                    "email": addr,
+                }
+                frappe.sendmail(
+                    recipients=[addr],
+                    subject=_safe_render(subject, context),
+                    message=_safe_render(message, context),
+                    attachments=sendmail_attachments,
+                    delayed=True,
+                    reference_doctype=TICKET_DOCTYPE,
+                    reference_name=doc.name,
+                    expose_recipients=None,
+                )
+        else:
+            frappe.sendmail(
+                recipients=targets,
+                subject=subject,
+                message=message,
+                attachments=sendmail_attachments,
+                delayed=True,
+                reference_doctype=TICKET_DOCTYPE,
+                reference_name=doc.name,
+                expose_recipients=None,
+            )
+
+        # CC: ONE un-personalized copy (placeholders blanked), never to an address
+        # that already received it as a recipient. Kept out of the per-recipient loop
+        # so CC people get a single copy, not one per student.
+        cc_targets = [c for c in cc_list if (c or "").strip().lower() not in target_seen]
+        if cc_targets:
+            frappe.sendmail(
+                recipients=cc_targets,
+                subject=_safe_render(subject, {}),
+                message=_safe_render(message, {}),
+                attachments=sendmail_attachments,
+                delayed=True,
+                reference_doctype=TICKET_DOCTYPE,
+                reference_name=doc.name,
+                expose_recipients="header",
+            )
 
         frappe.db.commit()
     except Exception:
@@ -817,10 +953,114 @@ def get_bulk_email_sample_csv():
     _require_unity_access()
     buffer = StringIO()
     writer = csv.writer(buffer)
-    writer.writerow(["email", "name"])
-    writer.writerow(["parent1@example.com", "Parent One"])
-    writer.writerow(["parent2@example.com", "Parent Two"])
-    writer.writerow(["guardian3@example.com", "Guardian Three"])
+    # First column is the STUDENT ID (Student.name) — the recipient email and all
+    # student details ({{first_name}}, {{last_name}}, …) are looked up from it. Any
+    # extra columns (e.g. amount) are also usable as {{merge}} fields, overriding
+    # the looked-up student fields.
+    writer.writerow(["name", "amount"])
+    writer.writerow(["BFOA01", "1500"])
+    writer.writerow(["WACB39", "2000"])
     frappe.response["type"] = "csv"
     frappe.response["doctype"] = "bulk_email_sample"
     frappe.response["result"] = buffer.getvalue()
+
+
+# Headers (lowercased) accepted as the student-id column.
+_STUDENT_ID_HEADERS = {"name", "student", "student_id", "student id", "student_name", "student.name", "id"}
+
+
+@frappe.whitelist()
+def parse_bulk_email_csv(content):
+    """Parse an uploaded bulk-email CSV into mail-merge rows, walsh-admin style.
+
+    The CSV carries a STUDENT-ID column (Student.name) — NOT an email. Each id is
+    resolved to a Student; the recipient is the student's own email
+    (student_email_id, falling back to the login `user`) and all student fields
+    become merge context at send time. Any extra columns are kept as additional
+    {{merge}} fields. Robust to quoted commas (csv.DictReader). Whitelisted + gated
+    like the send endpoint.
+    """
+    capabilities = _require_unity_access()
+    if not capabilities.get("can_view_all_tickets"):
+        frappe.throw(_("You are not allowed to send bulk emails"), frappe.PermissionError)
+
+    text = cstr(content or "")
+    if not text.strip():
+        frappe.throw(_("The CSV file is empty"))
+
+    reader = csv.DictReader(StringIO(text))
+    headers = [cstr(h or "").strip() for h in (reader.fieldnames or []) if cstr(h or "").strip()]
+    if not headers:
+        frappe.throw(_("The CSV has no header row"))
+
+    name_col = next((h for h in headers if h.lower() in _STUDENT_ID_HEADERS), None)
+    if not name_col:
+        name_col = next((h for h in headers if "student" in h.lower()), None)
+    if not name_col:
+        frappe.throw(_("The CSV must have a 'name' (student ID) column"))
+
+    # Read rows first, then batch-resolve the students in one query.
+    parsed = []
+    for raw in reader:
+        row = {
+            cstr(k or "").strip(): cstr(v or "").strip()
+            for k, v in raw.items()
+            if cstr(k or "").strip()
+        }
+        sid = cstr(row.get(name_col) or "").strip()
+        if sid:
+            parsed.append((sid, row))
+        if len(parsed) >= RECIPIENT_HARD_CAP * 2:
+            break
+
+    students = _students_by_name([sid for sid, _ in parsed])
+
+    rows = []
+    seen = set()
+    unmatched = 0
+    no_email = 0
+    duplicates = 0
+    for sid, row in parsed:
+        student = students.get(sid.lower())
+        if not student:
+            unmatched += 1
+            continue
+        email = cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
+        if not email or not validate_email_address(email, throw=False):
+            no_email += 1
+            continue
+        if email in seen:
+            duplicates += 1
+            continue
+        seen.add(email)
+        display = (
+            " ".join(
+                p
+                for p in (cstr(student.get("first_name")), cstr(student.get("last_name")))
+                if p.strip()
+            ).strip()
+            or cstr(student.get("student_name") or "").strip()
+            or sid
+        )
+        rows.append({"email": email, "name": display, "data": row})
+        if len(rows) >= RECIPIENT_HARD_CAP:
+            break
+
+    # Merge-field hint: common student fields (auto-resolved) + extra CSV columns.
+    common = []
+    if frappe.db.exists("DocType", "Student"):
+        meta = frappe.get_meta("Student")
+        common = [f for f in ("first_name", "last_name", "middle_name", "student_name") if meta.has_field(f)]
+    extra = [h for h in headers if h.lower() != name_col.lower()]
+    merge_fields = common + [e for e in extra if e not in common]
+
+    return {
+        "headers": headers,
+        "name_column": name_col,
+        "merge_fields": merge_fields,
+        "rows": rows,
+        "count": len(rows),
+        "unmatched_count": unmatched,
+        "no_email_count": no_email,
+        "duplicate_count": duplicates,
+    }

@@ -14,6 +14,11 @@
       @close="pickerOpen = false"
       @select="onTemplateSelected"
     />
+    <EmailTemplatePicker
+      v-if="emailTemplatePickerOpen"
+      @close="emailTemplatePickerOpen = false"
+      @select="onEmailTemplateSelected"
+    />
   </div>
 </template>
 
@@ -33,6 +38,7 @@ import "tinymce/themes/silver";
 import "tinymce/skins/ui/oxide/skin.min.css";
 import "tinymce/skins/content/default/content.min.css";
 import TemplatePicker from "./TemplatePicker.vue";
+import EmailTemplatePicker from "./EmailTemplatePicker.vue";
 
 interface Props {
   modelValue: string;
@@ -40,12 +46,17 @@ interface Props {
   disabled?: boolean;
   minHeight?: number;
   ticketName?: string | null;
+  enableEmailTemplate?: boolean;
 }
 
 interface Emits {
   (event: "update:modelValue", value: string): void;
   (event: "blur"): void;
   (event: "template-subject", value: string): void;
+  (
+    event: "email-template-selected",
+    value: { subject: string; body: string }
+  ): void;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -53,12 +64,14 @@ const props = withDefaults(defineProps<Props>(), {
   disabled: false,
   minHeight: 240,
   ticketName: null,
+  enableEmailTemplate: false,
 });
 
 const emit = defineEmits<Emits>();
 const content = ref(props.modelValue || "");
 const editorInstance = ref<any>(null);
 const pickerOpen = ref(false);
+const emailTemplatePickerOpen = ref(false);
 const apiKey = "no-api-key";
 
 const editorConfig = computed(() => ({
@@ -72,7 +85,9 @@ const editorConfig = computed(() => ({
   content_css: false,
   statusbar: false,
   toolbar:
-    "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code | templates",
+    "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code |" +
+    (props.enableEmailTemplate ? " emailtemplate" : "") +
+    " templates",
   placeholder: props.placeholder,
   content_style: `
     body {
@@ -96,6 +111,13 @@ const editorConfig = computed(() => ({
       tooltip: "Insert saved reply template",
       onAction: () => {
         pickerOpen.value = true;
+      },
+    });
+    editor.ui.registry.addButton("emailtemplate", {
+      text: "Email Template",
+      tooltip: "Load a Frappe Email Template (subject + body)",
+      onAction: () => {
+        emailTemplatePickerOpen.value = true;
       },
     });
   },
@@ -158,6 +180,17 @@ function onTemplateSelected(rendered: Rendered) {
     console.warn("[template-picker] warnings:", rendered.warnings);
   }
   pickerOpen.value = false;
+}
+
+// Email Template is the PRIMARY source: replace the whole body (not insert) and
+// hand the subject to the parent. The parent sets v-model (modelValue), which
+// flows back into the editor via the modelValue watch.
+function onEmailTemplateSelected(payload: { subject: string; body: string }) {
+  if (payload.body) {
+    setContent(payload.body);
+  }
+  emit("email-template-selected", payload);
+  emailTemplatePickerOpen.value = false;
 }
 
 function focus() {

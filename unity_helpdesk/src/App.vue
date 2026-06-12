@@ -310,25 +310,9 @@
             {{ bulkEmailWarning }}
           </p>
 
-          <label v-if="bulkEmail.recipients.length">
-            Recipients
-            <div class="recipient-multiselect recipient-multiselect--locked">
-              <span
-                v-for="chip in bulkEmail.recipients"
-                :key="chip.email"
-                class="recipient-chip recipient-chip--locked"
-              >
-                <span class="recipient-chip-label">{{
-                  chip.label || chip.email
-                }}</span>
-              </span>
-            </div>
-          </label>
-          <p v-else class="muted bulk-email-default-note">
-            No default recipient is configured — this email will be sent from
-            your account. Students stay hidden in BCC. You can set a default
-            recipient in Settings.
-          </p>
+          <!-- Recipients field intentionally hidden from the composer. The default
+               recipient(s) from HD Settings are still applied: bulkEmail.recipients
+               is sent and the backend job also adds _default_bulk_recipients(). -->
 
           <label>
             Subject
@@ -392,6 +376,12 @@
                 :key="b.email"
                 class="recipient-chip"
               >
+                <span
+                  v-if="bulkEmail.mergeData[b.email]"
+                  class="recipient-chip-merge"
+                  title="Personalized from CSV merge data"
+                  >⚡</span
+                >
                 <span class="recipient-chip-label" :title="b.email">{{
                   b.label || b.email
                 }}</span>
@@ -461,6 +451,19 @@
                 }}
               </span>
             </div>
+            <div v-if="bulkEmail.mergeFields.length" class="merge-fields-hint">
+              Merge fields:
+              <code
+                v-for="f in bulkEmail.mergeFields"
+                :key="f"
+                class="merge-field-chip"
+                >{{ mergeFieldToken(f) }}</code
+              >
+              <span class="muted"
+                >— use in the subject/body; blank when a recipient has no
+                value.</span
+              >
+            </div>
           </label>
           <label class="bulk-email-guardian-toggle">
             <input
@@ -487,7 +490,9 @@
               v-model="bulkEmail.message"
               :min-height="240"
               placeholder="Compose the email message"
+              :enable-email-template="true"
               @template-subject="applyTemplateSubjectToBulkEmail"
+              @email-template-selected="applyEmailTemplateToBulkEmail"
             />
           </label>
           <label>
@@ -641,6 +646,8 @@ const bulkEmail = reactive({
   cc: [],
   bcc: [], // [{email, name?, label?}] — students
   attachments: [],
+  mergeData: {}, // { email_lower: { col: val, ... } } from the imported CSV
+  mergeFields: [], // CSV headers (minus email) usable as {{field}} placeholders
 });
 const includeGuardians = ref(false);
 const guardianEmails = ref("");
@@ -799,6 +806,25 @@ function applyTemplateSubjectToBulkEmail(subject) {
     return;
   }
   bulkEmail.subject = subject;
+}
+
+// Build a "{{field}}" label without putting literal }} in the template (Vue's
+// mustache parser would close the interpolation at the first }}).
+function mergeFieldToken(field) {
+  return "{{" + field + "}}";
+}
+
+// Email Template is the primary source — replace BOTH subject and body. The
+// editor already swapped its content; we sync v-model + the subject field here.
+function applyEmailTemplateToBulkEmail(payload) {
+  const subject = payload && payload.subject;
+  const body = payload && payload.body;
+  if (typeof subject === "string" && subject.trim()) {
+    bulkEmail.subject = subject;
+  }
+  if (typeof body === "string") {
+    bulkEmail.message = body;
+  }
 }
 
 function onEmailInput() {
@@ -1100,6 +1126,8 @@ function resetBulkEmail() {
   bulkEmail.cc = [];
   bulkEmail.bcc = [];
   bulkEmail.attachments = [];
+  bulkEmail.mergeData = {};
+  bulkEmail.mergeFields = [];
   ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
@@ -1121,29 +1149,59 @@ async function handleBulkEmailCsv(event) {
   const file = event.target.files?.[0];
   if (!file) return;
   bulkEmailError.value = "";
+  bulkEmailWarning.value = "";
+  bulkEmailUploading.value = true;
   try {
     const text = await file.text();
-    const lines = text.split(/\r?\n/);
-    let startIdx = 0;
-    if (lines.length && /\bemail\b/i.test(lines[0])) startIdx = 1;
+    // Parse on the backend (robust to quoted commas) — returns headers + per-row
+    // data so we get the full mail-merge context, not just the email column.
+    const result = await call(
+      "helpdesk.api.unity_helpdesk_ext.parse_bulk_email_csv",
+      { content: text }
+    );
+    const rows = result?.rows || [];
+    if (!rows.length) {
+      bulkEmailError.value =
+        "No students resolved from the CSV. Include a 'name' (student ID) column — the email + details are looked up from it.";
+      return;
+    }
     const existing = new Set(bulkEmail.bcc.map((b) => b.email));
     let added = 0;
-    for (let i = startIdx; i < lines.length; i += 1) {
-      const cell = (lines[i] || "").split(",")[0].trim();
-      if (cell && EMAIL_REGEX.test(cell) && !existing.has(cell.toLowerCase())) {
-        const lower = cell.toLowerCase();
-        bulkEmail.bcc.push({ email: lower, name: cell, label: cell });
-        existing.add(lower);
+    for (const row of rows) {
+      const email = (row.email || "").toLowerCase().trim();
+      if (!email) continue;
+      // Keep each recipient's CSV row for {{merge}} rendering; student fields are
+      // resolved server-side at send time and merged under these.
+      bulkEmail.mergeData[email] = row.data || {};
+      if (!existing.has(email)) {
+        const label = row.name || email; // student display name
+        bulkEmail.bcc.push({ email, name: label, label });
+        existing.add(email);
         added += 1;
       }
     }
-    if (!added && !bulkEmail.bcc.length) {
-      bulkEmailError.value =
-        "No valid emails found in CSV. Use a single 'email' column.";
-    } else if (added && includeGuardians.value) {
+    // Merge fields = looked-up student fields + any extra CSV columns.
+    bulkEmail.mergeFields =
+      result.merge_fields ||
+      (result.headers || []).filter(
+        (h) => h.toLowerCase() !== (result.name_column || "name").toLowerCase()
+      );
+    if (added && includeGuardians.value) {
       refreshGuardianEmails();
     }
+    let note = `${rows.length} student${
+      rows.length === 1 ? "" : "s"
+    } loaded from CSV.`;
+    if (result.unmatched_count) note += ` ${result.unmatched_count} not found.`;
+    if (result.no_email_count)
+      note += ` ${result.no_email_count} without an email.`;
+    if (result.duplicate_count)
+      note += ` ${result.duplicate_count} duplicate(s) skipped.`;
+    bulkEmailWarning.value = note;
+  } catch (err) {
+    bulkEmailError.value = err.message || "CSV import failed.";
   } finally {
+    bulkEmailUploading.value = false;
     if (bulkEmailCsvInput.value) bulkEmailCsvInput.value.value = "";
   }
 }
@@ -1217,6 +1275,7 @@ async function sendBulkEmail() {
         attachments: JSON.stringify(
           bulkEmail.attachments.map((attachment) => attachment.name)
         ),
+        merge_data: JSON.stringify(bulkEmail.mergeData || {}),
       }
     );
     if (result?.warning) {

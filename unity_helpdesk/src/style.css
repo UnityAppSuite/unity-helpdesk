@@ -317,6 +317,29 @@ nav a.router-link-active {
 }
 .recipient-chip-remove:hover { color: #ef4444; }
 .recipient-multiselect--locked { cursor: default; background: #f8fafc; }
+.recipient-chip-merge {
+  color: #b45309;
+  font-size: 11px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.merge-fields-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #475569;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.merge-field-chip {
+  background: #eef2ff;
+  color: #4338ca;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
 .recipient-chip--locked { background: #e0e7ff; border-color: #a5b4fc; }
 .bulk-email-guardian-toggle {
   display: flex;
