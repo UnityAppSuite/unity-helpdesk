@@ -1,3 +1,4 @@
+import contextlib
 import functools
 import html
 import json
@@ -504,6 +505,7 @@ def _ticket_message_search_fields():
 			"custom_primary_message_html",
 			"custom_primary_message_text",
 			"custom_search_message_body",
+			"custom_search_recipient_emails",
 		]
 		if frappe.db.has_column(TICKET_DOCTYPE, field)
 	]
@@ -1255,6 +1257,48 @@ def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=Non
 	return "", ""
 
 
+# Max chars stored in custom_search_recipient_emails (a Small Text field). Caps
+# the comma-joined recipient set so the per-row LIKE recipient probe stays cheap
+# and the column never bloats — ~60+ emails, far beyond any real ticket.
+RECIPIENT_EMAILS_MAX = 2000
+_EMAIL_EXTRACT_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
+@functools.lru_cache(maxsize=1)
+def _support_inbox_emails():
+	"""Lowercased set of the helpdesk's own mailbox addresses (every Email Account
+	email_id, e.g. feedback@walnutedu.in). Stripped from the denormalised recipient
+	set so a support inbox — a recipient on essentially every ticket — doesn't make
+	every ticket match. Cached for the worker's lifetime (Email Accounts are stable;
+	a migrate/worker restart refreshes it)."""
+	emails = set()
+	try:
+		for row in frappe.get_all("Email Account", fields=["email_id"], page_length=0):
+			value = cstr(row.get("email_id") or "").strip().lower()
+			if value:
+				emails.add(value)
+	except Exception:
+		pass
+	return frozenset(emails)
+
+
+def _build_ticket_recipient_emails(communication_rows):
+	"""Comma-joined, deduped external recipient/cc emails across a ticket's
+	communications — the people a mail was *sent to* (case 2/3 "send to this mail").
+	The helpdesk's own inboxes are stripped so they don't match every ticket."""
+	inboxes = _support_inbox_emails()
+	emails = []
+	seen = set()
+	for row in communication_rows or []:
+		for field in ("recipients", "cc"):
+			for email in _EMAIL_EXTRACT_RE.findall(cstr(row.get(field) or "").lower()):
+				if email in inboxes or email in seen:
+					continue
+				seen.add(email)
+				emails.append(email)
+	return ", ".join(emails)[:RECIPIENT_EMAILS_MAX]
+
+
 def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
 	ticket_doc = ticket_doc or frappe.get_cached_doc(TICKET_DOCTYPE, ticket_name)
 	thread_components = get_ticket_thread_components(ticket_name)
@@ -1286,17 +1330,20 @@ def _build_ticket_message_search_values(ticket_name, ticket_doc=None):
 		recent_parts.append(_normalize_search_text(row.content))
 
 	combined = _assemble_search_body(subject_text, opening_parts, recent_parts)
-	return primary_message_html, primary_message_text, combined
+	recipient_emails = _build_ticket_recipient_emails(communication_rows)
+	return primary_message_html, primary_message_text, combined, recipient_emails
 
 
 def _build_ticket_message_search_field_update(ticket_name, ticket_doc=None):
 	field_names = _ticket_message_search_fields()
 	if not field_names:
 		return {}
-	primary_message_html, primary_message_text, search_text = _build_ticket_message_search_values(
-		ticket_name,
-		ticket_doc=ticket_doc,
-	)
+	(
+		primary_message_html,
+		primary_message_text,
+		search_text,
+		recipient_emails,
+	) = _build_ticket_message_search_values(ticket_name, ticket_doc=ticket_doc)
 	search_update = {}
 	if "custom_primary_message_html" in field_names:
 		search_update["custom_primary_message_html"] = primary_message_html
@@ -1304,6 +1351,8 @@ def _build_ticket_message_search_field_update(ticket_name, ticket_doc=None):
 		search_update["custom_primary_message_text"] = primary_message_text
 	if "custom_search_message_body" in field_names:
 		search_update["custom_search_message_body"] = search_text
+	if "custom_search_recipient_emails" in field_names:
+		search_update["custom_search_recipient_emails"] = recipient_emails
 	return search_update
 
 
@@ -1765,44 +1814,21 @@ def _looks_like_email(value):
 	return bool(_EMAIL_RE.match(cstr(value or "").strip()))
 
 
-def _expand_email_to_family_search_terms(email):
-	"""Given a guardian email, return every search term that identifies the
-	whole family: every guardian's email + the students' login emails + the
-	students' reference numbers + the students' display names + the student
-	IDs themselves. Searching by one parent's email then surfaces every
-	ticket associated with the family, including ones raised by the student
-	directly or indexed only by student ref/name."""
-	email = cstr(email or "").strip().lower()
-	terms = {
-		"emails": {email} if email else set(),
+def _empty_family_terms(seed_email=None):
+	seed = cstr(seed_email or "").strip().lower()
+	return {
+		"emails": {seed} if seed else set(),
 		"student_refs": set(),
 		"student_names": set(),
 		"student_ids": set(),
 	}
-	if not email:
-		return terms
-	if not (_has_doctype("Guardian") and _has_doctype("Student Guardian")):
-		return terms
 
-	guardian_ids = set()
-	for row in frappe.get_all(
-		"Guardian",
-		fields=["name"],
-		filters={"email_address": email},
-		page_length=0,
-	):
-		guardian_ids.add(row.name)
-	for row in frappe.get_all(
-		"Guardian",
-		fields=["name"],
-		filters={"user": email},
-		page_length=0,
-	):
-		guardian_ids.add(row.name)
-	if not guardian_ids:
-		return terms
 
+def _student_ids_for_guardian_ids(guardian_ids):
+	"""Student ids linked to any of these guardians (via the Student Guardian child table)."""
 	student_ids = set()
+	if not guardian_ids:
+		return student_ids
 	for row in frappe.get_all(
 		"Student Guardian",
 		fields=["parent"],
@@ -1811,9 +1837,21 @@ def _expand_email_to_family_search_terms(email):
 	):
 		if row.parent:
 			student_ids.add(row.parent)
+	return student_ids
+
+
+def _family_terms_for_student_ids(student_ids, seed_terms=None):
+	"""Expand a set of student ids into the full family search-term bundle:
+	every sibling-guardian email + each student's login email / reference number /
+	display name / id. Shared by the guardian-email, student-email and
+	student-code resolvers so they all surface the SAME family of tickets."""
+	terms = seed_terms if seed_terms is not None else _empty_family_terms()
+	student_ids = {cstr(s).strip() for s in (student_ids or set()) if cstr(s).strip()}
 	if not student_ids:
 		return terms
 
+	# Sibling guardians: every guardian of every resolved student, so one
+	# member's identifier surfaces the whole family (the other parent included).
 	family_guardian_ids = set()
 	for row in frappe.get_all(
 		"Student Guardian",
@@ -1835,11 +1873,14 @@ def _expand_email_to_family_search_terms(email):
 				if text:
 					terms["emails"].add(text)
 
-	# Pull each student's identifiers: id, ref, name, login email.
+	# Pull each student's identifiers: id, ref, name, login + contact emails.
 	if _has_doctype("Student"):
+		student_fields = ["name", "first_name", "last_name", "reference_number", "user"]
+		if frappe.db.has_column("Student", "student_email_id"):
+			student_fields.append("student_email_id")
 		for row in frappe.get_all(
 			"Student",
-			fields=["name", "first_name", "last_name", "reference_number", "user"],
+			fields=student_fields,
 			filters={"name": ["in", list(student_ids)]},
 			page_length=0,
 		):
@@ -1854,11 +1895,48 @@ def _expand_email_to_family_search_terms(email):
 			).strip()
 			if full_name:
 				terms["student_names"].add(full_name)
-			user_email = cstr(row.get("user") or "").strip().lower()
-			if user_email:
-				terms["emails"].add(user_email)
+			for email_field in ("user", "student_email_id"):
+				email_value = cstr(row.get(email_field) or "").strip().lower()
+				if email_value and "@" in email_value:
+					terms["emails"].add(email_value)
 
 	return terms
+
+
+def _expand_email_to_family_search_terms(email):
+	"""Given a guardian OR student email, return every search term that
+	identifies the whole family: every guardian's email + the students' login
+	emails + reference numbers + display names + student IDs. Searching by one
+	parent's (or the student's own) email then surfaces every ticket associated
+	with the family, including ones raised by a sibling or indexed only by
+	student ref/name."""
+	email = cstr(email or "").strip().lower()
+	terms = _empty_family_terms(email)
+	if not email:
+		return terms
+	if not (_has_doctype("Guardian") and _has_doctype("Student Guardian")):
+		return terms
+
+	# 1) email belongs to a guardian -> the students of that guardian.
+	guardian_ids = set()
+	for row in frappe.get_all("Guardian", fields=["name"], filters={"email_address": email}, page_length=0):
+		guardian_ids.add(row.name)
+	for row in frappe.get_all("Guardian", fields=["name"], filters={"user": email}, page_length=0):
+		guardian_ids.add(row.name)
+	student_ids = _student_ids_for_guardian_ids(guardian_ids)
+
+	# 2) email belongs to a student directly (Student.user / student_email_id) —
+	#    a student-raised ticket. Fan out to the SAME family so a student email
+	#    surfaces siblings + guardians, symmetric with the guardian path.
+	if _has_doctype("Student"):
+		for field in ("user", "student_email_id"):
+			if not frappe.db.has_column("Student", field):
+				continue
+			for row in frappe.get_all("Student", fields=["name"], filters={field: email}, page_length=0):
+				if row.name:
+					student_ids.add(row.name)
+
+	return _family_terms_for_student_ids(student_ids, seed_terms=terms)
 
 
 def _expand_email_to_family_emails(email):
@@ -1915,26 +1993,40 @@ def _expand_phone_to_family_search_terms(phone):
 	return _expand_email_to_family_search_terms(seed_email)
 
 
-def _family_terms_or_filters(terms):
-	"""OR-filters matching every ticket of a family, built from the expanded
-	{emails, student_refs, student_names, student_ids} term set. Shared by the
-	guardian-phone candidate branch (mirrors the inline email-branch logic)."""
-	or_filters = []
-	for email in terms.get("emails", set()):
-		or_filters.append([TICKET_DOCTYPE, "raised_by", "=", email])
-		if _has_field(TICKET_DOCTYPE, "custom_search_guardian_emails"):
-			or_filters.append(
-				[TICKET_DOCTYPE, "custom_search_guardian_emails", "like", f"%{email}%"]
-			)
-	if _has_field(TICKET_DOCTYPE, "custom_search_student_refs"):
-		for ref in terms.get("student_refs", set()):
-			or_filters.append([TICKET_DOCTYPE, "custom_search_student_refs", "like", f"%{ref}%"])
-	if _has_field(TICKET_DOCTYPE, "custom_search_student_names"):
-		for sname in terms.get("student_names", set()):
-			or_filters.append([TICKET_DOCTYPE, "custom_search_student_names", "like", f"%{sname}%"])
-	for student_id in terms.get("student_ids", set()):
-		or_filters.append([TICKET_DOCTYPE, "raised_by", "like", f"%{student_id}@%"])
-	return or_filters
+# Student identity codes. Live data: Student.name = <2-letter branch><reference>
+# e.g. "BFOA01"; reference_number = the trailing part e.g. "OA01". The mandatory
+# trailing digits reliably separate these from ordinary words ("fees", "ledger").
+# The DB lookup is the real gate — the regex is only a cheap pre-filter so plain
+# words never hit the Student table.
+_STUDENT_CODE_RE = re.compile(r"^[A-Za-z]{2,6}\d{1,4}$")
+
+
+def _looks_like_student_code(value):
+	return bool(_STUDENT_CODE_RE.match(cstr(value or "").strip()))
+
+
+def _expand_student_code_to_family_search_terms(code):
+	"""Resolve a student identity code — the student name (e.g. ``BFOA01``) or the
+	reference number (e.g. ``OA01``) — to the whole family's search terms, reusing
+	the same student->family walk as the email path. Returns empty terms (caller
+	falls through) when nothing resolves."""
+	code = cstr(code or "").strip()
+	if not code or not _has_doctype("Student"):
+		return _empty_family_terms()
+	student_ids = set()
+	# Exact student name (the PK) — instant; collation makes it case-insensitive.
+	if frappe.db.exists("Student", code):
+		student_ids.add(code)
+	# Reference number (e.g. "OA01").
+	if frappe.db.has_column("Student", "reference_number"):
+		for row in frappe.get_all(
+			"Student", fields=["name"], filters={"reference_number": code}, page_length=0
+		):
+			if row.name:
+				student_ids.add(row.name)
+	if not student_ids:
+		return _empty_family_terms()
+	return _family_terms_for_student_ids(student_ids)
 
 
 def _family_is_expanded(terms, seed_emails=0):
@@ -1945,6 +2037,100 @@ def _family_is_expanded(terms, seed_emails=0):
 		or terms.get("student_ids")
 		or len(terms.get("emails", set())) > seed_emails
 	)
+
+
+# Wall-time budget (seconds) for a single candidate-resolution query. The family
+# OR-search and the LIKE fallback can full-scan on a cold buffer pool; this caps
+# them so a worker can never be pinned. A query that exceeds it raises 1969 and
+# the caller degrades to "no candidates from this probe" (falls through).
+CANDIDATE_STATEMENT_TIMEOUT_SEC = 4
+
+
+@contextlib.contextmanager
+def _statement_timeout(seconds):
+	"""Bound queries in this block via MariaDB session max_statement_time, then
+	restore unlimited. Best-effort — a backend without support runs unguarded."""
+	applied = False
+	try:
+		try:
+			frappe.db.set_execution_timeout(int(seconds))
+			applied = True
+		except Exception:
+			applied = False
+		yield
+	finally:
+		if applied:
+			try:
+				frappe.db.set_execution_timeout(0)
+			except Exception:
+				pass
+
+
+def _is_statement_timeout(exc):
+	msg = cstr(exc).lower()
+	return "1969" in msg or "max_statement_time" in msg or "max_execution_time" in msg
+
+
+def _guarded_get_list(doctype, **kwargs):
+	"""frappe.get_list bounded by CANDIDATE_STATEMENT_TIMEOUT_SEC. Returns [] (not
+	an exception) when the query exceeds the budget, so a pathological candidate
+	scan degrades to 'no candidates from this probe' instead of hanging a worker."""
+	try:
+		with _statement_timeout(CANDIDATE_STATEMENT_TIMEOUT_SEC):
+			return frappe.get_list(doctype, **kwargs)
+	except Exception as exc:
+		if _is_statement_timeout(exc):
+			return []
+		raise
+
+
+def _family_candidate_names(terms, base_filters, match_recipients=False):
+	"""Resolve a family's tickets fast, safe and PRECISE.
+
+	Primary probe (always): a single index-backed raised_by probe — equality on
+	every family email (guardians + student logins + student_email_ids) plus an
+	indexed prefix range on each student id (BFOA01 -> 'bfoa01@%'). All conditions
+	are on the one raised_by_unity_idx column, so MariaDB index-merges instead of
+	full-scanning. Statement-guarded.
+
+	Recipient probe (``match_recipients``, for the email/phone paths — case 2/3
+	"send to this mail"): tickets where a family email is a To/CC recipient, via the
+	dedicated recipient FULLTEXT index (see _recipient_candidates) — index-backed,
+	not a %LIKE% scan. No-op until that index + backfill land.
+
+	Note: we deliberately do NOT match the denormalised student refs/names.
+	populate_ticket_student_search_fields derives a ticket's refs from its OWN
+	raised_by, so those fields never point to a student outside the raiser's family
+	— matching them adds zero recall over the raised_by equality while a short ref
+	like "AA01" over-matches (prefix + body tokens) and inflates results."""
+	names = set()
+
+	raised_or = []
+	for email in terms.get("emails", set()):
+		value = cstr(email).strip().lower()
+		if value:
+			raised_or.append([TICKET_DOCTYPE, "raised_by", "=", value])
+	for student_id in terms.get("student_ids", set()):
+		sid = cstr(student_id).strip().lower()
+		if sid:
+			raised_or.append([TICKET_DOCTYPE, "raised_by", "like", f"{sid}@%"])
+	if raised_or:
+		_append_ticket_names(
+			names,
+			_guarded_get_list(
+				TICKET_DOCTYPE,
+				fields=["name"],
+				filters=base_filters,
+				or_filters=raised_or,
+				order_by="modified desc",
+				page_length=MAX_SEARCH_CANDIDATES,
+			),
+		)
+
+	if match_recipients:
+		names |= _recipient_candidates(terms.get("emails", set()), base_filters)
+
+	return names
 
 
 def _search_candidate_ticket_names(base_filters, search):
@@ -1968,105 +2154,54 @@ def _search_candidate_ticket_names(base_filters, search):
 		if candidate_names:
 			return candidate_names
 
-	# Build the searchable column list dynamically — Data fields are indexed, the
-	# message body is a Small Text full-scan fallback.
+	# Indexed Data fields only for the LIKE path. The 12KB custom_search_message_body
+	# is deliberately NOT here: a leading-wildcard `%tok%` scan over it could not
+	# short-circuit the LIMIT and full-scanned all ~93K rows whenever a token was
+	# sparse/absent — the primary search timeout. FULLTEXT now owns all body/content
+	# matching; LIKE only covers the short, index-friendly identity Data fields.
 	search_fields = ["name", "subject", "raised_by"]
 	for field in [
 		"custom_search_student_names",
 		"custom_search_student_refs",
 		"custom_search_guardian_emails",
-		"custom_search_message_body",
 	]:
 		if _has_field(TICKET_DOCTYPE, field):
 			search_fields.append(field)
 
-	# Guardian-email family expansion: if the query is a single email, surface
-	# every ticket associated with the family. We expand to:
-	#   - every guardian's email + student login emails
-	#   - every student id / reference number / display name
-	# and OR-search across raised_by and the indexed Data fields. This is robust
-	# to historical tickets that were indexed before all guardians were linked
-	# (e.g. ticket raised by the student themselves with only raised_by populated).
+	# Email search (cases 2 & 3): a guardian OR student email. Resolve to the whole
+	# family and match via the index-only family resolver (raised_by equality/prefix
+	# + FULLTEXT over distinctive refs/ids). Runs even when nothing expands (its
+	# raised_by equality), so an email query never leaks into the tokenised content
+	# path. Falls through only when the email/family has no tickets at all.
 	if _looks_like_email(query):
 		terms = _expand_email_to_family_search_terms(query)
-		family_emails = terms["emails"]
-		family_refs = terms["student_refs"]
-		family_names = terms["student_names"]
-		family_ids = terms["student_ids"]
-		# Only enter the expanded path when expansion actually found something
-		# beyond the literal query (otherwise fall through to normal token search).
-		expanded = (
-			len(family_emails) > 1
-			or family_refs
-			or family_names
-			or family_ids
-		)
-		if expanded:
-			or_filters = []
-			for email in family_emails:
-				or_filters.append([TICKET_DOCTYPE, "raised_by", "=", email])
-				if _has_field(TICKET_DOCTYPE, "custom_search_guardian_emails"):
-					or_filters.append(
-						[
-							TICKET_DOCTYPE,
-							"custom_search_guardian_emails",
-							"like",
-							f"%{email}%",
-						]
-					)
-				# Some tickets are raised by the student's own login (waca78@…) —
-				# those won't be in custom_search_guardian_emails, so the raised_by
-				# equality covers them.
-			if _has_field(TICKET_DOCTYPE, "custom_search_student_refs"):
-				for ref in family_refs:
-					or_filters.append(
-						[TICKET_DOCTYPE, "custom_search_student_refs", "like", f"%{ref}%"]
-					)
-			if _has_field(TICKET_DOCTYPE, "custom_search_student_names"):
-				for sname in family_names:
-					or_filters.append(
-						[TICKET_DOCTYPE, "custom_search_student_names", "like", f"%{sname}%"]
-					)
-			# Many tickets have raised_by = "<student-id>@<domain>" — a substring
-			# match on the local part lets us catch them even if the domain
-			# isn't in the family email set.
-			for student_id in family_ids:
-				or_filters.append(
-					[TICKET_DOCTYPE, "raised_by", "like", f"%{student_id}@%"]
-				)
-			_append_ticket_names(
-				candidate_names,
-				frappe.get_list(
-					TICKET_DOCTYPE,
-					fields=["name"],
-					filters=base_filters,
-					or_filters=or_filters,
-					order_by="modified desc",
-					page_length=MAX_SEARCH_CANDIDATES,
-				),
-			)
+		candidate_names |= _family_candidate_names(terms, base_filters, match_recipients=True)
+		if candidate_names:
 			return candidate_names
 
-	# Guardian phone family expansion — mirrors the email path above. When the
-	# query is a phone number that resolves to a guardian, surface every ticket
-	# belonging to the whole family (all siblings). Falls through to the normal
-	# token/body search when no guardian matches, preserving the incidental match
-	# on a phone that only appears inside a ticket body.
+	# Guardian phone family expansion (case 5): a phone that resolves to a guardian
+	# surfaces every ticket of the whole family. Falls through to content search
+	# when no guardian matches (preserving an incidental phone-in-body match).
 	if _looks_like_phone(query):
 		phone_terms = _expand_phone_to_family_search_terms(query)
 		if _family_is_expanded(phone_terms):
-			_append_ticket_names(
-				candidate_names,
-				frappe.get_list(
-					TICKET_DOCTYPE,
-					fields=["name"],
-					filters=base_filters,
-					or_filters=_family_terms_or_filters(phone_terms),
-					order_by="modified desc",
-					page_length=MAX_SEARCH_CANDIDATES,
-				),
-			)
-			return candidate_names
+			candidate_names |= _family_candidate_names(phone_terms, base_filters, match_recipients=True)
+			if candidate_names:
+				return candidate_names
+
+	# Student-code search (case 1): the query is a student name code ("BFOA01") or
+	# reference number ("OA01"). Resolve it to the student's family and surface
+	# every ticket the family raised. Robust even when the denormalised
+	# custom_search_* fields are stale/NULL, because the resolved student login
+	# (indexed raised_by prefix) and guardian emails are matched directly. Falls
+	# through to FULLTEXT/LIKE when the code doesn't resolve (a code-shaped word
+	# that isn't a real student) or the resolved student simply has no tickets.
+	if _looks_like_student_code(query):
+		code_terms = _expand_student_code_to_family_search_terms(query)
+		if _family_is_expanded(code_terms):
+			candidate_names |= _family_candidate_names(code_terms, base_filters)
+			if candidate_names:
+				return candidate_names
 
 	# Tokenize the query the same way the index was tokenized (HTML-stripped,
 	# lowercase, alphanumerics + @._-). This makes pasted chunks of email body
@@ -2094,7 +2229,7 @@ def _search_candidate_ticket_names(base_filters, search):
 		]
 		_append_ticket_names(
 			candidate_names,
-			frappe.get_list(
+			_guarded_get_list(
 				TICKET_DOCTYPE,
 				fields=["name"],
 				filters=base_filters,
@@ -2105,31 +2240,19 @@ def _search_candidate_ticket_names(base_filters, search):
 		)
 		return candidate_names
 
-	# For long pasted queries (≥4 tokens or >60 chars), run FULLTEXT first
-	# when the index is available. The AND-of-OR LIKE path scans the whole
-	# 90K-row table and cliff-edges to zero whenever any one of the 8
-	# capped tokens is missing from the head/tail-truncated indexed body —
-	# trying it first for a long query is doubled wasted work. FULLTEXT
-	# scores partial matches and ignores stopwords automatically.
-	# Short queries like "TA16" stay on the legacy path (direct ticket-ID
-	# + Data-field LIKE handles them already).
-	# Lowered from (≥4 tokens / >60 chars) to (≥3 tokens / >40 chars) so more
-	# multi-word content searches use the FULLTEXT index (relevance-scored,
-	# stopword-aware) instead of the slower AND-of-OR LIKE scan over the 12k-char
-	# body field. If FULLTEXT yields nothing (e.g. all tokens <4 chars), we fall
-	# straight through to the AND-of-OR path below — never a dead end.
-	is_long_query = len(tokens) >= 3 or len(cstr(query)) > 40
-	if is_long_query and _fulltext_index_available():
-		candidate_names = _fulltext_candidates(query, base_filters)
-		if candidate_names:
-			return candidate_names
+	# FULLTEXT is authoritative for content: it covers body/subject/refs/names/
+	# guardian-emails (all indexed). For any query with an indexable (>=3-char)
+	# token, return its result DIRECTLY — even when empty. We deliberately do NOT
+	# fall through to a full %LIKE% scan on no match: that just full-scans 93K rows
+	# to the same empty answer (the old 4s "no results" cost) and the FT index
+	# already covers every column a content search needs. BOOLEAN MODE, no relevance
+	# sort, statement-guarded (see _fulltext_candidates).
+	if _fulltext_index_available() and _fulltext_boolean_query(query):
+		return _fulltext_candidates(query, base_filters)
 
-	# Multi-token AND-of-OR — primary path for short queries, and the
-	# fallback for long queries whose FULLTEXT search returned empty.
-	# Single SQL so the LIMIT applies after the AND filter, not per token
-	# — otherwise common tokens like "the" or "and" cap their per-token
-	# result at the 400 most-recently-modified rows and silently drop
-	# older tickets that do contain all the tokens.
+	# Only reached when the query has no FULLTEXT-indexable token (e.g. "AC", "12")
+	# or the index isn't on this site: body-less multi-token AND-of-OR over the
+	# short identity Data fields. Single SQL + statement guard.
 	return _multi_token_candidates(tokens, search_fields, base_filters)
 
 
@@ -2191,8 +2314,16 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 		# by the column-level filters above.
 
 	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
-	rows = query.run(as_dict=True)
-	return {row["name"] for row in rows}
+	# Statement-time guarded: the Data-field LIKEs are small but a cold buffer pool
+	# can still make a 93K scan slow — degrade to empty rather than pin a worker.
+	try:
+		with _statement_timeout(CANDIDATE_STATEMENT_TIMEOUT_SEC):
+			rows = query.run(as_dict=True)
+	except Exception as exc:
+		if _is_statement_timeout(exc):
+			return set()
+		raise
+	return {cstr(row["name"]) for row in rows}
 
 
 # Columns covered by the FULLTEXT index added in
@@ -2232,46 +2363,101 @@ def _fulltext_index_available():
 		return False
 
 
+# Per-statement guard (seconds) for the raw FULLTEXT SELECT. MariaDB kills the
+# query if it runs longer (raising 1969, which we catch + degrade). Set to 5 so a
+# COLD broad single-common-word search ("fee" ~4s cold: reading a posting list
+# present in 40K+ docs) still COMPLETES and returns results, rather than being
+# killed to empty — while staying far under the old 30s+ hang and bounding any
+# worker-hold. Warm (the production norm) these are 150ms-2.5s.
+FULLTEXT_STATEMENT_TIMEOUT_SEC = 5
+# InnoDB indexes tokens >= innodb_ft_min_token_size (3 on this deploy). Lowered
+# from the old 4 so 3-char content words ("fee", "bus") are searchable.
+_FULLTEXT_MIN_TOKEN = 3
+_FULLTEXT_MAX_TOKENS = 12
+
+
+def _fulltext_boolean_query(query):
+	"""Build a MariaDB BOOLEAN MODE match string from a free-text query.
+
+	- Re-tokenise on word chars only (``\\w+``) so the BOOLEAN operator
+	  characters ``@ . -`` (which appear in emails/refs) can never reach the
+	  parser and flip a token into an exclude/phrase. Identity lookups
+	  (email / phone / student-code) own those punctuated queries anyway.
+	- Drop tokens shorter than the InnoDB min token size (3) — they aren't in
+	  the index and a 1-2 char stem with ``*`` explodes the match set.
+	- A single token is prefix-matched (``+tok*``) so "transp" finds "transport"
+	  and as-you-type stays useful.
+	- A multi-word query requires the 1-3 most distinctive tokens (longest =
+	  rarest heuristic) with ``+`` so it narrows to tickets that actually contain
+	  its meaningful words instead of OR-matching every common word and truncating
+	  an arbitrary 1000. The Python ranker does the final ordering.
+	"""
+	tokens = [
+		t for t in re.findall(r"\w+", _normalize_search_text(query)) if len(t) >= _FULLTEXT_MIN_TOKEN
+	]
+	if not tokens:
+		return ""
+	# Dedupe (preserve first-seen order).
+	unique = list(dict.fromkeys(tokens))
+	# Single token (incl. as-you-type): prefix-match so "transp" finds "transport".
+	if len(unique) == 1:
+		return f"+{unique[0]}*"
+	by_rarity = sorted(unique, key=len, reverse=True)[:_FULLTEXT_MAX_TOKENS]
+	# Multi-token content search: REQUIRE the top 2-3 most distinctive tokens
+	# (longest = rarest), matched EXACTLY, and drop the rest. Optional (non-`+`)
+	# tokens don't restrict a BOOLEAN match set, and because we rank in Python — not
+	# by FT relevance — they add only cold posting-list cost for zero gain. Exact
+	# (no `*`) avoids prefix-expanding a common word, which was the ~3s cold cost.
+	# The required set stays a superset of the Python ranker's all-tokens result, so
+	# nothing rankable is lost; the ranker enforces the full token set on content.
+	require_count = 3 if len(by_rarity) >= 4 else 2
+	return " ".join(f"+{token}" for token in by_rarity[:require_count])
+
+
 def _fulltext_candidates(query, base_filters):
-	"""Relevance-ranked candidate set via MariaDB FULLTEXT INDEX. Used as a
-	fallback when the AND-of-OR LIKE path returns nothing for a long pasted
-	query. Tolerates a missing index (returns empty set) so the rest of the
-	search keeps working on a site where the patch hasn't run yet.
+	"""Candidate set via the MariaDB FULLTEXT index — the primary path for any
+	content/subject query that has a >=3-char word. BOOLEAN MODE with NO relevance
+	``ORDER BY``: the Python ranker (`_ranked_ticket_ids`) re-orders the bounded
+	set anyway, and scoring the whole match set with ``ORDER BY MATCH()`` was the
+	>30s timeout. Statement-time guarded so it can never hang a worker. Returns
+	empty on a missing index / timeout / no usable tokens and the caller falls
+	through to the body-less LIKE path — never a dead end.
 	"""
 	# Skip entirely if the FULLTEXT index isn't on this site — saves the
-	# round-trip + 1191 exception cost on every "no AND match" query.
+	# round-trip + 1191 exception cost on every query.
 	if not _fulltext_index_available():
 		return set()
-	# FULLTEXT in InnoDB ignores words shorter than
-	# innodb_ft_min_token_size (default 3) and the stopword list; strip
-	# explicitly so the query stays short and predictable.
-	cleaned_tokens = [t for t in _search_tokens(query) if len(t) >= 4]
-	if not cleaned_tokens:
+	boolean_query = _fulltext_boolean_query(query)
+	if not boolean_query:
 		return set()
-	# Bound the query string length — long pastes still tokenise to dozens
-	# of unique 4+-char words; 200 chars is plenty for relevance ranking.
-	cleaned = " ".join(cleaned_tokens)[:200]
 
 	col_list = ", ".join(f"`{c}`" for c in _FULLTEXT_COLUMNS)
+	# SET STATEMENT ... FOR scopes the timeout to THIS select only (not the
+	# permission re-query below). The timeout is an int literal, never user input.
 	sql = (
+		f"SET STATEMENT max_statement_time={int(FULLTEXT_STATEMENT_TIMEOUT_SEC)} FOR "
 		f"SELECT name FROM `tabHD Ticket` "
-		f"WHERE MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) "
-		f"ORDER BY MATCH({col_list}) AGAINST (%s IN NATURAL LANGUAGE MODE) DESC "
+		f"WHERE MATCH({col_list}) AGAINST (%s IN BOOLEAN MODE) "
 		f"LIMIT %s"
 	)
 	try:
-		rows = frappe.db.sql(sql, (cleaned, cleaned, MAX_SEARCH_CANDIDATES))
+		rows = frappe.db.sql(sql, (boolean_query, MAX_SEARCH_CANDIDATES))
 	except Exception as exc:
-		# 1191 = "Can't find FULLTEXT index matching the column list" — the
-		# patch hasn't run on this site. Log once and degrade silently;
-		# the legacy search path still returns its (empty) result.
-		frappe.log_error(
-			title="unity search FULLTEXT fallback failed",
-			message=f"{type(exc).__name__}: {exc}",
-		)
+		msg = cstr(exc)
+		# 1969 = query interrupted (hit the statement timeout) — the expected
+		# backstop under pathological load; degrade quietly to the LIKE fallback.
+		# Log anything else once (e.g. 1191 missing index on an un-migrated site).
+		if "1969" not in msg and "max_statement_time" not in msg.lower():
+			frappe.log_error(
+				title="unity search FULLTEXT fallback failed",
+				message=f"{type(exc).__name__}: {exc}",
+			)
 		return set()
 
-	candidate_names = {row[0] for row in rows if row and row[0]}
+	# cstr — HD Ticket names are integers (autoincrement naming); keep the whole
+	# candidate pipeline string-typed so set-union/dedup with the other probes
+	# (which go through _append_ticket_names) never splits "105" from 105.
+	candidate_names = {cstr(row[0]) for row in rows if row and row[0]}
 	if not candidate_names or not base_filters:
 		return candidate_names
 
@@ -2286,7 +2472,87 @@ def _fulltext_candidates(query, base_filters):
 		),
 		page_length=len(candidate_names),
 	)
-	return {row.name for row in filtered}
+	return {cstr(row.name) for row in filtered}
+
+
+_RECIPIENT_FT_INDEX_NAME = "recipient_ft_idx"
+_RECIPIENT_MAX_EMAILS = 20
+
+
+@functools.lru_cache(maxsize=1)
+def _recipient_ft_index_available():
+	"""Does the dedicated recipient_ft_idx FULLTEXT index exist? Cached per worker."""
+	try:
+		rows = frappe.db.sql(
+			"""SELECT 1 FROM information_schema.STATISTICS
+			   WHERE table_schema = DATABASE()
+			     AND table_name = 'tabHD Ticket'
+			     AND index_name = %s
+			   LIMIT 1""",
+			(_RECIPIENT_FT_INDEX_NAME,),
+		)
+		return bool(rows)
+	except Exception:
+		return False
+
+
+def _recipient_candidates(emails, base_filters):
+	"""Tickets where any of ``emails`` is a To/CC recipient — "sent to this mail"
+	(cases 2 & 3). Matched via the dedicated recipient FULLTEXT index (NOT a
+	leading-wildcard %LIKE% scan, which was a ~3s full scan). Each email's
+	distinctive tokens (local part + domain labels >= the InnoDB min size) are a
+	required ``(+a +b +c)`` group; groups are OR'd so any family member as a
+	recipient is a hit. NO relevance ORDER BY (Python ranker orders), statement
+	guarded, permissions re-applied. Empty when the index/field is absent
+	(un-migrated / un-backfilled site) — the caller still has the raised_by probe."""
+	if not (
+		_has_field(TICKET_DOCTYPE, "custom_search_recipient_emails")
+		and _recipient_ft_index_available()
+	):
+		return set()
+	groups = []
+	for email in emails:
+		tokens = [
+			t for t in re.findall(r"\w+", cstr(email).lower()) if len(t) >= _FULLTEXT_MIN_TOKEN
+		]
+		if tokens:
+			groups.append("(" + " ".join(f"+{t}" for t in tokens) + ")")
+		if len(groups) >= _RECIPIENT_MAX_EMAILS:
+			break
+	if not groups:
+		return set()
+	boolean_query = " ".join(groups)
+
+	sql = (
+		f"SET STATEMENT max_statement_time={int(FULLTEXT_STATEMENT_TIMEOUT_SEC)} FOR "
+		f"SELECT name FROM `tabHD Ticket` "
+		f"WHERE MATCH(`custom_search_recipient_emails`) AGAINST (%s IN BOOLEAN MODE) "
+		f"LIMIT %s"
+	)
+	try:
+		rows = frappe.db.sql(sql, (boolean_query, MAX_SEARCH_CANDIDATES))
+	except Exception as exc:
+		msg = cstr(exc)
+		if "1969" not in msg and "max_statement_time" not in msg.lower():
+			frappe.log_error(
+				title="unity recipient FULLTEXT failed",
+				message=f"{type(exc).__name__}: {exc}",
+			)
+		return set()
+
+	candidate_names = {cstr(row[0]) for row in rows if row and row[0]}
+	if not candidate_names or not base_filters:
+		return candidate_names
+	filtered = frappe.get_list(
+		TICKET_DOCTYPE,
+		fields=["name"],
+		filters=_merge_filters(
+			base_filters,
+			[[TICKET_DOCTYPE, "name", "in", list(candidate_names)]],
+		),
+		page_length=len(candidate_names),
+	)
+	return {cstr(row.name) for row in filtered}
 
 
 @frappe.whitelist()
@@ -2806,6 +3072,68 @@ def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
 	return {"data": rows[:limit], "query": query, "view": effective_view}
 
 
+@frappe.whitelist()
+def benchmark_ticket_search(queries=None, view="all", repeat=1):
+	"""Admin-only, read-only search timing harness. Runs the candidate resolver for
+	each query and reports candidate count + wall-ms, so every query shape can be
+	verified to resolve in milliseconds and never approach the API timeout.
+	SELECT-only — safe to run on production.
+
+	Usage:
+	  bench --site <site> execute helpdesk.api.unity_helpdesk.benchmark_ticket_search \\
+	    --kwargs '{"queries": ["BFOA01", "OA01", "parent@x.com", "fee receipt"]}'
+	"""
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to run the search benchmark"), frappe.PermissionError)
+
+	import time
+
+	query_list = [cstr(q) for q in (_parse_json(queries, None) or []) if cstr(q).strip()]
+	if not query_list:
+		frappe.throw(_("Provide a non-empty 'queries' list"))
+	try:
+		repeat = max(1, min(int(repeat or 1), 10))
+	except (TypeError, ValueError):
+		repeat = 1
+
+	base_filters = _build_filters(
+		"all",
+		None,
+		assigned_agent=None if capabilities.can_view_all_tickets else _session_user(),
+	)
+
+	results = []
+	for raw_query in query_list:
+		timings = []
+		candidate_count = 0
+		sample = []
+		error = None
+		for _iteration in range(repeat):
+			start = time.monotonic()
+			try:
+				names = _search_candidate_ticket_names(base_filters, raw_query)
+			except Exception as exc:
+				error = f"{type(exc).__name__}: {exc}"
+				names = set()
+			timings.append((time.monotonic() - start) * 1000.0)
+			candidate_count = len(names)
+			if not sample:
+				sample = sorted(names, key=str)[:5]
+		results.append(
+			{
+				"query": raw_query,
+				"candidates": candidate_count,
+				"ms_min": round(min(timings), 1),
+				"ms_max": round(max(timings), 1),
+				"ms_avg": round(sum(timings) / len(timings), 1),
+				"sample": sample,
+				"error": error,
+			}
+		)
+	return {"results": results, "repeat": repeat, "view": view}
+
+
 def _resolve_ticket_context(view, filters, search, message_body, page_length, start):
 	"""Compute the shared context that get_tickets_page and get_tickets_summary
 	both need: capabilities, effective view, base filter list, cleaned search
@@ -2869,6 +3197,15 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 				search_family_terms = expanded
 		elif _looks_like_phone(search):
 			expanded = _expand_phone_to_family_search_terms(search)
+			if _family_is_expanded(expanded):
+				search_family_terms = expanded
+		elif _looks_like_student_code(search):
+			# Student name code / reference ("SHOB76", "OB76"): same as the email/phone
+			# paths — pass the family expansion to the ranker so EVERY family ticket
+			# is a Tier-2 hit (whether raised by the student login or a guardian email),
+			# instead of scattering them across relevance tiers. With one tier, the
+			# tiebreaker (modified desc) takes over → newest ticket first.
+			expanded = _expand_student_code_to_family_search_terms(search)
 			if _family_is_expanded(expanded):
 				search_family_terms = expanded
 
