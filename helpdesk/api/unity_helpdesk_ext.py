@@ -555,10 +555,11 @@ def _students_by_email(emails):
 
 
 def _students_by_name(names):
-    """Map lowercased Student.name -> a small student field dict (one query) for
-    resolving a CSV student-ID column to a recipient email + display name. The
-    name PK match is collation-insensitive, so "wacb39" finds "WACB39". Returns {}
-    on sites without the education app; best-effort, never raises."""
+    """Map lowercased Student.name -> the full student field dict (one query) for
+    resolving a CSV student-ID column to a recipient email + display name + school,
+    and for the per-recipient merge context (all student fields, like walsh-admin's
+    student.as_dict()). The name PK match is collation-insensitive, so "wacb39"
+    finds "WACB39". Returns {} on sites without the education app; never raises."""
     normalized = {n for n in (cstr(x or "").strip() for x in (names or [])) if n}
     if not normalized or not frappe.db.exists("DocType", "Student"):
         return {}
@@ -567,20 +568,81 @@ def _students_by_name(names):
         rows = frappe.get_all(
             "Student",
             filters={"name": ["in", list(normalized)]},
-            fields=[
-                "name",
-                "student_email_id",
-                "user",
-                "first_name",
-                "last_name",
-                "student_name",
-            ],
+            fields=["*"],
         )
     except Exception:
         return {}
     for row in rows:
         out[cstr(row.get("name")).strip().lower()] = row
     return out
+
+
+def _guardian_emails_for_students(student_names):
+    """Map Student.name -> [guardian email, …] for a batch of students
+    (Student Guardian -> Guardian.email_address). Used to auto-include guardians
+    for CSV imports, walsh-admin style. {} on non-education sites; never raises."""
+    names = {cstr(n).strip() for n in (student_names or []) if cstr(n).strip()}
+    if not names or not frappe.db.exists("DocType", "Student Guardian"):
+        return {}
+    out = {}
+    try:
+        links = frappe.get_all(
+            "Student Guardian",
+            filters={"parenttype": "Student", "parent": ["in", list(names)]},
+            fields=["parent", "guardian"],
+        )
+        guardian_ids = list({l.guardian for l in links if l.guardian})
+        gmap = {}
+        if guardian_ids:
+            for g in frappe.get_all(
+                "Guardian",
+                filters={"name": ["in", guardian_ids]},
+                fields=["name", "email_address"],
+            ):
+                email = cstr(g.get("email_address") or "").strip().lower()
+                if email:
+                    gmap[g.name] = email
+        for link in links:
+            email = gmap.get(link.guardian)
+            if not email:
+                continue
+            bucket = out.setdefault(link.parent, [])
+            if email not in bucket:
+                bucket.append(email)
+    except Exception:
+        return {}
+    return out
+
+
+def _school_bcc_emails(school):
+    """School-level BCC for a school (walsh-admin parity): every member of the
+    school's bcc_email_group + the school's own admin email_address. Lowercased,
+    deduped. [] when the School doctype / fields aren't present; never raises."""
+    school = cstr(school or "").strip()
+    if not school or not frappe.db.exists("DocType", "School"):
+        return []
+    fields = [f for f in ("bcc_email_group", "email_address") if frappe.db.has_column("School", f)]
+    if not fields:
+        return []
+    emails = set()
+    try:
+        vals = frappe.db.get_value("School", school, fields, as_dict=True) or {}
+        admin = cstr(vals.get("email_address") or "").strip().lower()
+        if admin:
+            emails.add(admin)
+        group = cstr(vals.get("bcc_email_group") or "").strip()
+        if group and frappe.db.exists("DocType", "Email Group Member"):
+            for member in frappe.get_all(
+                "Email Group Member",
+                filters={"email_group": group},
+                fields=["email"],
+            ):
+                value = cstr(member.get("email") or "").strip().lower()
+                if value:
+                    emails.add(value)
+    except Exception:
+        return []
+    return sorted(emails)
 
 
 @frappe.whitelist()
@@ -593,6 +655,7 @@ def bulk_send_email(
     attachments=None,
     ticket_type=None,
     merge_data=None,
+    school_bcc=None,
 ):
     capabilities = _require_unity_access()
     if not capabilities.get("can_view_all_tickets"):
@@ -692,6 +755,9 @@ def bulk_send_email(
             if email_key and isinstance(row, dict):
                 merge_map[email_key] = {cstr(col).strip(): row[col] for col in row}
 
+    # School-level BCC (one un-personalized copy) computed from the CSV's school.
+    school_bcc_list, _invalid_school_bcc = _split_email_list_with_counts(school_bcc)
+
     frappe.enqueue(
         "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
         queue="long",
@@ -704,6 +770,7 @@ def bulk_send_email(
         file_names=file_names,
         ticket_type=ticket_type,
         merge_data=merge_map,
+        school_bcc_list=school_bcc_list,
     )
 
     # "count" is the real audience the email will reach: default recipients (TO)
@@ -729,6 +796,7 @@ def _bulk_send_email_job(
     file_names=None,
     ticket_type=None,
     merge_data=None,
+    school_bcc_list=None,
 ):
     """Background worker for bulk_send_email.
 
@@ -737,9 +805,9 @@ def _bulk_send_email_job(
     placeholders or a CSV merge map was supplied, it renders and sends ONE email
     PER recipient (context = {**student, **csv_row, "email"}) so every copy is
     personalized AND each recipient's To shows only their own address. Otherwise it
-    sends a single hidden-recipient blast. CC is always sent ONCE, separately,
-    un-personalized. Runs ignore_permissions with an explicit `sender`; never
-    raises — failures are logged.
+    sends a single hidden-recipient blast. CC is sent ONCE (visible group); the
+    school BCC (walsh-admin) is sent ONCE, hidden, un-personalized. Runs
+    ignore_permissions with an explicit `sender`; never raises — failures logged.
     """
     try:
         recipients = recipients or []
@@ -747,6 +815,7 @@ def _bulk_send_email_job(
         bcc_list = bcc_list or []
         file_names = file_names or []
         merge_data = merge_data or {}
+        school_bcc_list = school_bcc_list or []
 
         audit_description = _bulk_email_audit_html(
             recipients, cc_list, bcc_list, message
@@ -826,12 +895,28 @@ def _bulk_send_email_job(
         # delivery) and carry the attachments.
         needs_merge = bool(merge_data) or ("{{" in subject) or ("{{" in message)
         if needs_merge:
-            students = _students_by_email(targets)
+            # Resolve student context two ways: by the CSV-carried `_student` id (so
+            # a guardian recipient inherits ITS student's fields, walsh-admin style)
+            # and by the recipient's own email (manually-added students). `_student`
+            # wins. Both batched into one query each.
+            carried_ids = {
+                cstr((merge_data.get(k) or {}).get("_student") or "").strip()
+                for k in merge_data
+            }
+            students_by_name = _students_by_name([s for s in carried_ids if s])
+            students_by_email = _students_by_email(targets)
             for addr in targets:
                 key = (addr or "").strip().lower()
+                row = merge_data.get(key) or {}
+                sid = cstr(row.get("_student") or "").strip()
+                student = (
+                    students_by_name.get(sid.lower())
+                    if sid
+                    else students_by_email.get(key)
+                )
                 context = {
-                    **(students.get(key) or {}),
-                    **(merge_data.get(key) or {}),
+                    **(student or {}),
+                    **{k: v for k, v in row.items() if k != "_student"},
                     "email": addr,
                 }
                 frappe.sendmail(
@@ -856,9 +941,8 @@ def _bulk_send_email_job(
                 expose_recipients=None,
             )
 
-        # CC: ONE un-personalized copy (placeholders blanked), never to an address
-        # that already received it as a recipient. Kept out of the per-recipient loop
-        # so CC people get a single copy, not one per student.
+        # CC: ONE un-personalized copy (visible CC group), never to an address that
+        # already received it as a recipient.
         cc_targets = [c for c in cc_list if (c or "").strip().lower() not in target_seen]
         if cc_targets:
             frappe.sendmail(
@@ -870,6 +954,24 @@ def _bulk_send_email_job(
                 reference_doctype=TICKET_DOCTYPE,
                 reference_name=doc.name,
                 expose_recipients="header",
+            )
+
+        # School BCC (walsh-admin parity): ONE un-personalized HIDDEN copy to the
+        # school's email group + admin, deduped against everyone who already got it.
+        already = set(target_seen) | {(c or "").strip().lower() for c in cc_targets}
+        school_targets = [
+            s for s in school_bcc_list if (s or "").strip().lower() not in already
+        ]
+        if school_targets:
+            frappe.sendmail(
+                recipients=school_targets,
+                subject=_safe_render(subject, {}),
+                message=_safe_render(message, {}),
+                attachments=sendmail_attachments,
+                delayed=True,
+                reference_doctype=TICKET_DOCTYPE,
+                reference_name=doc.name,
+                expose_recipients=None,
             )
 
         frappe.db.commit()
@@ -953,32 +1055,45 @@ def get_bulk_email_sample_csv():
     _require_unity_access()
     buffer = StringIO()
     writer = csv.writer(buffer)
-    # First column is the STUDENT ID (Student.name) — the recipient email and all
-    # student details ({{first_name}}, {{last_name}}, …) are looked up from it. Any
-    # extra columns (e.g. amount) are also usable as {{merge}} fields, overriding
-    # the looked-up student fields.
-    writer.writerow(["name", "amount"])
-    writer.writerow(["BFOA01", "1500"])
-    writer.writerow(["WACB39", "2000"])
+    # walsh-admin shape: each row is a STUDENT — `id` (Student.name) + `school`.
+    # The recipient email, student details ({{first_name}}, {{student_name}}, …)
+    # and guardians are all looked up from the student. `school` validates the
+    # batch (one school; the student must belong to it) and BCCs the school's email
+    # group + admin. Any extra columns (e.g. amount) are usable as {{merge}} fields.
+    writer.writerow(["id", "school"])
+    writer.writerow(["BFOA01", "<school name>"])
+    writer.writerow(["WACB39", "<school name>"])
     frappe.response["type"] = "csv"
     frappe.response["doctype"] = "bulk_email_sample"
     frappe.response["result"] = buffer.getvalue()
 
 
-# Headers (lowercased) accepted as the student-id column.
-_STUDENT_ID_HEADERS = {"name", "student", "student_id", "student id", "student_name", "student.name", "id"}
+# Headers (lowercased) accepted as the student-id / school columns.
+_STUDENT_ID_HEADERS = {"id", "name", "student", "student_id", "student id", "student_name", "student.name"}
+_SCHOOL_HEADERS = {"school", "school_id", "school name", "school_name", "school.name"}
+
+
+def _student_display_name(student, fallback=""):
+    name = " ".join(
+        p
+        for p in (cstr(student.get("first_name")), cstr(student.get("last_name")))
+        if p.strip()
+    ).strip()
+    return name or cstr(student.get("student_name") or "").strip() or fallback
 
 
 @frappe.whitelist()
 def parse_bulk_email_csv(content):
-    """Parse an uploaded bulk-email CSV into mail-merge rows, walsh-admin style.
+    """Parse a bulk-email CSV (walsh-admin style): an `id` (Student.name) column +
+    a `school` column.
 
-    The CSV carries a STUDENT-ID column (Student.name) — NOT an email. Each id is
-    resolved to a Student; the recipient is the student's own email
-    (student_email_id, falling back to the login `user`) and all student fields
-    become merge context at send time. Any extra columns are kept as additional
-    {{merge}} fields. Robust to quoted commas (csv.DictReader). Whitelisted + gated
-    like the send endpoint.
+    Each id resolves a Student -> recipient (student_email_id, falling back to
+    `user`) and all student fields become merge context at send time. **Guardians
+    are auto-included** — each guardian is added as a recipient that inherits its
+    student's merge context (via a carried ``_student`` key). `school` enforces
+    one-school-per-CSV and that every student belongs to it, and yields the school
+    BCC (bcc_email_group members + School.email_address). Extra columns become
+    additional {{merge}} fields. Whitelisted + gated like the send endpoint.
     """
     capabilities = _require_unity_access()
     if not capabilities.get("can_view_all_tickets"):
@@ -993,13 +1108,13 @@ def parse_bulk_email_csv(content):
     if not headers:
         frappe.throw(_("The CSV has no header row"))
 
-    name_col = next((h for h in headers if h.lower() in _STUDENT_ID_HEADERS), None)
-    if not name_col:
-        name_col = next((h for h in headers if "student" in h.lower()), None)
-    if not name_col:
-        frappe.throw(_("The CSV must have a 'name' (student ID) column"))
+    id_col = next((h for h in headers if h.lower() in _STUDENT_ID_HEADERS), None)
+    if not id_col:
+        id_col = next((h for h in headers if "student" in h.lower()), None)
+    if not id_col:
+        frappe.throw(_("The CSV must have an 'id' (student) column"))
+    school_col = next((h for h in headers if h.lower() in _SCHOOL_HEADERS), None)
 
-    # Read rows first, then batch-resolve the students in one query.
     parsed = []
     for raw in reader:
         row = {
@@ -1007,60 +1122,108 @@ def parse_bulk_email_csv(content):
             for k, v in raw.items()
             if cstr(k or "").strip()
         }
-        sid = cstr(row.get(name_col) or "").strip()
+        sid = cstr(row.get(id_col) or "").strip()
         if sid:
             parsed.append((sid, row))
         if len(parsed) >= RECIPIENT_HARD_CAP * 2:
             break
+    if not parsed:
+        frappe.throw(_("No student IDs found in the CSV"))
 
-    students = _students_by_name([sid for sid, _ in parsed])
+    # One-school-per-CSV validation (walsh-admin validate_school).
+    csv_school = ""
+    if school_col:
+        schools = {
+            cstr(row.get(school_col) or "").strip()
+            for _, row in parsed
+            if cstr(row.get(school_col) or "").strip()
+        }
+        if len(schools) > 1:
+            frappe.throw(
+                _("The CSV mixes multiple schools ({0}). Send one school at a time.").format(
+                    ", ".join(sorted(schools))
+                )
+            )
+        csv_school = next(iter(schools), "")
+
+    student_ids = [sid for sid, _ in parsed]
+    students = _students_by_name(student_ids)
+    guardians = _guardian_emails_for_students(student_ids)
 
     rows = []
     seen = set()
     unmatched = 0
+    school_mismatch = 0
     no_email = 0
     duplicates = 0
+    guardian_added = 0
+    student_added = 0
     for sid, row in parsed:
         student = students.get(sid.lower())
         if not student:
             unmatched += 1
             continue
+        # Each student must belong to the declared school (walsh safety check).
+        student_school = cstr(student.get("school") or "").strip()
+        if csv_school and student_school and student_school != csv_school:
+            school_mismatch += 1
+            continue
+        canonical_id = cstr(student.get("name") or sid).strip()
+        # Carried context shared by the student AND their guardians.
+        ctx = {**row, "_student": canonical_id}
+        display = _student_display_name(student, sid)
+
         email = cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
-        if not email or not validate_email_address(email, throw=False):
+        if email and validate_email_address(email, throw=False):
+            if email in seen:
+                duplicates += 1
+            else:
+                seen.add(email)
+                rows.append({"email": email, "name": display, "data": ctx})
+                student_added += 1
+        else:
             no_email += 1
-            continue
-        if email in seen:
-            duplicates += 1
-            continue
-        seen.add(email)
-        display = (
-            " ".join(
-                p
-                for p in (cstr(student.get("first_name")), cstr(student.get("last_name")))
-                if p.strip()
-            ).strip()
-            or cstr(student.get("student_name") or "").strip()
-            or sid
-        )
-        rows.append({"email": email, "name": display, "data": row})
+
+        # Auto-include guardians — each inherits the student's merge context.
+        for gemail in guardians.get(canonical_id, []):
+            ge = cstr(gemail).strip().lower()
+            if ge and validate_email_address(ge, throw=False) and ge not in seen:
+                seen.add(ge)
+                rows.append({"email": ge, "name": f"{display} (guardian)", "data": ctx})
+                guardian_added += 1
+
         if len(rows) >= RECIPIENT_HARD_CAP:
             break
 
-    # Merge-field hint: common student fields (auto-resolved) + extra CSV columns.
+    school_bcc = _school_bcc_emails(csv_school) if csv_school else []
+
+    # Merge-field hint: common student fields (auto-resolved) + extra CSV columns
+    # (excluding the id/school helper columns).
     common = []
     if frappe.db.exists("DocType", "Student"):
         meta = frappe.get_meta("Student")
-        common = [f for f in ("first_name", "last_name", "middle_name", "student_name") if meta.has_field(f)]
-    extra = [h for h in headers if h.lower() != name_col.lower()]
+        common = [
+            f
+            for f in ("first_name", "last_name", "middle_name", "student_name", "school")
+            if meta.has_field(f)
+        ]
+    skip = {id_col.lower()} | ({school_col.lower()} if school_col else set())
+    extra = [h for h in headers if h.lower() not in skip]
     merge_fields = common + [e for e in extra if e not in common]
 
     return {
         "headers": headers,
-        "name_column": name_col,
+        "id_column": id_col,
+        "school_column": school_col,
+        "school": csv_school,
+        "school_bcc": school_bcc,
         "merge_fields": merge_fields,
         "rows": rows,
         "count": len(rows),
+        "student_count": student_added,
+        "guardian_count": guardian_added,
         "unmatched_count": unmatched,
+        "school_mismatch_count": school_mismatch,
         "no_email_count": no_email,
         "duplicate_count": duplicates,
     }

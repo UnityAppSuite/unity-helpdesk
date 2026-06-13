@@ -310,9 +310,25 @@
             {{ bulkEmailWarning }}
           </p>
 
-          <!-- Recipients field intentionally hidden from the composer. The default
-               recipient(s) from HD Settings are still applied: bulkEmail.recipients
-               is sent and the backend job also adds _default_bulk_recipients(). -->
+          <label v-if="bulkEmail.recipients.length">
+            Recipients
+            <div class="recipient-multiselect recipient-multiselect--locked">
+              <span
+                v-for="chip in bulkEmail.recipients"
+                :key="chip.email"
+                class="recipient-chip recipient-chip--locked"
+              >
+                <span class="recipient-chip-label">{{
+                  chip.label || chip.email
+                }}</span>
+              </span>
+            </div>
+          </label>
+          <p v-else class="muted bulk-email-default-note">
+            No default recipient is configured — this email will be sent from
+            your account. Students stay hidden in BCC. You can set a default
+            recipient in Settings.
+          </p>
 
           <label>
             Subject
@@ -399,7 +415,7 @@
                   v-model="bccSearchQuery"
                   type="text"
                   class="recipient-input"
-                  placeholder="Type student name or email…"
+                  placeholder="Type reference number, student name or email…"
                   autocomplete="off"
                   @input="onBccSearch"
                   @keydown.enter.prevent="addBccFromInput"
@@ -646,8 +662,9 @@ const bulkEmail = reactive({
   cc: [],
   bcc: [], // [{email, name?, label?}] — students
   attachments: [],
-  mergeData: {}, // { email_lower: { col: val, ... } } from the imported CSV
-  mergeFields: [], // CSV headers (minus email) usable as {{field}} placeholders
+  mergeData: {}, // { email_lower: { col: val, ..., _student } } from the imported CSV
+  mergeFields: [], // student fields + extra CSV columns usable as {{field}}
+  schoolBcc: [], // school email-group + admin (one un-personalized BCC), from CSV school
 });
 const includeGuardians = ref(false);
 const guardianEmails = ref("");
@@ -1128,6 +1145,7 @@ function resetBulkEmail() {
   bulkEmail.attachments = [];
   bulkEmail.mergeData = {};
   bulkEmail.mergeFields = [];
+  bulkEmail.schoolBcc = [];
   ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
@@ -1162,11 +1180,10 @@ async function handleBulkEmailCsv(event) {
     const rows = result?.rows || [];
     if (!rows.length) {
       bulkEmailError.value =
-        "No students resolved from the CSV. Include a 'name' (student ID) column — the email + details are looked up from it.";
+        "No students resolved from the CSV. Include an 'id' (student) column — the email, details and guardians are looked up from it.";
       return;
     }
     const existing = new Set(bulkEmail.bcc.map((b) => b.email));
-    let added = 0;
     for (const row of rows) {
       const email = (row.email || "").toLowerCase().trim();
       if (!email) continue;
@@ -1174,25 +1191,31 @@ async function handleBulkEmailCsv(event) {
       // resolved server-side at send time and merged under these.
       bulkEmail.mergeData[email] = row.data || {};
       if (!existing.has(email)) {
-        const label = row.name || email; // student display name
+        const label = row.name || email; // student / "Name (guardian)" display
         bulkEmail.bcc.push({ email, name: label, label });
         existing.add(email);
-        added += 1;
       }
     }
     // Merge fields = looked-up student fields + any extra CSV columns.
     bulkEmail.mergeFields =
       result.merge_fields ||
       (result.headers || []).filter(
-        (h) => h.toLowerCase() !== (result.name_column || "name").toLowerCase()
+        (h) => h.toLowerCase() !== (result.id_column || "id").toLowerCase()
       );
-    if (added && includeGuardians.value) {
-      refreshGuardianEmails();
-    }
-    let note = `${rows.length} student${
-      rows.length === 1 ? "" : "s"
-    } loaded from CSV.`;
+    // School-level BCC (email group + admin), derived from the CSV's school —
+    // sent once, un-personalized, on send. Guardians are already auto-added above.
+    bulkEmail.schoolBcc = result.school_bcc || [];
+    let note = `${result.student_count || 0} student${
+      (result.student_count || 0) === 1 ? "" : "s"
+    } loaded`;
+    if (result.guardian_count)
+      note += ` + ${result.guardian_count} guardian(s)`;
+    if (result.school_bcc && result.school_bcc.length)
+      note += ` · ${result.school_bcc.length} school BCC`;
+    note += ".";
     if (result.unmatched_count) note += ` ${result.unmatched_count} not found.`;
+    if (result.school_mismatch_count)
+      note += ` ${result.school_mismatch_count} wrong-school skipped.`;
     if (result.no_email_count)
       note += ` ${result.no_email_count} without an email.`;
     if (result.duplicate_count)
@@ -1276,6 +1299,9 @@ async function sendBulkEmail() {
           bulkEmail.attachments.map((attachment) => attachment.name)
         ),
         merge_data: JSON.stringify(bulkEmail.mergeData || {}),
+        school_bcc: bulkEmail.schoolBcc.length
+          ? JSON.stringify(bulkEmail.schoolBcc)
+          : null,
       }
     );
     if (result?.warning) {
