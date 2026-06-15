@@ -534,6 +534,7 @@
               v-model="composerHtml"
               :min-height="260"
               :ticket-name="props.ticketId"
+              :enable-email-template="composeMode === 'reply'"
               :placeholder="
                 composeMode === 'reply'
                   ? 'Type your reply to the customer...'

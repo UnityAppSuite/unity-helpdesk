@@ -107,8 +107,8 @@ const editorConfig = computed(() => ({
   `,
   setup: (editor: any) => {
     editor.ui.registry.addButton("templates", {
-      text: "Templates",
-      tooltip: "Insert saved reply template",
+      text: "Static Templates",
+      tooltip: "Insert saved reply template (static text)",
       onAction: () => {
         pickerOpen.value = true;
       },

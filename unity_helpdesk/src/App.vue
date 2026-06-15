@@ -1,5 +1,16 @@
 <template>
   <div class="app-shell" :class="threadLayoutClass">
+    <transition name="global-notice-fade">
+      <div
+        v-if="globalNotice"
+        class="global-notice"
+        :class="`global-notice--${globalNotice.type}`"
+        role="status"
+        @click="dismissGlobalNotice"
+      >
+        {{ globalNotice.text }}
+      </div>
+    </transition>
     <aside class="sidebar" :class="{ open: sidebarOpen }">
       <RouterLink class="brand" to="/tickets/my" @click="sidebarOpen = false">
         <span class="brand-mark">
@@ -226,7 +237,9 @@
               v-model="composer.message"
               :min-height="260"
               placeholder="Write the email that should be sent to the customer"
+              :enable-email-template="true"
               @template-subject="applyTemplateSubjectToComposer"
+              @email-template-selected="applyEmailTemplateToCreateTicket"
             />
           </label>
           <label>
@@ -310,25 +323,11 @@
             {{ bulkEmailWarning }}
           </p>
 
-          <label v-if="bulkEmail.recipients.length">
-            Recipients
-            <div class="recipient-multiselect recipient-multiselect--locked">
-              <span
-                v-for="chip in bulkEmail.recipients"
-                :key="chip.email"
-                class="recipient-chip recipient-chip--locked"
-              >
-                <span class="recipient-chip-label">{{
-                  chip.label || chip.email
-                }}</span>
-              </span>
-            </div>
-          </label>
-          <p v-else class="muted bulk-email-default-note">
-            No default recipient is configured — this email will be sent from
-            your account. Students stay hidden in BCC. You can set a default
-            recipient in Settings.
-          </p>
+          <!--
+            Recipients field intentionally hidden. The default recipient (if any)
+            is still populated into bulkEmail.recipients and sent to the server;
+            students/guardians always stay hidden in per-recipient BCC.
+          -->
 
           <label>
             Subject
@@ -398,9 +397,11 @@
                   title="Personalized from CSV merge data"
                   >⚡</span
                 >
-                <span class="recipient-chip-label" :title="b.email">{{
-                  b.label || b.email
-                }}</span>
+                <span
+                  class="recipient-chip-label"
+                  :title="b.label || b.email"
+                  >{{ b.email }}</span
+                >
                 <button
                   type="button"
                   class="recipient-chip-remove"
@@ -481,7 +482,17 @@
               >
             </div>
           </label>
-          <label class="bulk-email-guardian-toggle">
+          <p
+            v-if="bulkEmail.csvImported"
+            class="muted bulk-email-guardian-auto"
+          >
+            Guardians are included automatically from each student id in the
+            CSV.
+          </p>
+          <label
+            v-if="!bulkEmail.csvImported"
+            class="bulk-email-guardian-toggle"
+          >
             <input
               v-model="includeGuardians"
               type="checkbox"
@@ -492,7 +503,7 @@
               >fetching guardians…</span
             >
           </label>
-          <label>
+          <label v-if="!bulkEmail.csvImported">
             Guardian Emails
             <textarea
               v-model="guardianEmails"
@@ -665,6 +676,7 @@ const bulkEmail = reactive({
   mergeData: {}, // { email_lower: { col: val, ..., _student } } from the imported CSV
   mergeFields: [], // student fields + extra CSV columns usable as {{field}}
   schoolBcc: [], // school email-group + admin (one un-personalized BCC), from CSV school
+  csvImported: false, // true once a CSV is imported — guardians are auto-included, so the manual guardian controls are hidden
 });
 const includeGuardians = ref(false);
 const guardianEmails = ref("");
@@ -682,6 +694,36 @@ provide("refreshUnitySession", loadSession);
 // can reuse them via inject instead of re-fetching on every navigation.
 provide("unityAgents", agents);
 provide("unityTicketTypes", ticketTypes);
+
+// Cross-view "tickets changed" signal — TicketsView injects it and reloads when it
+// bumps, so a non-blocking send is reflected in the list once the request finishes.
+const ticketsRefreshSignal = ref(0);
+provide("unityTicketsRefresh", ticketsRefreshSignal);
+function signalTicketsRefresh() {
+  ticketsRefreshSignal.value += 1;
+}
+
+// Global, non-blocking notice (toast) shown above everything. Lets the send
+// composers close immediately and report progress/outcome out-of-band, so the UI
+// never hangs on a slow send.
+const globalNotice = ref(null); // { text, type: 'info' | 'success' | 'error' }
+let globalNoticeTimer = null;
+function showGlobalNotice(text, type = "info", autoDismissMs = 0) {
+  if (globalNoticeTimer) {
+    clearTimeout(globalNoticeTimer);
+    globalNoticeTimer = null;
+  }
+  globalNotice.value = { text, type };
+  if (autoDismissMs > 0) {
+    globalNoticeTimer = setTimeout(() => {
+      globalNotice.value = null;
+    }, autoDismissMs);
+  }
+}
+function dismissGlobalNotice() {
+  if (globalNoticeTimer) clearTimeout(globalNoticeTimer);
+  globalNotice.value = null;
+}
 
 const capabilities = computed(() => session.capabilities || {});
 const canViewMyTickets = computed(
@@ -844,6 +886,20 @@ function applyEmailTemplateToBulkEmail(payload) {
   }
 }
 
+// Create-Ticket composer: same as bulk — Email Template drives subject + body.
+// The single send does NOT render Jinja, so any {{placeholders}} load as-is for
+// the agent to fill before sending (matches the canned-response button).
+function applyEmailTemplateToCreateTicket(payload) {
+  const subject = payload && payload.subject;
+  const body = payload && payload.body;
+  if (typeof subject === "string" && subject.trim()) {
+    composer.subject = subject;
+  }
+  if (typeof body === "string") {
+    composer.message = body;
+  }
+}
+
 function onEmailInput() {
   clearTimeout(suggestTimeout);
   const query = composer.raised_by;
@@ -902,30 +958,41 @@ async function createTicket() {
     composerError.value = "Ticket Type is required.";
     return;
   }
-  composerSaving.value = true;
+  // Snapshot the payload BEFORE closing (closeComposer resets the form). Then close
+  // the composer immediately and report progress out-of-band — the request runs in
+  // the background so the UI never hangs on a slow send. The new ticket appears in
+  // the list once the request finishes (or sooner — it's committed early server-side).
+  const payload = {
+    subject: composer.subject,
+    raised_by: composer.raised_by,
+    message: composer.message,
+    priority: composer.priority,
+    ticket_type: composer.ticket_type,
+    assignee: composer.assignee,
+    attachments: composer.attachments.map((attachment) => attachment.name),
+  };
+  closeComposer();
+  showGlobalNotice(
+    "📨 Email is being sent — the new ticket will appear in your list shortly…",
+    "info"
+  );
   try {
-    const result = await call("helpdesk.api.unity_helpdesk_ext.create_ticket", {
-      subject: composer.subject,
-      raised_by: composer.raised_by,
-      message: composer.message,
-      priority: composer.priority,
-      ticket_type: composer.ticket_type,
-      assignee: composer.assignee,
-      attachments: composer.attachments.map((attachment) => attachment.name),
-    });
-    const ticket = result?.ticket || {};
+    const result = await call(
+      "helpdesk.api.unity_helpdesk_ext.create_ticket",
+      payload
+    );
+    signalTicketsRefresh();
     if (result?.warning) {
-      sessionStorage.setItem(TICKET_NOTICE_KEY, result.warning);
-      composerWarning.value = result.warning;
-    }
-    closeComposer();
-    if (ticket?.name) {
-      router.push(`/tickets/${ticket.name}`);
+      showGlobalNotice(result.warning, "error", 9000);
+    } else {
+      showGlobalNotice("✅ Ticket created and email sent.", "success", 5000);
     }
   } catch (err) {
-    composerError.value = err.message;
-  } finally {
-    composerSaving.value = false;
+    showGlobalNotice(
+      "Ticket creation failed: " + (err?.message || err),
+      "error",
+      10000
+    );
   }
 }
 
@@ -1146,6 +1213,7 @@ function resetBulkEmail() {
   bulkEmail.mergeData = {};
   bulkEmail.mergeFields = [];
   bulkEmail.schoolBcc = [];
+  bulkEmail.csvImported = false;
   ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
@@ -1205,6 +1273,11 @@ async function handleBulkEmailCsv(event) {
     // School-level BCC (email group + admin), derived from the CSV's school —
     // sent once, un-personalized, on send. Guardians are already auto-added above.
     bulkEmail.schoolBcc = result.school_bcc || [];
+    // Guardians come automatically from each student id, so the manual
+    // "Include guardian emails" controls are no longer relevant — hide them.
+    bulkEmail.csvImported = true;
+    includeGuardians.value = false;
+    guardianEmails.value = "";
     let note = `${result.student_count || 0} student${
       (result.student_count || 0) === 1 ? "" : "s"
     } loaded`;
@@ -1283,50 +1356,59 @@ async function sendBulkEmail() {
     bulkEmailError.value = "Message is required.";
     return;
   }
-  bulkEmailSending.value = true;
+  // Build the payload BEFORE closing the composer (closeBulkEmail resets the form).
+  const ccEmails = bulkEmail.cc.map((c) => c.email);
+  const payload = {
+    subject: bulkEmail.subject,
+    message: bulkEmail.message,
+    ticket_type: bulkEmail.ticket_type,
+    recipients: JSON.stringify(recipients),
+    cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
+    bcc: bccEmails.length ? JSON.stringify(bccEmails) : null,
+    attachments: JSON.stringify(
+      bulkEmail.attachments.map((attachment) => attachment.name)
+    ),
+    merge_data: JSON.stringify(bulkEmail.mergeData || {}),
+    school_bcc: bulkEmail.schoolBcc.length
+      ? JSON.stringify(bulkEmail.schoolBcc)
+      : null,
+  };
+  const recipientCount = bccEmails.length;
+
+  // Non-blocking: close the composer immediately and report progress out-of-band so
+  // the UI never hangs on a slow send. The audit ticket appears in the list once the
+  // request finishes (it is committed early server-side).
+  closeBulkEmail();
+  showGlobalNotice(
+    "📨 Bulk email is being sent — the new ticket will appear in your list shortly…",
+    "info"
+  );
   try {
-    const ccEmails = bulkEmail.cc.map((c) => c.email);
     const result = await call(
       "helpdesk.api.unity_helpdesk_ext.bulk_send_email",
-      {
-        subject: bulkEmail.subject,
-        message: bulkEmail.message,
-        ticket_type: bulkEmail.ticket_type,
-        recipients: JSON.stringify(recipients),
-        cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
-        bcc: bccEmails.length ? JSON.stringify(bccEmails) : null,
-        attachments: JSON.stringify(
-          bulkEmail.attachments.map((attachment) => attachment.name)
-        ),
-        merge_data: JSON.stringify(bulkEmail.mergeData || {}),
-        school_bcc: bulkEmail.schoolBcc.length
-          ? JSON.stringify(bulkEmail.schoolBcc)
-          : null,
-      }
+      payload
     );
+    signalTicketsRefresh();
     if (result?.warning) {
-      bulkEmailWarning.value = result.warning;
-      return;
+      showGlobalNotice(result.warning, "error", 9000);
+    } else {
+      const count = result?.sent || result?.count || recipientCount;
+      const noun = count === 1 ? "recipient" : "recipients";
+      let message =
+        result?.instant === false
+          ? `✅ Bulk email queued for ${count} ${noun} — it will send shortly.`
+          : `✅ Bulk email sent to ${count} ${noun}.`;
+      if (result?.invalid_count) {
+        message += ` ${result.invalid_count} invalid address(es) skipped.`;
+      }
+      showGlobalNotice(message, "success", 6000);
     }
-    const count = result?.count || 0;
-    const noun = count === 1 ? "recipient" : "recipients";
-    let message = `Email queued — it will be sent to ${count} ${noun} shortly.`;
-    if (result?.invalid_count) {
-      message += ` ${result.invalid_count} invalid email address(es) were skipped.`;
-    }
-    // The send runs in the background (no ticket to open). Clear the form so a
-    // stray click can't re-send, show a green confirmation, then auto-close the
-    // modal shortly after so the user both sees the success and the window closes.
-    resetBulkEmail();
-    bulkEmailSuccess.value = message;
-    if (bulkSuccessCloseTimer) clearTimeout(bulkSuccessCloseTimer);
-    bulkSuccessCloseTimer = setTimeout(() => {
-      closeBulkEmail();
-    }, 2200);
   } catch (err) {
-    bulkEmailError.value = err.message;
-  } finally {
-    bulkEmailSending.value = false;
+    showGlobalNotice(
+      "Bulk email failed: " + (err?.message || err),
+      "error",
+      10000
+    );
   }
 }
 </script>

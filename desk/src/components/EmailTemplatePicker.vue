@@ -72,6 +72,13 @@
   </div>
 </template>
 
+<script lang="ts">
+// Module-scoped cache for the default (no-search) template list. It survives the
+// picker being unmounted/remounted (v-if toggles), so the SECOND and later opens
+// paint instantly instead of waiting on another round-trip to the (slow dev) server.
+let defaultListCache: { name: string; subject?: string }[] | null = null;
+</script>
+
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 
@@ -135,20 +142,34 @@ async function callMethod<T>(
 async function loadTemplates() {
   listController?.abort();
   listController = new AbortController();
-  loading.value = true;
+  const isDefault = !search.value;
+  // For the default list, paint cached results immediately and refresh in the
+  // background (no spinner). Only show "Loading…" when we have nothing to show.
+  if (isDefault && defaultListCache) {
+    templates.value = defaultListCache;
+    activeIdx.value = templates.value.length ? 0 : -1;
+    loading.value = false;
+  } else {
+    loading.value = true;
+  }
   try {
     const data = await callMethod<Template[]>(
       "helpdesk.api.email_templates.list_email_templates",
       { search: search.value || undefined, limit: 50 },
       listController.signal
     );
-    templates.value = Array.isArray(data) ? data : [];
-    activeIdx.value = templates.value.length ? 0 : -1;
+    const list = Array.isArray(data) ? data : [];
+    templates.value = list;
+    activeIdx.value = list.length ? 0 : -1;
+    if (isDefault) defaultListCache = list; // warm the cache for the next open
   } catch (err: any) {
     if (err?.name !== "AbortError") {
       console.warn("[email-template-picker] list failed:", err);
-      templates.value = [];
-      activeIdx.value = -1;
+      // Keep the cached list visible on a background-refresh failure.
+      if (!(isDefault && defaultListCache)) {
+        templates.value = [];
+        activeIdx.value = -1;
+      }
     }
   } finally {
     loading.value = false;
