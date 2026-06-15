@@ -848,6 +848,16 @@ const refreshUnitySession = inject("refreshUnitySession", null);
 // instead of issuing duplicate get_agents / get_ticket_types calls per view.
 const injectedAgents = inject("unityAgents", null);
 const injectedTicketTypes = inject("unityTicketTypes", null);
+// Bumped by App.vue when a non-blocking send finishes — pull the new ticket in.
+const ticketsRefreshSignal = inject("unityTicketsRefresh", null);
+if (ticketsRefreshSignal) {
+  watch(
+    () => ticketsRefreshSignal.value,
+    () => {
+      reload();
+    }
+  );
+}
 
 const draftSearch = ref("");
 const appliedSearch = ref("");

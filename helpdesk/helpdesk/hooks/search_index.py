@@ -34,61 +34,58 @@ def on_ticket_after_insert(doc, method=None):
 	)
 
 
+def _enqueue_search_index(ticket_name):
+	"""Rebuild the message-body search index OFF the request.
+
+	The reply/note write path used to refresh the index synchronously (and these
+	doc-event hooks fired it again), so a busy ticket's whole-thread rebuild
+	— get_ticket_thread_components fetches every Communication + per-comm
+	attachments/avatars — ran 2-3x on EVERY reply/note, adding seconds of latency.
+
+	Enqueue it instead, on the `short` queue, **deduplicated per ticket** (so the
+	after_insert + on_update + any sibling events for one ticket coalesce into a
+	single job) and **after_commit** (so the new Communication/comment is visible
+	to the worker). A stale index for a couple of seconds never blocks the write.
+	Falls back to a direct sync update only if enqueue itself fails (no worker)."""
+	if not ticket_name:
+		return
+	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+
+	try:
+		frappe.enqueue(
+			"helpdesk.api.unity_helpdesk.update_ticket_message_search_index",
+			ticket_name=ticket_name,
+			queue="short",
+			job_id=f"unity_search_idx::{ticket_name}",
+			deduplicate=True,
+			enqueue_after_commit=True,
+		)
+	except Exception:
+		_safe(
+			"update_ticket_message_search_index (sync fallback)",
+			lambda: update_ticket_message_search_index(ticket_name),
+		)
+
+
 def on_communication_after_insert(doc, method=None):
 	"""Refresh the message-body index whenever a new email/communication lands on a ticket."""
 	if doc.get("reference_doctype") != "HD Ticket":
 		return
-	ticket_name = doc.get("reference_name")
-	if not ticket_name:
-		return
-
-	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-	_safe(
-		"update_ticket_message_search_index (communication)",
-		lambda: update_ticket_message_search_index(ticket_name),
-	)
+	_enqueue_search_index(doc.get("reference_name"))
 
 
 def on_comment_after_insert(doc, method=None):
 	"""Refresh the message-body index when a comment is added."""
-	ticket_name = doc.get("reference_ticket")
-	if not ticket_name:
-		return
-
-	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-	_safe(
-		"update_ticket_message_search_index (comment)",
-		lambda: update_ticket_message_search_index(ticket_name),
-	)
+	_enqueue_search_index(doc.get("reference_ticket"))
 
 
 def on_communication_on_update(doc, method=None):
 	"""Refresh the message-body index when an existing email/communication is edited."""
 	if doc.get("reference_doctype") != "HD Ticket":
 		return
-	ticket_name = doc.get("reference_name")
-	if not ticket_name:
-		return
-
-	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-	_safe(
-		"update_ticket_message_search_index (communication on_update)",
-		lambda: update_ticket_message_search_index(ticket_name),
-	)
+	_enqueue_search_index(doc.get("reference_name"))
 
 
 def on_comment_on_update(doc, method=None):
 	"""Refresh the message-body index when an existing comment is edited."""
-	ticket_name = doc.get("reference_ticket")
-	if not ticket_name:
-		return
-
-	from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
-
-	_safe(
-		"update_ticket_message_search_index (comment on_update)",
-		lambda: update_ticket_message_search_index(ticket_name),
-	)
+	_enqueue_search_index(doc.get("reference_ticket"))

@@ -4378,6 +4378,31 @@ def search_contacts(query):
 			seen.add(e)
 			results.append({"email": e, "name": name or e})
 
+	# Search Student by id / reference number / name / email — return the student's
+	# OWN email (student_email_id, fallback user) so the BCC picker resolves students
+	# by reference number or name, not only guardians/contacts. Listed first so a
+	# code/ref search surfaces the student.
+	if frappe.db.exists("DocType", "Student"):
+		try:
+			student_fields = ["name", "first_name", "last_name", "student_email_id", "user"]
+			optional = [f for f in ("student_name", "reference_number") if frappe.db.has_column("Student", f)]
+			student_or = [["name", "like", f"%{q}%"]]
+			for f in ("reference_number", "student_name", "first_name", "last_name", "student_email_id"):
+				if frappe.db.has_column("Student", f):
+					student_or.append([f, "like", f"%{q}%"])
+			for s in frappe.get_all(
+				"Student",
+				or_filters=student_or,
+				fields=student_fields + optional,
+				limit_page_length=10,
+			):
+				display = " ".join(
+					p for p in (cstr(s.get("first_name")), cstr(s.get("last_name"))) if p.strip()
+				).strip() or cstr(s.get("student_name") or "").strip() or cstr(s.get("name"))
+				_add(s.get("student_email_id") or s.get("user"), display)
+		except Exception:
+			pass
+
 	# Search Guardian (parents) by name
 	for g in frappe.get_all(
 		"Guardian",
