@@ -238,29 +238,19 @@
               :min-height="260"
               placeholder="Write the email that should be sent to the customer"
               :enable-email-template="true"
+              :enable-attach="true"
+              @attach="composerAttachmentInput?.click()"
               @template-subject="applyTemplateSubjectToComposer"
               @email-template-selected="applyEmailTemplateToCreateTicket"
             />
-          </label>
-          <label>
-            Attachments
-            <div class="composer-attachment-actions">
-              <button
-                type="button"
-                class="btn secondary"
-                :disabled="composerUploading"
-                @click="composerAttachmentInput?.click()"
-              >
-                {{ composerUploading ? "Uploading..." : "Add Attachments" }}
-              </button>
-              <input
-                ref="composerAttachmentInput"
-                type="file"
-                class="hidden-file-input"
-                multiple
-                @change="handleComposerAttachments"
-              />
-            </div>
+            <input
+              ref="composerAttachmentInput"
+              type="file"
+              class="hidden-file-input"
+              multiple
+              @change="handleComposerAttachments"
+            />
+            <span v-if="composerUploading" class="muted">Uploading…</span>
             <div
               v-if="composer.attachments.length"
               class="attachment-list attachment-list-modal"
@@ -308,33 +298,243 @@
           <div>
             <strong>Send Bulk Email</strong>
             <span
-              >Compose one email and BCC many recipients. A single audit ticket
-              is created.</span
+              >Send a personalised email to each student (and their guardians).
+              One ticket is created per student.</span
             >
           </div>
           <button class="btn secondary" @click="closeBulkEmail">Close</button>
         </div>
         <div class="modal-body stack">
-          <p v-if="bulkEmailSuccess" class="success-banner">
-            {{ bulkEmailSuccess }}
-          </p>
           <p v-if="bulkEmailError" class="error">{{ bulkEmailError }}</p>
           <p v-else-if="bulkEmailWarning" class="warning-banner">
             {{ bulkEmailWarning }}
           </p>
 
-          <!--
-            Recipients field intentionally hidden. The default recipient (if any)
-            is still populated into bulkEmail.recipients and sent to the server;
-            students/guardians always stay hidden in per-recipient BCC.
-          -->
+          <!-- Recipient input mode -->
+          <div class="bulk-mode-toggle" role="tablist">
+            <button
+              type="button"
+              class="bulk-mode-btn"
+              :class="{ active: bulkEmail.mode === 'reference' }"
+              role="tab"
+              :aria-selected="bulkEmail.mode === 'reference'"
+              @click="setBulkMode('reference')"
+            >
+              Enter reference numbers
+            </button>
+            <button
+              type="button"
+              class="bulk-mode-btn"
+              :class="{ active: bulkEmail.mode === 'csv' }"
+              role="tab"
+              :aria-selected="bulkEmail.mode === 'csv'"
+              @click="setBulkMode('csv')"
+            >
+              Import CSV
+            </button>
+          </div>
+
+          <!-- Reference-number mode -->
+          <template v-if="bulkEmail.mode === 'reference'">
+            <label>
+              Reference numbers / students
+              <div class="recipient-multiselect" @click="focusBccInput">
+                <span
+                  v-for="s in bulkEmail.students"
+                  :key="s.key"
+                  class="recipient-chip"
+                  :class="{
+                    'recipient-chip-warn':
+                      s.status === 'notfound' || s.status === 'noemail',
+                  }"
+                >
+                  <span class="recipient-chip-label" :title="chipTitle(s)">{{
+                    s.name
+                  }}</span>
+                  <button
+                    type="button"
+                    class="recipient-chip-remove"
+                    @click.stop="removeStudent(s.key)"
+                  >
+                    ×
+                  </button>
+                </span>
+                <div class="recipient-input-wrap">
+                  <input
+                    ref="bccInputRef"
+                    v-model="bccSearchQuery"
+                    type="text"
+                    class="recipient-input"
+                    placeholder="Type reference number, student name or email…"
+                    autocomplete="off"
+                    @input="onBccSearch"
+                    @keydown.enter.prevent="addStudentFromInput"
+                    @keydown.backspace="onBccBackspace"
+                    @keydown.escape="bccResults = []"
+                    @focus="onBccSearch"
+                  />
+                  <div v-if="bccResults.length" class="recipient-dropdown">
+                    <button
+                      v-for="r in bccResults"
+                      :key="r.email"
+                      type="button"
+                      class="recipient-dropdown-item"
+                      @mousedown.prevent="selectStudent(r)"
+                    >
+                      <span class="rd-name">{{ r.name }}</span>
+                      <span class="rd-email">{{ r.email }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="composer-attachment-actions" style="margin-top: 6px">
+                <span v-if="bulkResolving" class="muted">resolving…</span>
+                <span class="muted" style="margin-left: auto">
+                  {{ bulkEmailStudentCount }} student{{
+                    bulkEmailStudentCount === 1 ? "" : "s"
+                  }}
+                </span>
+              </div>
+            </label>
+            <label class="bulk-email-guardian-toggle">
+              <input v-model="includeGuardians" type="checkbox" />
+              Include guardian emails
+              <span
+                v-if="guardianCountLabel"
+                class="muted"
+                style="margin-left: 6px"
+                >{{ guardianCountLabel }}</span
+              >
+            </label>
+            <label v-if="includeGuardians && recipientsPreview">
+              Recipients (student + guardian emails)
+              <textarea
+                class="recipients-preview"
+                :value="recipientsPreview"
+                rows="4"
+                readonly
+              ></textarea>
+            </label>
+          </template>
+
+          <!-- CSV mode -->
+          <template v-else>
+            <label>
+              Import students from CSV
+              <div class="composer-attachment-actions" style="margin-top: 6px">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  :disabled="bulkEmailUploading"
+                  @click="bulkEmailCsvInput?.click()"
+                >
+                  {{ bulkEmailUploading ? "Importing..." : "Import CSV" }}
+                </button>
+                <input
+                  ref="bulkEmailCsvInput"
+                  type="file"
+                  accept=".csv,text/csv"
+                  class="hidden-file-input"
+                  @change="handleBulkEmailCsv"
+                />
+                <a
+                  href="/api/method/helpdesk.api.unity_helpdesk_ext.get_bulk_email_sample_csv"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="btn secondary"
+                >
+                  Sample CSV
+                </a>
+                <span class="muted" style="margin-left: auto">
+                  {{ bulkEmailStudentCount }} student{{
+                    bulkEmailStudentCount === 1 ? "" : "s"
+                  }}
+                </span>
+              </div>
+              <div
+                v-if="bulkEmail.students.length"
+                class="bulk-email-chip-list"
+              >
+                <span
+                  v-for="s in bulkEmail.students"
+                  :key="s.key"
+                  class="recipient-chip"
+                  :class="{ 'recipient-chip-warn': s.status === 'noemail' }"
+                >
+                  <span class="recipient-chip-label" :title="chipTitle(s)">{{
+                    s.name
+                  }}</span>
+                  <button
+                    type="button"
+                    class="recipient-chip-remove"
+                    @click.stop="removeStudent(s.key)"
+                  >
+                    ×
+                  </button>
+                </span>
+              </div>
+              <p class="muted bulk-email-guardian-auto">
+                Guardians are included automatically from each student id in the
+                CSV.
+              </p>
+            </label>
+            <label v-if="recipientsPreview">
+              Recipients (student + guardian emails)
+              <textarea
+                class="recipients-preview"
+                :value="recipientsPreview"
+                rows="4"
+                readonly
+              ></textarea>
+            </label>
+          </template>
+
+          <!-- Concise hint: any Student field works as a merge token. -->
+          <div class="merge-fields-hint">
+            <span class="muted">
+              Tip: type
+              <code class="merge-field-chip">{{
+                mergeFieldToken("field_name")
+              }}</code>
+              in the subject or body to auto-fill any student detail (e.g.
+              <code class="merge-field-chip">{{
+                mergeFieldToken("first_name")
+              }}</code
+              >,
+              <code class="merge-field-chip">{{
+                mergeFieldToken("last_name")
+              }}</code
+              >). It's filled per student and left blank if the student has no
+              value.
+            </span>
+          </div>
+          <!-- What the composed email actually uses, with unknown-token warning -->
+          <div v-if="templateTokens.length" class="merge-fields-hint">
+            This email uses:
+            <code
+              v-for="t in templateTokens"
+              :key="t.token"
+              class="merge-field-chip"
+              :class="{ 'merge-field-chip-bad': !t.recognised }"
+              :title="
+                t.recognised
+                  ? 'Auto-filled per student'
+                  : 'Not a known field — will be blank'
+              "
+              >{{ mergeFieldToken(t.token) }}</code
+            >
+            <span v-if="unknownTokens.length" class="bulk-token-warn"
+              >⚠ {{ unknownTokens.join(", ") }} won't auto-fill — check the
+              field name.</span
+            >
+          </div>
 
           <label>
             Subject
             <input
               v-model="bulkEmail.subject"
               type="text"
-              placeholder="Email subject"
+              placeholder="Email subject (auto-filled when you pick an Email Template)"
             />
           </label>
           <label>
@@ -384,163 +584,24 @@
             </div>
           </label>
           <label>
-            BCC (students)
-            <div class="recipient-multiselect" @click="focusBccInput">
-              <span
-                v-for="b in bulkEmail.bcc"
-                :key="b.email"
-                class="recipient-chip"
-              >
-                <span
-                  v-if="bulkEmail.mergeData[b.email]"
-                  class="recipient-chip-merge"
-                  title="Personalized from CSV merge data"
-                  >⚡</span
-                >
-                <span
-                  class="recipient-chip-label"
-                  :title="b.label || b.email"
-                  >{{ b.email }}</span
-                >
-                <button
-                  type="button"
-                  class="recipient-chip-remove"
-                  @click.stop="removeBcc(b.email)"
-                >
-                  ×
-                </button>
-              </span>
-              <div class="recipient-input-wrap">
-                <input
-                  ref="bccInputRef"
-                  v-model="bccSearchQuery"
-                  type="text"
-                  class="recipient-input"
-                  placeholder="Type reference number, student name or email…"
-                  autocomplete="off"
-                  @input="onBccSearch"
-                  @keydown.enter.prevent="addBccFromInput"
-                  @keydown.backspace="onBccBackspace"
-                  @keydown.escape="bccResults = []"
-                  @focus="onBccSearch"
-                />
-                <div v-if="bccResults.length" class="recipient-dropdown">
-                  <button
-                    v-for="r in bccResults"
-                    :key="r.email"
-                    type="button"
-                    class="recipient-dropdown-item"
-                    @mousedown.prevent="selectBcc(r)"
-                  >
-                    <span class="rd-name">{{ r.name }}</span>
-                    <span class="rd-email">{{ r.email }}</span>
-                  </button>
-                </div>
-              </div>
-            </div>
-            <div class="composer-attachment-actions" style="margin-top: 6px">
-              <button
-                type="button"
-                class="btn secondary"
-                :disabled="bulkEmailUploading"
-                @click="bulkEmailCsvInput?.click()"
-              >
-                Import CSV
-              </button>
-              <input
-                ref="bulkEmailCsvInput"
-                type="file"
-                accept=".csv,text/csv"
-                class="hidden-file-input"
-                @change="handleBulkEmailCsv"
-              />
-              <a
-                href="/api/method/helpdesk.api.unity_helpdesk_ext.get_bulk_email_sample_csv"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="btn secondary"
-              >
-                Sample CSV
-              </a>
-              <span class="muted" style="margin-left: auto">
-                {{ bulkEmail.bcc.length }} student{{
-                  bulkEmail.bcc.length === 1 ? "" : "s"
-                }}
-              </span>
-            </div>
-            <div v-if="bulkEmail.mergeFields.length" class="merge-fields-hint">
-              Merge fields:
-              <code
-                v-for="f in bulkEmail.mergeFields"
-                :key="f"
-                class="merge-field-chip"
-                >{{ mergeFieldToken(f) }}</code
-              >
-              <span class="muted"
-                >— use in the subject/body; blank when a recipient has no
-                value.</span
-              >
-            </div>
-          </label>
-          <p
-            v-if="bulkEmail.csvImported"
-            class="muted bulk-email-guardian-auto"
-          >
-            Guardians are included automatically from each student id in the
-            CSV.
-          </p>
-          <label
-            v-if="!bulkEmail.csvImported"
-            class="bulk-email-guardian-toggle"
-          >
-            <input
-              v-model="includeGuardians"
-              type="checkbox"
-              @change="onIncludeGuardiansChange"
-            />
-            Include guardian emails
-            <span v-if="guardiansLoading" class="muted" style="margin-left: 6px"
-              >fetching guardians…</span
-            >
-          </label>
-          <label v-if="!bulkEmail.csvImported">
-            Guardian Emails
-            <textarea
-              v-model="guardianEmails"
-              rows="3"
-              placeholder="Check the box above to auto-fill guardian emails for the students added in BCC"
-            ></textarea>
-          </label>
-          <label>
             Message
             <TinyMceEditor
               v-model="bulkEmail.message"
               :min-height="240"
               placeholder="Compose the email message"
               :enable-email-template="true"
+              :enable-attach="true"
+              @attach="bulkEmailAttachmentInput?.click()"
               @template-subject="applyTemplateSubjectToBulkEmail"
               @email-template-selected="applyEmailTemplateToBulkEmail"
             />
-          </label>
-          <label>
-            Attachments
-            <div class="composer-attachment-actions">
-              <button
-                type="button"
-                class="btn secondary"
-                :disabled="bulkEmailUploading"
-                @click="bulkEmailAttachmentInput?.click()"
-              >
-                {{ bulkEmailUploading ? "Uploading..." : "Add Attachments" }}
-              </button>
-              <input
-                ref="bulkEmailAttachmentInput"
-                type="file"
-                class="hidden-file-input"
-                multiple
-                @change="handleBulkEmailAttachments"
-              />
-            </div>
+            <input
+              ref="bulkEmailAttachmentInput"
+              type="file"
+              class="hidden-file-input"
+              multiple
+              @change="handleBulkEmailAttachments"
+            />
             <div
               v-if="bulkEmail.attachments.length"
               class="attachment-list attachment-list-modal"
@@ -572,14 +633,14 @@
           <button class="btn secondary" @click="closeBulkEmail">Cancel</button>
           <button
             class="btn"
-            :disabled="bulkEmailSending || !bulkEmailBccTotal"
+            :disabled="bulkEmailSending || !bulkEmailStudentCount"
             @click="sendBulkEmail"
           >
             {{
               bulkEmailSending
                 ? "Sending..."
-                : `Send to ${bulkEmailBccTotal} recipient${
-                    bulkEmailBccTotal === 1 ? "" : "s"
+                : `Send to ${bulkEmailStudentCount} student${
+                    bulkEmailStudentCount === 1 ? "" : "s"
                   }`
             }}
           </button>
@@ -654,33 +715,29 @@ const bulkEmailSending = ref(false);
 const bulkEmailUploading = ref(false);
 const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
-const bulkEmailSuccess = ref("");
-let bulkSuccessCloseTimer = null;
 const bulkEmailCsvInput = ref(null);
 const bulkEmailAttachmentInput = ref(null);
-// Default bulk-email recipients come from HD Settings (via the profile),
-// not a hardcoded address. Returns chip objects for the recipient list.
-function defaultRecipientChips() {
-  const defaults = profile.value?.settings?.bulk_email_default_recipients;
-  if (!Array.isArray(defaults)) return [];
-  return defaults.map((email) => ({ email, name: email, label: email }));
-}
+const bulkResolving = ref(false);
 const bulkEmail = reactive({
-  recipients: defaultRecipientChips(),
+  mode: "reference", // "reference" (type ref numbers) | "csv" (import file)
   subject: "",
   ticket_type: "",
   message: "",
   cc: [],
-  bcc: [], // [{email, name?, label?}] — students
+  // Reference-mode raw inputs (reference numbers / student names / emails).
+  tokens: [],
+  // Resolved recipients — one per student (or free email). Each becomes ONE
+  // ticket + ONE email to [student + guardians]:
+  //   { key, token, student, name, email, guardian_emails: [], data: {}, status }
+  students: [],
   attachments: [],
-  mergeData: {}, // { email_lower: { col: val, ..., _student } } from the imported CSV
-  mergeFields: [], // student fields + extra CSV columns usable as {{field}}
-  schoolBcc: [], // school email-group + admin (one un-personalized BCC), from CSV school
-  csvImported: false, // true once a CSV is imported — guardians are auto-included, so the manual guardian controls are hidden
+  mergeFields: [], // student fields usable as {{field}}
+  csvImported: false,
 });
 const includeGuardians = ref(false);
-const guardianEmails = ref("");
-const guardiansLoading = ref(false);
+// All Student doctype fields, fetched once when the bulk modal opens — used to
+// show the full merge-field list and to flag {{tokens}} that won't auto-fill.
+const studentMergeFields = ref([]);
 const ccInputRef = ref(null);
 const ccInputQuery = ref("");
 const bccInputRef = ref(null);
@@ -973,7 +1030,7 @@ async function createTicket() {
   };
   closeComposer();
   showGlobalNotice(
-    "📨 Email is being sent — the new ticket will appear in your list shortly…",
+    "Sending email… the new ticket will appear in your list shortly.",
     "info"
   );
   try {
@@ -985,7 +1042,7 @@ async function createTicket() {
     if (result?.warning) {
       showGlobalNotice(result.warning, "error", 9000);
     } else {
-      showGlobalNotice("✅ Ticket created and email sent.", "success", 5000);
+      showGlobalNotice("Ticket created and email sent.", "success", 5000);
     }
   } catch (err) {
     showGlobalNotice(
@@ -999,24 +1056,106 @@ async function createTicket() {
 // --- Bulk email ---
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-function parseBulkRecipients(raw) {
-  return (raw || "")
-    .split(/[\s,;]+/)
-    .map((value) => value.trim())
-    .filter((value) => EMAIL_REGEX.test(value));
+// Deliverable emails for one student: the student + (optionally) their guardians,
+// deduped WITHIN the student. Siblings sharing a guardian still each get their own
+// personalised ticket that mails that guardian.
+function studentGroupEmails(s, includeG) {
+  const out = [];
+  const seen = new Set();
+  const push = (e) => {
+    const x = (e || "").toLowerCase().trim();
+    if (x && EMAIL_REGEX.test(x) && !seen.has(x)) {
+      seen.add(x);
+      out.push(x);
+    }
+  };
+  push(s.email);
+  if (includeG) (s.guardian_emails || []).forEach(push);
+  return out;
 }
 
-const parsedGuardianEmails = computed(() =>
-  parseBulkRecipients(guardianEmails.value)
-);
-const bulkEmailBccTotal = computed(() => {
-  const seen = new Set();
-  for (const b of bulkEmail.bcc) {
-    if (b.email) seen.add(b.email.toLowerCase());
+// One send group per resolved student (or free email) -> one ticket + one email.
+const bulkEmailGroups = computed(() => {
+  const includeG = bulkEmail.mode === "csv" ? true : includeGuardians.value;
+  const groups = [];
+  for (const s of bulkEmail.students) {
+    if (s.status === "notfound") continue;
+    const emails = studentGroupEmails(s, includeG);
+    if (!emails.length) continue;
+    groups.push({ student: s.student || null, emails, data: s.data || {} });
   }
-  for (const g of parsedGuardianEmails.value) seen.add(g);
-  return seen.size;
+  return groups;
 });
+const bulkEmailStudentCount = computed(() => bulkEmailGroups.value.length);
+const guardianCountLabel = computed(() => {
+  if (bulkEmail.mode !== "reference" || !includeGuardians.value) return "";
+  const total = bulkEmail.students.reduce(
+    (n, s) => n + (s.guardian_emails || []).length,
+    0
+  );
+  return total ? `${total} guardian email(s) will be included` : "";
+});
+
+// Read-only preview of exactly who gets emailed — one line per student:
+// "Name: studentEmail, guardian1, guardian2".
+const recipientsPreview = computed(() => {
+  const includeG = bulkEmail.mode === "csv" ? true : includeGuardians.value;
+  return bulkEmail.students
+    .filter((s) => s.status !== "notfound")
+    .map((s) => {
+      const emails = studentGroupEmails(s, includeG);
+      return emails.length ? `${s.name}: ${emails.join(", ")}` : null;
+    })
+    .filter(Boolean)
+    .join("\n");
+});
+
+// Tokens ({{x}}) the composed subject/body uses, each flagged recognised or not —
+// recognised = a Student fieldname, a CSV column, or a resolved student's data key.
+const templateTokens = computed(() => {
+  const known = new Set();
+  studentMergeFields.value.forEach((f) => known.add(f.fieldname));
+  (bulkEmail.mergeFields || []).forEach((f) => known.add(f));
+  bulkEmail.students.forEach((s) =>
+    Object.keys(s.data || {}).forEach((k) => known.add(k))
+  );
+  const text = `${bulkEmail.subject || ""} ${bulkEmail.message || ""}`;
+  const seen = new Set();
+  const out = [];
+  // Local regex (matchAll) — no shared lastIndex mutation, so the computed stays
+  // side-effect-free.
+  for (const match of text.matchAll(/\{\{\s*([\w. ]+?)\s*\}\}/g)) {
+    const token = (match[1] || "").trim();
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    out.push({ token, recognised: known.has(token) });
+  }
+  return out;
+});
+const unknownTokens = computed(() =>
+  templateTokens.value.filter((t) => !t.recognised).map((t) => t.token)
+);
+
+function setBulkMode(mode) {
+  if (bulkEmail.mode === mode) return;
+  bulkEmail.mode = mode;
+  bulkEmail.tokens = [];
+  bulkEmail.students = [];
+  bulkEmail.mergeFields = [];
+  bulkEmail.csvImported = false;
+  bccSearchQuery.value = "";
+  bccResults.value = [];
+  bulkEmailWarning.value = "";
+  bulkEmailError.value = "";
+}
+
+function chipTitle(s) {
+  const parts = [s.email || "(no email on file)"];
+  if ((s.guardian_emails || []).length) {
+    parts.push(`guardians: ${s.guardian_emails.join(", ")}`);
+  }
+  return parts.join(" · ");
+}
 
 function focusCcInput() {
   ccInputRef.value?.focus();
@@ -1054,36 +1193,49 @@ function focusBccInput() {
   bccInputRef.value?.focus();
 }
 
-function selectBcc(r) {
-  const email = (r.email || "").toLowerCase().trim();
-  if (!email || bulkEmail.bcc.find((x) => x.email === email)) return;
-  bulkEmail.bcc.push({
-    email,
-    name: r.name || email,
-    label: r.name ? `${r.name}` : email,
-  });
+// Add a reference number / student name / email the agent typed or picked. The
+// backend resolve_bulk_email_students turns each token into a student (with
+// guardians + merge data) or a free email.
+function addStudentToken(token) {
+  const t = (token || "").trim();
+  if (!t) return;
+  if (bulkEmail.tokens.some((x) => x.toLowerCase() === t.toLowerCase())) return;
+  bulkEmail.tokens.push(t);
+  resolveStudents();
+}
+
+function selectStudent(r) {
+  addStudentToken(r.email || r.name || "");
   bccSearchQuery.value = "";
   bccResults.value = [];
   bccInputRef.value?.focus();
-  if (includeGuardians.value) refreshGuardianEmails();
 }
 
-function addBccFromInput() {
+function addStudentFromInput() {
   const val = bccSearchQuery.value.trim();
-  if (EMAIL_REGEX.test(val)) {
-    selectBcc({ email: val, name: val });
+  if (!val) return;
+  addStudentToken(val);
+  bccSearchQuery.value = "";
+  bccResults.value = [];
+}
+
+function removeStudent(key) {
+  const s = bulkEmail.students.find((x) => x.key === key);
+  if (bulkEmail.mode === "reference") {
+    if (s && s.token) {
+      bulkEmail.tokens = bulkEmail.tokens.filter(
+        (t) => t.toLowerCase() !== s.token.toLowerCase()
+      );
+    }
+    resolveStudents();
+  } else {
+    bulkEmail.students = bulkEmail.students.filter((x) => x.key !== key);
   }
 }
 
-function removeBcc(email) {
-  bulkEmail.bcc = bulkEmail.bcc.filter((b) => b.email !== email);
-  if (includeGuardians.value) refreshGuardianEmails();
-}
-
 function onBccBackspace() {
-  if (!bccSearchQuery.value && bulkEmail.bcc.length) {
-    bulkEmail.bcc.pop();
-    if (includeGuardians.value) refreshGuardianEmails();
+  if (!bccSearchQuery.value && bulkEmail.students.length) {
+    removeStudent(bulkEmail.students[bulkEmail.students.length - 1].key);
   }
 }
 
@@ -1107,126 +1259,145 @@ function onBccSearch() {
   }, 280);
 }
 
-async function onIncludeGuardiansChange() {
-  if (includeGuardians.value) {
-    await refreshGuardianEmails();
-  } else {
-    guardianEmails.value = "";
-  }
-}
-
-async function refreshGuardianEmails() {
-  const studentEmails = bulkEmail.bcc
-    .map((b) => (b.email || "").toLowerCase().trim())
-    .filter((e) => e && EMAIL_REGEX.test(e));
-  if (!studentEmails.length) {
-    guardianEmails.value = "";
+// Resolve the typed reference numbers / names / emails into students (with their
+// guardians + merge data) via the backend. Rebuilds bulkEmail.students from the
+// raw token list so add/remove stays in sync.
+async function resolveStudents() {
+  const tokens = bulkEmail.tokens.slice();
+  if (!tokens.length) {
+    bulkEmail.students = [];
+    bulkEmail.mergeFields = [];
+    bulkEmailWarning.value = "";
     return;
   }
-  guardiansLoading.value = true;
+  bulkResolving.value = true;
   try {
-    const response = await call(
-      "helpdesk.api.unity_helpdesk.get_student_guardian_emails",
-      { student_emails: JSON.stringify(studentEmails) }
+    const result = await call(
+      "helpdesk.api.unity_helpdesk.resolve_bulk_email_students",
+      { refs: JSON.stringify(tokens) }
     );
-    // Backend now returns { mapping, diagnostic }. Old shape was a bare
-    // { email: [guardians] } dict — keep a defensive fallback so the SPA
-    // still renders if it talks to an older backend during a deploy.
-    const mapping =
-      response && response.mapping ? response.mapping : response || {};
-    const diagnostic = (response && response.diagnostic) || null;
-
-    const seen = new Set();
-    for (const studentEmail of studentEmails) {
-      const guardians = mapping[studentEmail] || [];
-      for (const g of guardians) {
-        const email = (g || "").toLowerCase().trim();
-        if (email && EMAIL_REGEX.test(email)) seen.add(email);
-      }
-    }
-    guardianEmails.value = [...seen].join(", ");
-
-    // Surface a non-blocking warning when the lookup yielded nothing.
-    // Replaces the previous silent catch — the user used to think the
-    // checkbox was broken when actually their Student records simply
-    // didn't have student_email_id set on this site.
-    if (diagnostic) {
-      if (diagnostic.input_count > 0 && diagnostic.students_matched === 0) {
-        bulkEmailWarning.value =
-          "We couldn't match any of the selected recipients to a student " +
-          "record, so no guardian emails were added.";
-      } else if (
-        diagnostic.input_count > 0 &&
-        diagnostic.students_with_guardians === 0
-      ) {
-        bulkEmailWarning.value =
-          `Found ${diagnostic.students_matched} student(s), but none have a ` +
-          `guardian email on file.`;
-      } else if (
-        diagnostic.unmatched_emails &&
-        diagnostic.unmatched_emails.length
-      ) {
-        // Partial match — let the user know which addresses didn't resolve.
-        bulkEmailWarning.value =
-          `${diagnostic.unmatched_emails.length} of ${diagnostic.input_count} ` +
-          `recipient(s) didn't match a student record: ` +
-          diagnostic.unmatched_emails.slice(0, 5).join(", ") +
-          (diagnostic.unmatched_emails.length > 5 ? ", ..." : "");
+    const students = result?.students || [];
+    const out = [];
+    const seenStudents = new Set();
+    const seenFree = new Set();
+    for (const token of tokens) {
+      const t = token.toLowerCase();
+      const st = students.find(
+        (s) =>
+          String(s.student || "").toLowerCase() === t ||
+          String((s.data && s.data.reference_number) || "").toLowerCase() ===
+            t ||
+          String(s.email || "").toLowerCase() === t
+      );
+      if (st) {
+        if (seenStudents.has(st.student)) continue;
+        seenStudents.add(st.student);
+        out.push({
+          key: `s:${st.student}`,
+          token,
+          student: st.student,
+          name: st.student_name || st.student,
+          email: st.email || "",
+          guardian_emails: st.guardian_emails || [],
+          data: st.data || {},
+          status: st.has_email ? "student" : "noemail",
+        });
+      } else if (EMAIL_REGEX.test(token)) {
+        if (seenFree.has(t)) continue;
+        seenFree.add(t);
+        out.push({
+          key: `f:${t}`,
+          token,
+          student: null,
+          name: token,
+          email: t,
+          guardian_emails: [],
+          data: {},
+          status: "free",
+        });
       } else {
-        // Clear any stale warning from a previous attempt.
-        bulkEmailWarning.value = "";
+        out.push({
+          key: `n:${t}`,
+          token,
+          student: null,
+          name: token,
+          email: "",
+          guardian_emails: [],
+          data: {},
+          status: "notfound",
+        });
       }
     }
+    bulkEmail.students = out;
+    bulkEmail.mergeFields = result?.merge_fields || [];
+    const notFound = out
+      .filter((s) => s.status === "notfound")
+      .map((s) => s.token);
+    const noEmail = out
+      .filter((s) => s.status === "noemail")
+      .map((s) => s.name);
+    let warn = "";
+    if (notFound.length)
+      warn += `Couldn't find ${notFound.length} reference(s): ${notFound
+        .slice(0, 5)
+        .join(", ")}${notFound.length > 5 ? ", …" : ""}. `;
+    if (noEmail.length)
+      warn += `${noEmail.length} student(s) have no email on file${
+        includeGuardians.value ? " — guardians will still be emailed" : ""
+      }.`;
+    bulkEmailWarning.value = warn.trim();
   } catch (err) {
-    // Don't blank the textarea if a network/auth error hits — keep the
-    // last known guardian list, but surface a hint so the user isn't
-    // left wondering why the checkbox seemed to do nothing.
-    if (err instanceof AuthRedirectError || err?.code === "AUTH_REDIRECT") {
+    if (err instanceof AuthRedirectError || err?.code === "AUTH_REDIRECT")
       return;
-    }
-    bulkEmailWarning.value =
-      "Couldn't load guardian emails — keeping previous list. " +
-      (err?.message || "Retry by toggling the checkbox.");
+    bulkEmailError.value = err?.message || "Couldn't resolve students.";
   } finally {
-    guardiansLoading.value = false;
+    bulkResolving.value = false;
   }
 }
 
 function openBulkEmailModal() {
   resetBulkEmail();
   openBulkEmail.value = true;
+  loadStudentMergeFields();
+}
+
+// Fetch the full Student field list once (cached for the session) so the composer
+// can show all available {{fields}} and flag unknown template tokens.
+async function loadStudentMergeFields() {
+  if (studentMergeFields.value.length) return;
+  try {
+    const fields = await call(
+      "helpdesk.api.unity_helpdesk.get_student_merge_fields"
+    );
+    studentMergeFields.value = Array.isArray(fields) ? fields : [];
+  } catch {
+    studentMergeFields.value = [];
+  }
 }
 
 function resetBulkEmail() {
   bulkEmailSending.value = false;
   bulkEmailUploading.value = false;
+  bulkResolving.value = false;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  bulkEmailSuccess.value = "";
-  bulkEmail.recipients = defaultRecipientChips();
+  bulkEmail.mode = "reference";
   bulkEmail.subject = "";
   bulkEmail.ticket_type = "";
   bulkEmail.message = "";
   bulkEmail.cc = [];
-  bulkEmail.bcc = [];
+  bulkEmail.tokens = [];
+  bulkEmail.students = [];
   bulkEmail.attachments = [];
-  bulkEmail.mergeData = {};
   bulkEmail.mergeFields = [];
-  bulkEmail.schoolBcc = [];
   bulkEmail.csvImported = false;
   ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
   includeGuardians.value = false;
-  guardianEmails.value = "";
-  guardiansLoading.value = false;
 }
 
 function closeBulkEmail() {
-  if (bulkSuccessCloseTimer) {
-    clearTimeout(bulkSuccessCloseTimer);
-    bulkSuccessCloseTimer = null;
-  }
   openBulkEmail.value = false;
   resetBulkEmail();
 }
@@ -1251,40 +1422,49 @@ async function handleBulkEmailCsv(event) {
         "No students resolved from the CSV. Include an 'id' (student) column — the email, details and guardians are looked up from it.";
       return;
     }
-    const existing = new Set(bulkEmail.bcc.map((b) => b.email));
+    // Reconstruct one entry per student: the student row (name) + its guardian
+    // rows ("Name (guardian)"), linked by data._student. Each becomes one ticket.
+    const byStudent = {};
+    const order = [];
     for (const row of rows) {
+      const sid = (row.data && row.data._student) || "";
       const email = (row.email || "").toLowerCase().trim();
-      if (!email) continue;
-      // Keep each recipient's CSV row for {{merge}} rendering; student fields are
-      // resolved server-side at send time and merged under these.
-      bulkEmail.mergeData[email] = row.data || {};
-      if (!existing.has(email)) {
-        const label = row.name || email; // student / "Name (guardian)" display
-        bulkEmail.bcc.push({ email, name: label, label });
-        existing.add(email);
+      const key = sid ? `s:${sid}` : `f:${email}`;
+      if (!byStudent[key]) {
+        byStudent[key] = {
+          key,
+          token: "",
+          student: sid || null,
+          name: "",
+          email: "",
+          guardian_emails: [],
+          data: {},
+          status: sid ? "student" : "free",
+        };
+        order.push(key);
       }
+      const g = byStudent[key];
+      const isGuardian = /\(guardian\)\s*$/i.test(row.name || "");
+      if (isGuardian) {
+        if (email) g.guardian_emails.push(email);
+      } else {
+        g.email = email;
+        g.name = row.name || email;
+        const data = { ...(row.data || {}) };
+        delete data._student;
+        g.data = data;
+        if (!email) g.status = "noemail";
+      }
+      if (!g.name) g.name = row.name || email;
     }
-    // Merge fields = looked-up student fields + any extra CSV columns.
-    bulkEmail.mergeFields =
-      result.merge_fields ||
-      (result.headers || []).filter(
-        (h) => h.toLowerCase() !== (result.id_column || "id").toLowerCase()
-      );
-    // School-level BCC (email group + admin), derived from the CSV's school —
-    // sent once, un-personalized, on send. Guardians are already auto-added above.
-    bulkEmail.schoolBcc = result.school_bcc || [];
-    // Guardians come automatically from each student id, so the manual
-    // "Include guardian emails" controls are no longer relevant — hide them.
+    bulkEmail.students = order.map((k) => byStudent[k]);
+    bulkEmail.mergeFields = result.merge_fields || [];
     bulkEmail.csvImported = true;
-    includeGuardians.value = false;
-    guardianEmails.value = "";
     let note = `${result.student_count || 0} student${
       (result.student_count || 0) === 1 ? "" : "s"
     } loaded`;
     if (result.guardian_count)
       note += ` + ${result.guardian_count} guardian(s)`;
-    if (result.school_bcc && result.school_bcc.length)
-      note += ` · ${result.school_bcc.length} school BCC`;
     note += ".";
     if (result.unmatched_count) note += ` ${result.unmatched_count} not found.`;
     if (result.school_mismatch_count)
@@ -1293,6 +1473,8 @@ async function handleBulkEmailCsv(event) {
       note += ` ${result.no_email_count} without an email.`;
     if (result.duplicate_count)
       note += ` ${result.duplicate_count} duplicate(s) skipped.`;
+    if (result.truncated)
+      note += ` Only the first ${rows.length} recipients were kept — split the CSV to send the rest.`;
     bulkEmailWarning.value = note;
   } catch (err) {
     bulkEmailError.value = err.message || "CSV import failed.";
@@ -1331,17 +1513,13 @@ function removeBulkEmailAttachment(name) {
 async function sendBulkEmail() {
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  const recipients = bulkEmail.recipients.map((r) => r.email);
-  const bccSeen = new Set();
-  for (const b of bulkEmail.bcc) {
-    const email = (b.email || "").toLowerCase().trim();
-    if (email && EMAIL_REGEX.test(email)) bccSeen.add(email);
-  }
-  for (const g of parsedGuardianEmails.value) bccSeen.add(g);
-  const bccEmails = [...bccSeen];
-  if (!bccEmails.length) {
+  // One group per student (or free email): the student + their guardians.
+  const groups = bulkEmailGroups.value;
+  if (!groups.length) {
     bulkEmailError.value =
-      "Add at least one student in BCC (and optionally include guardians).";
+      bulkEmail.mode === "csv"
+        ? "Import a CSV with at least one student that has an email."
+        : "Add at least one student (reference number) or recipient before sending.";
     return;
   }
   if (!bulkEmail.subject.trim()) {
@@ -1362,25 +1540,20 @@ async function sendBulkEmail() {
     subject: bulkEmail.subject,
     message: bulkEmail.message,
     ticket_type: bulkEmail.ticket_type,
-    recipients: JSON.stringify(recipients),
+    groups: JSON.stringify(groups),
     cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
-    bcc: bccEmails.length ? JSON.stringify(bccEmails) : null,
     attachments: JSON.stringify(
       bulkEmail.attachments.map((attachment) => attachment.name)
     ),
-    merge_data: JSON.stringify(bulkEmail.mergeData || {}),
-    school_bcc: bulkEmail.schoolBcc.length
-      ? JSON.stringify(bulkEmail.schoolBcc)
-      : null,
   };
-  const recipientCount = bccEmails.length;
+  const studentCount = groups.length;
 
   // Non-blocking: close the composer immediately and report progress out-of-band so
-  // the UI never hangs on a slow send. The audit ticket appears in the list once the
-  // request finishes (it is committed early server-side).
+  // the UI never hangs on a slow send. The per-student tickets appear in the list
+  // as they are created (each is committed early server-side).
   closeBulkEmail();
   showGlobalNotice(
-    "📨 Bulk email is being sent — the new ticket will appear in your list shortly…",
+    "Sending email… your tickets will appear in the list shortly.",
     "info"
   );
   try {
@@ -1392,12 +1565,12 @@ async function sendBulkEmail() {
     if (result?.warning) {
       showGlobalNotice(result.warning, "error", 9000);
     } else {
-      const count = result?.sent || result?.count || recipientCount;
-      const noun = count === 1 ? "recipient" : "recipients";
+      const n = result?.ticket_count || result?.student_count || studentCount;
+      const noun = n === 1 ? "ticket" : "tickets";
       let message =
         result?.instant === false
-          ? `✅ Bulk email queued for ${count} ${noun} — it will send shortly.`
-          : `✅ Bulk email sent to ${count} ${noun}.`;
+          ? `Bulk email queued — ${n} ${noun} created, sending shortly.`
+          : `Bulk email sent — ${n} ${noun} created.`;
       if (result?.invalid_count) {
         message += ` ${result.invalid_count} invalid address(es) skipped.`;
       }

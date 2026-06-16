@@ -275,6 +275,9 @@ def _ticket_fields(extra=None):
 AVAILABLE_TICKET_COLUMNS = [
 	{"key": "name", "label": "Ticket ID", "default": True, "fixed": True, "width": 110},
 	{"key": "subject", "label": "Subject", "default": True, "fixed": True, "width": 280},
+	# Virtual column rendered by the SPA from subject + ticket_type + _assign +
+	# creation (all already fetched). `virtual` => never queried as a HD Ticket field.
+	{"key": "summary", "label": "Summary", "default": False, "fixed": False, "width": 360, "virtual": True},
 	{"key": "ticket_type", "label": "Ticket Type", "default": True, "fixed": False, "width": 150},
 	{"key": "priority", "label": "Priority", "default": True, "fixed": False, "width": 130},
 	{"key": "status", "label": "Status", "default": True, "fixed": False, "width": 140},
@@ -358,8 +361,11 @@ def _load_column_preferences():
 
 def _selected_column_fields():
 	# Returns the HD Ticket fieldnames a user's column choice depends on, so
-	# get_tickets() can fetch them. Virtual keys (none currently) are skipped.
-	return [pref["key"] for pref in _load_column_preferences()]
+	# get_tickets() can fetch them. Virtual keys (e.g. "summary") are composed by
+	# the SPA from already-fetched fields, so they're skipped here — passing them as
+	# fields would make frappe.get_list throw on an unknown column.
+	virtual = {c["key"] for c in AVAILABLE_TICKET_COLUMNS if c.get("virtual")}
+	return [pref["key"] for pref in _load_column_preferences() if pref["key"] not in virtual]
 
 
 def _assignee_from_assign(assign_value, ticket_name=None):
@@ -4628,6 +4634,184 @@ def get_student_guardian_emails(student_emails):
 			"unmatched_emails": unmatched_emails,
 		},
 	}
+
+
+@frappe.whitelist()
+def resolve_bulk_email_students(refs):
+	"""Resolve reference numbers / student ids / emails to per-student bulk-email
+	groups for the composer's "reference number" mode.
+
+	For each input matching a Student (by name, reference_number, student_email_id
+	or user) returns the student's deliverable email, that student's guardian
+	emails, and a merge ``data`` dict (common Student fields). The composer builds
+	one ticket + one email per student (student + guardians when the
+	Include-guardians toggle is on). Unresolvable inputs come back in ``unmatched``;
+	matched students with no email in ``no_email``.
+	"""
+	capabilities = _require_unity_access()
+	if not capabilities.get("can_view_all_tickets"):
+		frappe.throw(_("You are not allowed to send bulk emails"), frappe.PermissionError)
+
+	empty = {"students": [], "merge_fields": [], "unmatched": [], "no_email": []}
+	if not frappe.db.exists("DocType", "Student"):
+		return empty
+
+	raw = _parse_json(refs, []) or []
+	if isinstance(raw, str):
+		raw = [raw]
+	if not isinstance(raw, (list, tuple)):
+		return empty
+
+	tokens = []
+	seen_tokens = set()
+	for value in raw:
+		token = cstr(value or "").strip()
+		if token and token.lower() not in seen_tokens:
+			seen_tokens.add(token.lower())
+			tokens.append(token)
+	if not tokens:
+		return empty
+
+	lowered = [t.lower() for t in tokens]
+	meta = frappe.get_meta("Student")
+	has_ref = meta.has_field("reference_number")
+	has_email_id = meta.has_field("student_email_id")
+	has_user = meta.has_field("user")
+
+	fetch_fields = ["name", "student_name", "first_name", "middle_name", "last_name"]
+	for field in ("student_email_id", "user", "reference_number", "school"):
+		if meta.has_field(field):
+			fetch_fields.append(field)
+	fetch_fields = list(dict.fromkeys(fetch_fields))
+
+	or_filters = {"name": ["in", tokens]}
+	if has_ref:
+		or_filters["reference_number"] = ["in", tokens]
+	if has_email_id:
+		or_filters["student_email_id"] = ["in", lowered]
+	if has_user:
+		or_filters["user"] = ["in", lowered]
+
+	try:
+		rows = frappe.get_all(
+			"Student",
+			fields=fetch_fields,
+			or_filters=or_filters,
+			page_length=len(tokens) * 4 + 10,
+		)
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "unity_helpdesk.resolve_bulk_email_students")
+		return empty
+
+	by_name, by_ref, by_email = {}, {}, {}
+	for row in rows:
+		by_name[cstr(row.get("name")).strip().lower()] = row
+		ref = cstr(row.get("reference_number") or "").strip().lower()
+		if ref:
+			by_ref.setdefault(ref, row)
+		for field in ("student_email_id", "user"):
+			value = cstr(row.get(field) or "").strip().lower()
+			if value:
+				by_email.setdefault(value, row)
+
+	resolved = {}
+	order = []
+	unmatched = []
+	for token in tokens:
+		key = token.lower()
+		row = by_name.get(key) or by_ref.get(key) or by_email.get(key)
+		if not row:
+			unmatched.append(token)
+			continue
+		sid = cstr(row.get("name")).strip()
+		if sid and sid not in resolved:
+			resolved[sid] = row
+			order.append(sid)
+
+	guardians_by_student = _guardian_emails_for_student_ids(list(resolved.keys()))
+
+	students = []
+	no_email = []
+	for sid in order:
+		row = resolved[sid]
+		email = cstr(row.get("student_email_id") or row.get("user") or "").strip().lower()
+		data = {
+			"first_name": cstr(row.get("first_name") or ""),
+			"middle_name": cstr(row.get("middle_name") or ""),
+			"last_name": cstr(row.get("last_name") or ""),
+			"student_name": cstr(row.get("student_name") or ""),
+		}
+		if has_ref:
+			data["reference_number"] = cstr(row.get("reference_number") or "")
+		if meta.has_field("school"):
+			data["school"] = cstr(row.get("school") or "")
+		students.append(
+			{
+				"student": sid,
+				"student_name": _student_display_name(row) or sid,
+				"email": email,
+				"has_email": bool(email),
+				"guardian_emails": guardians_by_student.get(sid, []),
+				"data": data,
+			}
+		)
+		if not email:
+			no_email.append(sid)
+
+	common = [
+		field
+		for field in ("first_name", "last_name", "middle_name", "student_name", "school")
+		if meta.has_field(field)
+	]
+	if has_ref:
+		common.append("reference_number")
+	return {
+		"students": students,
+		"merge_fields": common,
+		"unmatched": unmatched,
+		"no_email": no_email,
+	}
+
+
+@frappe.whitelist()
+def get_student_merge_fields():
+	"""All Student doctype fields usable as {{merge}} placeholders in the bulk /
+	single email composer. Returns [{fieldname, label}] for value-bearing fields
+	(layout fieldtypes excluded). [] when the Student doctype isn't installed.
+
+	The send path already fills ANY field by its exact fieldname (it fetches
+	`fields=["*"]`), so this just lets the composer SHOW the full, accurate list and
+	flag template tokens that won't resolve.
+	"""
+	capabilities = _require_unity_access()
+	if not capabilities.get("can_view_all_tickets"):
+		frappe.throw(_("You are not allowed to send bulk emails"), frappe.PermissionError)
+	if not frappe.db.exists("DocType", "Student"):
+		return []
+	skip_types = {
+		"Section Break",
+		"Column Break",
+		"Tab Break",
+		"HTML",
+		"Table",
+		"Table MultiSelect",
+		"Button",
+		"Image",
+		"Fold",
+		"Heading",
+		"Geolocation",
+	}
+	out = []
+	seen = set()
+	for df in frappe.get_meta("Student").fields:
+		fieldname = cstr(df.fieldname or "").strip()
+		if not fieldname or df.fieldtype in skip_types or fieldname in seen:
+			continue
+		seen.add(fieldname)
+		out.append(
+			{"fieldname": fieldname, "label": cstr(df.label or fieldname).strip() or fieldname}
+		)
+	return out
 
 
 @frappe.whitelist()

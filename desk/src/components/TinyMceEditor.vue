@@ -8,16 +8,13 @@
       @on-init="handleInit"
       @blur="$emit('blur')"
     />
-    <TemplatePicker
-      v-if="pickerOpen"
+    <UnifiedTemplatePicker
+      v-if="templatePickerOpen"
       :ticket-name="ticketName"
-      @close="pickerOpen = false"
-      @select="onTemplateSelected"
-    />
-    <EmailTemplatePicker
-      v-if="emailTemplatePickerOpen"
-      @close="emailTemplatePickerOpen = false"
-      @select="onEmailTemplateSelected"
+      :enable-email-template="enableEmailTemplate"
+      @close="templatePickerOpen = false"
+      @select-static="onTemplateSelected"
+      @select-email="onEmailTemplateSelected"
     />
   </div>
 </template>
@@ -37,8 +34,7 @@ import "tinymce/plugins/table";
 import "tinymce/themes/silver";
 import "tinymce/skins/ui/oxide/skin.min.css";
 import "tinymce/skins/content/default/content.min.css";
-import TemplatePicker from "./TemplatePicker.vue";
-import EmailTemplatePicker from "./EmailTemplatePicker.vue";
+import UnifiedTemplatePicker from "./UnifiedTemplatePicker.vue";
 
 interface Props {
   modelValue: string;
@@ -47,11 +43,13 @@ interface Props {
   minHeight?: number;
   ticketName?: string | null;
   enableEmailTemplate?: boolean;
+  enableAttach?: boolean;
 }
 
 interface Emits {
   (event: "update:modelValue", value: string): void;
   (event: "blur"): void;
+  (event: "attach"): void;
   (event: "template-subject", value: string): void;
   (
     event: "email-template-selected",
@@ -65,13 +63,13 @@ const props = withDefaults(defineProps<Props>(), {
   minHeight: 240,
   ticketName: null,
   enableEmailTemplate: false,
+  enableAttach: false,
 });
 
 const emit = defineEmits<Emits>();
 const content = ref(props.modelValue || "");
 const editorInstance = ref<any>(null);
-const pickerOpen = ref(false);
-const emailTemplatePickerOpen = ref(false);
+const templatePickerOpen = ref(false);
 const apiKey = "no-api-key";
 
 const editorConfig = computed(() => ({
@@ -84,10 +82,14 @@ const editorConfig = computed(() => ({
   skin: false,
   content_css: false,
   statusbar: false,
+  // Keep the toolbar docked inside the editor — `toolbar_sticky` (TinyMCE default)
+  // detaches it and floats it over the page when the editor sits in a scrolling
+  // modal (the bulk-email composer), so it's explicitly disabled.
+  toolbar_sticky: false,
   toolbar:
     "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code |" +
-    (props.enableEmailTemplate ? " emailtemplate" : "") +
-    " templates",
+    " templates" +
+    (props.enableAttach ? " attach" : ""),
   placeholder: props.placeholder,
   content_style: `
     body {
@@ -107,19 +109,22 @@ const editorConfig = computed(() => ({
   `,
   setup: (editor: any) => {
     editor.ui.registry.addButton("templates", {
-      text: "Static Templates",
-      tooltip: "Insert saved reply template (static text)",
+      text: "Templates",
+      tooltip: "Insert an email or static template",
       onAction: () => {
-        pickerOpen.value = true;
+        templatePickerOpen.value = true;
       },
     });
-    editor.ui.registry.addButton("emailtemplate", {
-      text: "Email Template",
-      tooltip: "Load a Frappe Email Template (subject + body)",
-      onAction: () => {
-        emailTemplatePickerOpen.value = true;
-      },
-    });
+    if (props.enableAttach) {
+      editor.ui.registry.addButton("attach", {
+        icon: "upload",
+        text: "Attach",
+        tooltip: "Attach files",
+        onAction: () => {
+          emit("attach");
+        },
+      });
+    }
   },
 }));
 
@@ -144,6 +149,13 @@ watch(content, (value) => {
 
 function handleInit(_event: unknown, editor: any) {
   editorInstance.value = editor;
+  // Re-apply current content so a re-initialization (e.g. the toolbar config
+  // changing when `enableEmailTemplate` flips on a tab switch) never leaves the
+  // editor visually blank while the model still holds text.
+  const value = content.value || "";
+  if (value && editor.getContent() !== value) {
+    editor.setContent(value);
+  }
 }
 
 function setContent(value = "") {
@@ -179,7 +191,7 @@ function onTemplateSelected(rendered: Rendered) {
   if (rendered.warnings && rendered.warnings.length) {
     console.warn("[template-picker] warnings:", rendered.warnings);
   }
-  pickerOpen.value = false;
+  templatePickerOpen.value = false;
 }
 
 // Email Template is the PRIMARY source: replace the whole body (not insert) and
@@ -190,7 +202,7 @@ function onEmailTemplateSelected(payload: { subject: string; body: string }) {
     setContent(payload.body);
   }
   emit("email-template-selected", payload);
-  emailTemplatePickerOpen.value = false;
+  templatePickerOpen.value = false;
 }
 
 function focus() {
