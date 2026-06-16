@@ -96,8 +96,10 @@
 
         <section
           v-if="
-            !ticket.custom_is_bulk_email &&
-            (shouldRenderStructuredStudentContext || showLegacyStudentSection)
+            structuredStudents.length > 0 ||
+            (!ticket.custom_is_bulk_email &&
+              (shouldRenderStructuredStudentContext ||
+                showLegacyStudentSection))
           "
           class="detail-section"
         >
@@ -512,35 +514,28 @@
           </div>
           <div class="detail-body stack">
             <p v-if="actionError" class="error">{{ actionError }}</p>
-            <div class="editor-toolbar editor-toolbar-tinymce">
-              <button
-                type="button"
-                class="btn secondary"
-                :disabled="uploadingAttachment"
-                @click="triggerAttachmentPicker"
-              >
-                {{ uploadingAttachment ? "Uploading..." : "Attach Files" }}
-              </button>
-              <input
-                ref="attachmentInput"
-                type="file"
-                class="hidden-file-input"
-                multiple
-                @change="handleAttachmentPick"
-              />
-            </div>
             <TinyMceEditor
               ref="editorRef"
               v-model="composerHtml"
               :min-height="260"
               :ticket-name="props.ticketId"
               :enable-email-template="composeMode === 'reply'"
+              :enable-attach="true"
               :placeholder="
                 composeMode === 'reply'
                   ? 'Type your reply to the customer...'
                   : 'Add an internal note (not sent to customer)...'
               "
+              @attach="triggerAttachmentPicker"
             />
+            <input
+              ref="attachmentInput"
+              type="file"
+              class="hidden-file-input"
+              multiple
+              @change="handleAttachmentPick"
+            />
+            <span v-if="uploadingAttachment" class="muted">Uploading…</span>
             <div v-if="composerAttachments.length" class="attachment-list">
               <div
                 v-for="attachment in composerAttachments"
@@ -766,7 +761,27 @@ const error = ref(""); // page-load errors only
 const notice = ref("");
 const actionError = ref(""); // reply / comment / save errors
 const composeMode = ref("reply"); // 'reply' | 'comment'
-const composerHtml = ref("");
+// Separate drafts per mode so switching Reply <-> Internal Note never loses text.
+// Persisted to sessionStorage (per ticket + mode) so they also survive a reload,
+// and cleared only on a successful send.
+const composerDrafts = reactive({ reply: "", comment: "" });
+function draftKey(mode) {
+  return `unity:draft:${props.ticketId || "new"}:${mode}`;
+}
+const composerHtml = computed({
+  get: () => composerDrafts[composeMode.value] || "",
+  set: (val) => {
+    const value = val || "";
+    composerDrafts[composeMode.value] = value;
+    try {
+      const k = draftKey(composeMode.value);
+      if (value.trim()) sessionStorage.setItem(k, value);
+      else sessionStorage.removeItem(k);
+    } catch {
+      /* sessionStorage unavailable — in-memory draft still works */
+    }
+  },
+});
 const composerAttachments = ref([]);
 const editorRef = ref(null);
 const attachmentInput = ref(null);
@@ -816,11 +831,11 @@ const timeline = computed(() => {
     }));
     items = [...comms, ...notes];
   }
-  // Drop the auto-generated intake message when all it carries is the
-  // student / sibling / fee / previous-ticket template that's already shown in
-  // the dedicated sections above (see isRedundantPrimaryMessage).
+  // Hide the auto-generated "STUDENT DETAILS" intake (already shown in the side
+  // panel). Everything else — the customer's email, every agent reply, internal
+  // notes — renders in chronological order.
   return items
-    .filter((item) => !isRedundantPrimaryMessage(item))
+    .filter((item) => !isStudentDetailsIntake(item))
     .sort((a, b) => new Date(a.creation) - new Date(b.creation));
 });
 const filteredPreviousTickets = computed(() =>
@@ -968,6 +983,7 @@ watch(
     comments.value = [];
     previousTicketRows.value = [];
     repliedToSummary.value = "";
+    restoreDrafts();
     await Promise.all([loadTicket(), loadLookups()]);
   },
   { immediate: true }
@@ -1296,8 +1312,19 @@ function composerCommentHtml() {
 
 async function resetComposer() {
   composerAttachments.value = [];
-  composerHtml.value = "";
+  composerHtml.value = ""; // clears the active mode's draft + its sessionStorage
   editorRef.value?.clear?.();
+}
+
+// Load any cached drafts for this ticket (survives reload/navigation).
+function restoreDrafts() {
+  try {
+    composerDrafts.reply = sessionStorage.getItem(draftKey("reply")) || "";
+    composerDrafts.comment = sessionStorage.getItem(draftKey("comment")) || "";
+  } catch {
+    composerDrafts.reply = "";
+    composerDrafts.comment = "";
+  }
 }
 
 function findNextTableIndex(nodes, start) {
@@ -1370,64 +1397,32 @@ function normalizeTicketLinksInHtml(value) {
   return container.innerHTML;
 }
 
+// Render the full body of every (kept) thread message verbatim. The student /
+// fee blocks live in the dedicated side panel; the thread shows complete mail
+// bodies so no agent reply, customer email or note is ever blanked.
 function threadContent(item) {
-  if (item?._type !== "comm") {
-    return normalizeTicketLinksInHtml(item?.content || "");
-  }
-
-  const raw = item.content || "";
-  const normalizedRaw = normalizeHtml(raw);
-  const isPrimary =
-    !!normalizedRaw &&
-    normalizedRaw === normalizeHtml(ticket.value?.description || "");
-
-  // ONLY the primary (first) message has its embedded student / fee / previous-
-  // ticket blocks lifted into the dedicated sections above. Every other message
-  // — agent replies and inbound customer emails — renders verbatim, so a real
-  // message can never be blanked out by the structured-block extractor. This is
-  // the guard against "missing customer content / agent reply" in the thread.
-  if (isPrimary) {
-    const parsed = parsedDescription.value || {};
-    const remaining = (parsed.remainingHtml || "").trim();
-    const hasStructuredBlocks =
-      (parsed.students && parsed.students.length) ||
-      (parsed.fees && parsed.fees.length) ||
-      parsed.previousTicketsHtml;
-    if (hasStructuredBlocks && hasMeaningfulHtml(remaining)) {
-      return normalizeTicketLinksInHtml(remaining);
-    }
-    if (hasStructuredBlocks) {
-      // Pure intake template — the blocks are shown in the sections above and
-      // this message is dropped from the timeline by isRedundantPrimaryMessage.
-      // Return empty as a defensive guard so no "shown above" note ever renders.
-      return "";
-    }
-    // No structured blocks parsed — fall back to the real content, never blank.
-    return normalizeTicketLinksInHtml(remaining || raw);
-  }
-
-  return normalizeTicketLinksInHtml(raw);
+  return normalizeTicketLinksInHtml(item?.content || "");
 }
 
-// True only for the auto-generated intake message (equals ticket.description)
-// whose student / sibling / fee / previous-ticket blocks are already surfaced in
-// the dedicated sections above AND which has no human-written text left once
-// those blocks are lifted out. Such a message is pure duplication, so the
-// timeline drops it entirely rather than showing an empty bubble or a redundant
-// "details shown above" note. A primary message carrying real text is kept.
-function isRedundantPrimaryMessage(item) {
+// The edu_quality auto-intake is created as a "Student Information" communication
+// carrying the STUDENT DETAILS / fee / previous-ticket template (already shown in
+// the side panel). Hide it from the thread. A customer message (Received) and any
+// genuine agent reply / bulk message are always kept. Subject is the reliable
+// signal (hardcoded by CustomHDTicket.fetch_ticket_details); a content/description
+// fallback covers older intakes that lack the subject.
+function isStudentDetailsIntake(item) {
   if (item?._type !== "comm") return false;
-  const normalizedRaw = normalizeHtml(item.content || "");
-  if (!normalizedRaw) return false;
-  if (normalizedRaw !== normalizeHtml(ticket.value?.description || "")) {
-    return false;
+  if ((item.subject || "").trim().toLowerCase() === "student information") {
+    return true;
   }
-  const parsed = parsedDescription.value || {};
-  const hasStructuredBlocks =
-    (parsed.students && parsed.students.length) ||
-    (parsed.fees && parsed.fees.length) ||
-    parsed.previousTicketsHtml;
-  return hasStructuredBlocks && !hasMeaningfulHtml(parsed.remainingHtml || "");
+  if (item.sent_or_received === "Received") return false;
+  const raw = item.content || "";
+  if (!/STUDENT DETAILS/i.test(raw)) return false;
+  const normalizedRaw = normalizeHtml(raw);
+  return (
+    !!normalizedRaw &&
+    normalizedRaw === normalizeHtml(ticket.value?.description || "")
+  );
 }
 
 function applyForm() {
@@ -1798,8 +1793,9 @@ watch(
 watch(
   () => composeMode.value,
   () => {
+    // Switching tabs keeps each mode's own draft (see composerDrafts) — only
+    // clear the transient error.
     actionError.value = "";
-    resetComposer();
   }
 );
 </script>

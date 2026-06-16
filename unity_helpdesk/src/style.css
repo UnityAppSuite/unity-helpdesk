@@ -340,7 +340,60 @@ nav a.router-link-active {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
 }
+/* A {{token}} used in the composed email that maps to no known field. */
+.merge-field-chip-bad {
+  background: #fef2f2;
+  color: #b91c1c;
+  text-decoration: line-through;
+}
+.bulk-token-warn {
+  font-size: 11px;
+  color: #b45309;
+  width: 100%;
+}
+/* Read-only preview of the per-student recipient list in the bulk composer. */
+.recipients-preview {
+  width: 100%;
+  max-height: 120px;
+  overflow-y: auto;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #475569;
+  background: #f8fafc;
+}
 .recipient-chip--locked { background: #e0e7ff; border-color: #a5b4fc; }
+/* A recipient that didn't resolve to a student, or has no email on file. */
+.recipient-chip-warn { background: #fef3c7; border-color: #fcd34d; color: #92400e; }
+/* Reference-number vs CSV input mode toggle in the bulk-email composer. */
+.bulk-mode-toggle {
+  display: flex;
+  gap: 6px;
+}
+.bulk-mode-btn {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f8fafc;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.bulk-mode-btn.active {
+  background: #4f46e5;
+  border-color: #4f46e5;
+  color: #fff;
+}
+/* Read-only student chips shown after a CSV import. */
+.bulk-email-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
 .bulk-email-guardian-toggle {
   display: flex;
   align-items: center;
@@ -3396,4 +3449,180 @@ body.col-resizing .ticket-table * {
 .global-notice-fade-leave-to {
   opacity: 0;
   transform: translateX(-50%) translateY(-8px);
+}
+
+/* ============================================================
+   Summary column + mobile ticket cards + collapsible filters
+   ============================================================ */
+
+/* Summary column cell (desktop table) */
+.summary-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  white-space: normal;
+}
+.summary-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.summary-subject {
+  font-weight: 600;
+  color: #111827;
+}
+.summary-type {
+  flex-shrink: 0;
+}
+.summary-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+/* Filter group: on desktop it's transparent (children flow inline in .toolbar
+   exactly as before); the toggle and mobile collapse only apply ≤640px. */
+.filter-group {
+  display: contents;
+}
+/* Search/Refresh/Columns (+ the mobile-only Filters toggle) grouped as a row. */
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.filters-toggle {
+  display: none;
+}
+.filters-toggle-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent, #4f46e5);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* Mobile summary cards — hidden on desktop, shown ≤640px (table hidden then). */
+.ticket-cards {
+  display: none;
+}
+.ticket-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  background: #fff;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.ticket-card.row-selected {
+  border-color: var(--accent, #4f46e5);
+  box-shadow: 0 0 0 1px var(--accent, #4f46e5);
+}
+.ticket-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ticket-card-id {
+  font-weight: 700;
+  color: var(--accent, #4f46e5);
+  font-size: 13px;
+}
+.ticket-card-top .badge {
+  margin-left: auto;
+}
+.ticket-card-subject {
+  font-weight: 600;
+  color: #111827;
+  line-height: 1.35;
+}
+.ticket-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  /* Metric cards: one compact row (overrides the ≤980px single-column rule). */
+  .metrics {
+    grid-template-columns: repeat(5, 1fr);
+    gap: 6px;
+    margin-bottom: 12px;
+  }
+  .metric {
+    padding: 8px 6px;
+    border-left-width: 3px;
+  }
+  .metric b {
+    font-size: 16px;
+  }
+  .metric span {
+    font-size: 9px;
+  }
+
+  /* Stack the toolbar; order: search → action row (Filters/Search/Refresh/Columns)
+     → the collapsible filter panel. */
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .toolbar .search-wrapper {
+    order: 1;
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+    margin-left: 0;
+  }
+  .toolbar-actions {
+    order: 2;
+  }
+  .filter-group {
+    order: 3;
+  }
+  /* Collapsible filters: hidden behind the toggle until opened. */
+  .filters-toggle {
+    display: inline-flex;
+    align-items: center;
+  }
+  .filter-group {
+    display: none;
+    width: 100%;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .filter-group.open {
+    display: flex;
+  }
+  .filter-group select,
+  .filter-group .date-range-trigger,
+  .filter-group .date-range-btn {
+    width: 100%;
+  }
+
+  /* Swap the wide table for stacked summary cards. */
+  .ticket-table {
+    display: none;
+  }
+  .ticket-cards {
+    display: block;
+  }
+  .scroll-x {
+    overflow-x: visible;
+  }
 }
