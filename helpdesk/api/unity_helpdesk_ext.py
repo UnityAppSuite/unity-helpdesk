@@ -185,6 +185,13 @@ def create_ticket(
     if not message:
         frappe.throw(_("Please enter email message"))
 
+    # Personalize template placeholders ({{first_name}} etc.) from the customer's
+    # student record. Plain (non-template) text is returned unchanged; an external
+    # or guardian-only address yields blank fields and never drops the send.
+    _merge_ctx = _merge_context_for_email(raised_by)
+    subject = _safe_render(subject, _merge_ctx) or subject
+    message = _safe_render(message, _merge_ctx)
+
     payload = {
         "doctype": TICKET_DOCTYPE,
         "subject": subject,
@@ -396,6 +403,9 @@ def reply(name, message, cc=None, bcc=None, attachments=None):
     if not message:
         frappe.throw(_("Please enter a reply"))
     ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+    # Personalize template placeholders ({{first_name}} etc.) from the ticket's
+    # customer (raised_by) student record. Plain text is returned unchanged.
+    message = _safe_render(message, _merge_context_for_email(ticket.get("raised_by")))
     try:
         ticket.reply_via_agent(
             message=message,
@@ -652,15 +662,117 @@ def _school_bcc_emails(school):
     return sorted(emails)
 
 
+def _student_primary_email(student):
+    """The student's own deliverable email (student_email_id, else login user)."""
+    if not student:
+        return ""
+    return cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
+
+
+def _merge_context_for_email(email):
+    """Best-effort merge context (Student field dict) for ONE recipient email — used
+    to personalize {{first_name}} etc. on single-ticket / reply sends. Matches
+    Student.student_email_id / user. Returns {} for a guardian-only or external
+    address, so unknown placeholders simply render blank (the "render blank, still
+    send" rule)."""
+    email = cstr(email or "").strip().lower()
+    if not email:
+        return {}
+    return _students_by_email([email]).get(email, {}) or {}
+
+
+def _normalize_bulk_email_groups(groups, recipients=None, bcc=None, merge_data=None):
+    """Normalize per-student send groups for bulk_send_email.
+
+    Primary input `groups` is a JSON list of
+        {"student": "<id|null>", "emails": [...], "data": {<merge row>}}
+    — each becomes ONE ticket + ONE email to its (validated, globally-deduped) emails
+    (the student + that student's guardians, or a single free-typed address).
+
+    Legacy flat inputs (`recipients`/`bcc` email lists + an optional
+    `merge_data` {email: {col,.., _student}} map) are converted to one group per
+    email so older callers keep working under the per-student model.
+
+    Returns (normalized_groups, invalid_count, total_recipients). Dedupe is
+    PER-GROUP (within one student), NOT global — siblings who share a guardian
+    each get their own personalized ticket that mails that guardian.
+    """
+    out = []
+    invalid_count = 0
+    total = 0
+
+    def _clean(values):
+        nonlocal invalid_count
+        cleaned = []
+        local_seen = set()
+        for v in (values or []):
+            email = cstr((v.get("email") if isinstance(v, dict) else v) or "").strip().lower()
+            if not email or email in local_seen:
+                continue
+            local_seen.add(email)
+            if not validate_email_address(email, throw=False):
+                invalid_count += 1
+                continue
+            cleaned.append(email)
+        return cleaned
+
+    parsed_groups = _parse_json(groups, []) or []
+    if isinstance(parsed_groups, list):
+        for g in parsed_groups:
+            if not isinstance(g, dict):
+                continue
+            emails = _clean(g.get("emails"))
+            if not emails:
+                continue
+            data = g.get("data") if isinstance(g.get("data"), dict) else {}
+            out.append(
+                {
+                    "student": cstr(g.get("student") or "").strip() or None,
+                    "emails": emails,
+                    "data": {cstr(k).strip(): data[k] for k in data if cstr(k).strip() != "_student"},
+                }
+            )
+            total += len(emails)
+
+    # Backward-compat: flat recipient/bcc lists -> one group per email.
+    if not out and (recipients or bcc):
+        merge_map = {}
+        raw_merge = _parse_json(merge_data, {}) or {}
+        if isinstance(raw_merge, dict):
+            for key, row in raw_merge.items():
+                ek = cstr(key or "").strip().lower()
+                if ek and isinstance(row, dict):
+                    merge_map[ek] = {cstr(c).strip(): row[c] for c in row}
+        for src in (recipients, bcc):
+            for item in (_parse_json(src, []) or []):
+                emails = _clean([item])
+                if not emails:
+                    continue
+                row = merge_map.get(emails[0]) or {}
+                out.append(
+                    {
+                        "student": cstr(row.get("_student") or "").strip() or None,
+                        "emails": emails,
+                        "data": {k: v for k, v in row.items() if k != "_student"},
+                    }
+                )
+                total += 1
+
+    return out, invalid_count, total
+
+
 @frappe.whitelist()
 def bulk_send_email(
     subject,
     message,
-    recipients,
+    groups=None,
     cc=None,
-    bcc=None,
-    attachments=None,
     ticket_type=None,
+    attachments=None,
+    # Legacy flat-recipient params (deprecated) — converted to per-email groups
+    # by _normalize_bulk_email_groups so older callers keep working.
+    recipients=None,
+    bcc=None,
     merge_data=None,
     school_bcc=None,
 ):
@@ -698,47 +810,26 @@ def bulk_send_email(
             frappe.OutgoingEmailError,
         )
 
-    parsed = _parse_json(recipients, [])
-    raw_emails = []
-    for item in parsed or []:
-        if isinstance(item, str):
-            raw_emails.append(item)
-        elif isinstance(item, dict):
-            raw_emails.append(item.get("email"))
-    valid_emails = []
-    invalid_count = 0
-    seen = set()
-    for value in raw_emails:
-        email = cstr(value or "").strip().lower()
-        if not email or email in seen:
-            continue
-        if not validate_email_address(email, throw=False):
-            invalid_count += 1
-            continue
-        seen.add(email)
-        valid_emails.append(email)
-
+    # One optional, VISIBLE CC list applied to every per-student mail.
     cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
-    bcc_list, invalid_bcc_count = _split_email_list_with_counts(bcc)
 
-    # The default recipient (the "recipients" field, mirrored from HD Settings) is
-    # OPTIONAL — it is not mandatory to configure one. As long as there is at least
-    # one BCC student the email can be sent; when no default is configured the mail
-    # is sent from the sender's own account instead (see _bulk_send_email_job).
-    if not valid_emails and not bcc_list:
+    # Per-student (and per-free-email) groups: one ticket + one email each.
+    normalized_groups, invalid_count, total_recipients = _normalize_bulk_email_groups(
+        groups, recipients=recipients, bcc=bcc, merge_data=merge_data
+    )
+    if not normalized_groups:
         frappe.throw(_("Add at least one recipient (student) before sending"))
 
-    if len(valid_emails) > RECIPIENT_HARD_CAP or len(bcc_list) > RECIPIENT_HARD_CAP:
+    # Hard caps bound the total send volume; over the limit we throw (rather than
+    # silently send a partial batch) so the user knowingly splits it.
+    if total_recipients > RECIPIENT_HARD_CAP:
         frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
-
-    if len(valid_emails) + len(cc_list) + len(bcc_list) > TOTAL_ADDRESS_HARD_CAP:
+    if total_recipients + len(cc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
-            _("Total addresses (recipients + cc + bcc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
+            _("Total addresses (recipients + cc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
         )
 
-    # Resolve attachment File names cheaply in-request (single IN(...) query),
-    # then hand all the heavy work (audit ticket insert + Communication + the
-    # actual send) to a background job so this request returns immediately.
+    # Resolve attachment File names cheaply in-request (single IN(...) query).
     attachment_list = [n for n in (_parse_json(attachments, []) or []) if n]
     if attachment_list:
         existing_files = set(
@@ -752,292 +843,162 @@ def bulk_send_email(
     else:
         file_names = []
 
-    # Per-recipient mail-merge context: a JSON map {email_lower: {col: val, ...}}
-    # from the imported CSV. Optional — absent for a plain (non-personalized) blast.
-    merge_map = {}
-    raw_merge = _parse_json(merge_data, {}) or {}
-    if isinstance(raw_merge, dict):
-        for key, row in raw_merge.items():
-            email_key = cstr(key or "").strip().lower()
-            if email_key and isinstance(row, dict):
-                merge_map[email_key] = {cstr(col).strip(): row[col] for col in row}
-
-    # School-level BCC (one un-personalized copy) computed from the CSV's school.
-    school_bcc_list, _invalid_school_bcc = _split_email_list_with_counts(school_bcc)
-
     # Run IN-REQUEST (no background worker) — exactly like a single-ticket / chat
-    # reply (reply_via_agent). The audit ticket AND the Email Queue entries are
-    # created before this returns, so the ticket is immediately in the list view
-    # and every email is listed in the Email Queue. We respect the SAME HD Settings
-    # "instantly_send_email" flag the replies use: ON -> send now; OFF -> just queue
-    # (still listed in the Email Queue, flushed like any other mail).
+    # reply (reply_via_agent). Every per-student ticket + Email Queue entry is
+    # created before this returns. We respect the SAME HD Settings
+    # "instantly_send_email" flag the replies use: ON -> send now; OFF -> just queue.
     instant = bool(int(frappe.db.get_single_value("HD Settings", "instantly_send_email") or 0))
     result = _bulk_send_email_job(
         subject=subject,
         message=message,
-        recipients=valid_emails,
+        groups=normalized_groups,
         cc_list=cc_list,
-        bcc_list=bcc_list,
         sender=frappe.session.user,
         file_names=file_names,
         ticket_type=ticket_type,
-        merge_data=merge_map,
-        school_bcc_list=school_bcc_list,
         now=instant,
     ) or {}
 
-    # "count" is the real audience the email reached: default recipients (TO) plus
-    # every student/guardian (BCC).
+    tickets = result.get("tickets") or []
     return {
         "ok": True,
         "instant": instant,
+        "tickets": tickets,
+        # `ticket` (singular) kept for older callers — the first per-student ticket.
+        "ticket": tickets[0] if tickets else None,
+        "ticket_count": len(tickets),
+        "student_count": result.get("student_count", 0),
+        "recipient_count": total_recipients,
+        "count": total_recipients,
         "sent": result.get("sent", 0),
-        "ticket": result.get("ticket"),
-        "count": len(valid_emails) + len(bcc_list),
+        "queued": result.get("sent", 0),
         "invalid_count": invalid_count,
         "invalid_cc_count": invalid_cc_count,
-        "invalid_bcc_count": invalid_bcc_count,
     }
 
 
 def _bulk_send_email_job(
     subject,
     message,
-    recipients,
+    groups,
     cc_list=None,
-    bcc_list=None,
     sender=None,
     file_names=None,
     ticket_type=None,
-    merge_data=None,
-    school_bcc_list=None,
     now=False,
 ):
-    """Send the bulk email — runs IN-REQUEST (now=True) so it never depends on a
-    background worker or the scheduler, exactly like a single-ticket reply.
+    """Send a PER-STUDENT bulk email — runs IN-REQUEST (now=True) so it never
+    depends on a background worker, exactly like a single-ticket reply.
 
-    Creates the audit HD Ticket + one Communication (storing the UNRENDERED
-    template), then delivers the email. When the subject/body carry Jinja
-    placeholders or a CSV merge map was supplied, it renders and sends ONE email
-    PER recipient (context = {**student, **csv_row, "email"}) so every copy is
-    personalized AND each recipient's To shows only their own address. Otherwise it
-    sends a single hidden-recipient blast. CC is sent ONCE (visible group); the
-    school BCC (walsh-admin) is sent ONCE, hidden, un-personalized. Runs
-    ignore_permissions with an explicit `sender`; never raises — failures logged.
+    For each group (one student + their guardians, or one free-typed address) it:
+      * renders the subject + message against that student's record + carried merge
+        data (``{**student, **data}``) — so {{first_name}} etc. fill per student,
+      * creates ONE HD Ticket whose description is the RENDERED MESSAGE ONLY (no
+        recipient / CC / BCC preamble — the recipient set lives in
+        custom_bulk_email_recipients), raised_by the student's own email when
+        resolvable so the ticket groups under the student,
+      * sends ONE email to that group's recipients, VISIBLE (expose_recipients
+        ="header"), with the optional CC.
+    No school / default BCC (admins/hods/teachers are intentionally NOT mailed).
+    One bad group/address is logged, never aborts the rest. Never raises unless
+    `now` (a synchronous failure must surface to the SPA).
     """
     try:
-        recipients = recipients or []
+        groups = groups or []
         cc_list = cc_list or []
-        bcc_list = bcc_list or []
         file_names = file_names or []
-        merge_data = merge_data or {}
-        school_bcc_list = school_bcc_list or []
 
-        audit_description = _bulk_email_audit_html(
-            recipients, cc_list, bcc_list, message
-        )
-        payload = {
-            "doctype": TICKET_DOCTYPE,
-            "subject": subject,
-            "raised_by": sender,
-            "description": audit_description,
-            "status": "Open",
-            "ticket_type": ticket_type,
-        }
-        if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
-            payload["custom_via_unity_portal"] = 1
-        if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
-            payload["custom_is_bulk_email"] = 1
-        # Denormalised list of every recipient (TO + CC + BCC) for the
-        # "Previous Tickets" history lookup.
-        if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
-            all_recipients = sorted(set(recipients) | set(cc_list) | set(bcc_list))
-            payload["custom_bulk_email_recipients"] = ", ".join(all_recipients)
-        doc = frappe.get_doc(payload).insert(ignore_permissions=True)
-
-        # Attach by File docname via "fid". The old {"file_url": name} passed a
-        # docname where frappe.sendmail expects an actual URL, so it matched no File
-        # and attachments silently never sent. File.get_content() reads from disk
-        # with no permission check, so private orphan files attach fine in the worker.
+        # Attach by File docname via "fid" (File.get_content reads from disk, so
+        # private orphan files attach fine).
         sendmail_attachments = [{"fid": name} for name in file_names]
 
-        # Resolve the recipient list. Every address — the students plus the
-        # configured default/audit recipients (from HD Settings) — goes into one
-        # de-duplicated list. The sender (the logged-in agent) is NEVER added as a
-        # recipient — they only appear as the From address.
-        targets = []
-        target_seen = set()
-        for addr in list(bcc_list) + list(recipients) + _default_bulk_recipients():
-            key = (addr or "").lower()
-            if not key or key in target_seen:
-                continue
-            target_seen.add(key)
-            targets.append(addr)
+        # Resolve every student record in ONE query for the merge context.
+        student_ids = [g["student"] for g in groups if g.get("student")]
+        students_by_name = _students_by_name(student_ids) if student_ids else {}
 
-        if not targets:
-            frappe.log_error(
-                "Bulk email job had no valid recipients", "Unity Helpdesk _bulk_send_email_job"
-            )
-            return
-
-        # Representative event-field context — e.g. {{Time}}/{{Location}}/{{End}} from
-        # the FIRST CSV row. Used to render every copy that has NO per-recipient CSV
-        # data: the audit Communication, the default/audit recipient, the CC group and
-        # the school BCC. Without this their placeholders render BLANK. (walsh-admin
-        # always renders with a row's context, so its admin/school copies are filled.)
-        _sample_row = next(iter(merge_data.values()), None) if merge_data else None
-        _sample_event_ctx = (
-            {k: v for k, v in _sample_row.items() if k != "_student"}
-            if isinstance(_sample_row, dict)
-            else {}
-        )
-
-        # Log the bulk email as a Communication on the audit ticket, rendered with the
-        # sample context so the agent sees the filled-in output (not raw {{...}}). The
-        # recipients field is validated as real email addresses by frappe, so it must
-        # contain ONLY valid addresses — never a "(+N more)" summary.
-        try:
-            from frappe.core.doctype.communication.email import make as make_comm
-
-            make_comm(
-                doctype=TICKET_DOCTYPE,
-                name=doc.name,
-                subject=_safe_render(subject, _sample_event_ctx),
-                content=_safe_render(message, _sample_event_ctx),
-                sent_or_received="Sent",
-                sender=sender,
-                recipients=", ".join(targets),
-                cc=", ".join(cc_list) if cc_list else "",
-                communication_medium="Email",
-                send_email=False,
-            )
-        except Exception:
-            frappe.log_error(
-                frappe.get_traceback(),
-                "Unity Helpdesk bulk_send_email: Communication creation",
-            )
-
-        # Persist the audit ticket + Communication NOW — before the (possibly slow)
-        # per-recipient send — so the ticket shows in the list immediately and stops
-        # holding row locks while the emails go out.
-        frappe.db.commit()
-
-        # Personalize only when there's something to merge; otherwise one efficient
-        # blast. BOTH paths hide co-recipients (expose_recipients=None + single-address
-        # delivery) and carry the attachments.
-        needs_merge = bool(merge_data) or ("{{" in subject) or ("{{" in message)
+        tickets = []
         sent_count = 0
-        if needs_merge:
-            # Resolve student context two ways: by the CSV-carried `_student` id (so
-            # a guardian recipient inherits ITS student's fields, walsh-admin style)
-            # and by the recipient's own email (manually-added students). `_student`
-            # wins. Both batched into one query each.
-            carried_ids = {
-                cstr((merge_data.get(k) or {}).get("_student") or "").strip()
-                for k in merge_data
-            }
-            students_by_name = _students_by_name([s for s in carried_ids if s])
-            students_by_email = _students_by_email(targets)
-            for addr in targets:
-                key = (addr or "").strip().lower()
-                row = merge_data.get(key)
-                if row is None:
-                    # Non-CSV recipient (the default/audit recipient, or a manually
-                    # typed address): no student-specific data, but fill the shared
-                    # event fields from the sample so {{Time}} etc. aren't left blank.
-                    context = {**_sample_event_ctx, "email": addr}
-                else:
-                    sid = cstr(row.get("_student") or "").strip()
-                    student = (
-                        students_by_name.get(sid.lower())
-                        if sid
-                        else students_by_email.get(key)
-                    )
-                    context = {
-                        **(student or {}),
-                        **{k: v for k, v in row.items() if k != "_student"},
-                        "email": addr,
-                    }
-                try:
-                    frappe.sendmail(
-                        recipients=[addr],
-                        subject=_safe_render(subject, context),
-                        message=_safe_render(message, context),
-                        attachments=sendmail_attachments,
-                        delayed=not now,
-                        reference_doctype=TICKET_DOCTYPE,
-                        reference_name=doc.name,
-                        expose_recipients=None,
-                    )
-                    sent_count += 1
-                except Exception:
-                    # A single bad address must never abort the rest of the batch.
-                    frappe.log_error(
-                        frappe.get_traceback(),
-                        f"Unity bulk send failed for {addr}",
-                    )
-        else:
-            frappe.sendmail(
-                recipients=targets,
-                subject=subject,
-                message=message,
-                attachments=sendmail_attachments,
-                delayed=not now,
-                reference_doctype=TICKET_DOCTYPE,
-                reference_name=doc.name,
-                expose_recipients=None,
-            )
-            sent_count += len(targets)
+        student_count = 0
+        for group in groups:
+            emails = group.get("emails") or []
+            if not emails:
+                continue
+            sid = cstr(group.get("student") or "").strip()
+            student = students_by_name.get(sid.lower()) if sid else None
+            if student:
+                student_count += 1
 
-        # CC: ONE un-personalized copy (visible CC group), never to an address that
-        # already received it as a recipient.
-        cc_targets = [c for c in cc_list if (c or "").strip().lower() not in target_seen]
-        if cc_targets:
+            context = {**(student or {}), **(group.get("data") or {})}
+            rendered_subject = _safe_render(subject, context) or subject
+            rendered_message = _safe_render(message, context)
+
+            # raised_by: the student's own email when resolvable (so the
+            # student-context panel populates and the ticket groups under them),
+            # else the first recipient, else the agent.
+            raised_by = _student_primary_email(student) or emails[0] or sender
+
+            payload = {
+                "doctype": TICKET_DOCTYPE,
+                "subject": rendered_subject,
+                "raised_by": raised_by,
+                # Message ONLY — no recipient preamble (fixes the "Mail Body" column).
+                "description": rendered_message,
+                "status": "Open",
+                "ticket_type": ticket_type,
+            }
+            if _has_field(TICKET_DOCTYPE, "custom_via_unity_portal"):
+                payload["custom_via_unity_portal"] = 1
+            if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
+                payload["custom_is_bulk_email"] = 1
+            # Denormalised recipient set (student + guardians [+ cc]) for the
+            # "Previous Tickets" / "received by" history lookup.
+            if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
+                payload["custom_bulk_email_recipients"] = ", ".join(
+                    sorted(set(emails) | set(cc_list))
+                )
+
+            try:
+                doc = frappe.get_doc(payload).insert(ignore_permissions=True)
+            except Exception:
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    "Unity bulk per-student ticket insert failed",
+                )
+                continue
+            tickets.append(doc.name)
+            # Commit each ticket as it's created so it shows in the list immediately
+            # and stops holding row locks during the (possibly slow) send.
+            frappe.db.commit()
+
             try:
                 frappe.sendmail(
-                    recipients=cc_targets,
-                    subject=_safe_render(subject, _sample_event_ctx),
-                    message=_safe_render(message, _sample_event_ctx),
+                    recipients=emails,
+                    cc=cc_list or None,
+                    subject=rendered_subject,
+                    message=rendered_message,
                     attachments=sendmail_attachments,
                     delayed=not now,
                     reference_doctype=TICKET_DOCTYPE,
                     reference_name=doc.name,
                     expose_recipients="header",
                 )
+                sent_count += len(emails)
             except Exception:
-                frappe.log_error(frappe.get_traceback(), "Unity bulk CC send failed")
-
-        # School BCC (walsh-admin parity): ONE un-personalized HIDDEN copy to the
-        # school's email group + admin, deduped against everyone who already got it.
-        already = set(target_seen) | {(c or "").strip().lower() for c in cc_targets}
-        school_targets = [
-            s for s in school_bcc_list if (s or "").strip().lower() not in already
-        ]
-        if school_targets:
-            try:
-                frappe.sendmail(
-                    recipients=school_targets,
-                    subject=_safe_render(subject, _sample_event_ctx),
-                    message=_safe_render(message, _sample_event_ctx),
-                    attachments=sendmail_attachments,
-                    delayed=not now,
-                    reference_doctype=TICKET_DOCTYPE,
-                    reference_name=doc.name,
-                    expose_recipients=None,
+                # A single bad group must never abort the rest of the batch.
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Unity bulk send failed for ticket {doc.name}",
                 )
-            except Exception:
-                frappe.log_error(frappe.get_traceback(), "Unity bulk school-BCC send failed")
 
         frappe.db.commit()
-        return {"ticket": doc.name, "sent": sent_count, "recipients": len(targets)}
+        return {"tickets": tickets, "sent": sent_count, "student_count": student_count}
     except Exception:
         frappe.log_error(
             frappe.get_traceback(),
             "Unity Helpdesk _bulk_send_email_job",
         )
         # A synchronous (in-request) send must surface a hard failure to the user
-        # so the SPA shows an error instead of a false "sent"; the background path
-        # stays silent (logged only).
+        # so the SPA shows an error instead of a false "sent".
         if now:
             raise
 
@@ -1080,34 +1041,6 @@ def _split_email_list_with_counts(value):
         else:
             invalid += 1
     return out, invalid
-
-
-def _bulk_email_audit_html(recipients, cc_list, bcc_list, message):
-    # Collapsible recipient list
-    recipient_items = "".join(
-        f"<li style='font-size:12px;color:#475569'>{frappe.utils.escape_html(e)}</li>"
-        for e in recipients
-    )
-    recipient_block = (
-        f"<details style='margin:6px 0'>"
-        f"<summary style='cursor:pointer;font-weight:600;color:#3730a3'>"
-        f"Recipients ({len(recipients)})"
-        f"</summary>"
-        f"<ul style='margin:6px 0 0 16px;padding:0'>{recipient_items}</ul>"
-        f"</details>"
-    )
-    # No "📢 Bulk Email" speaker header — bulk emails should read like normal mail.
-    sections = [
-        recipient_block,
-    ]
-    if cc_list:
-        sections.append(f"<p><strong>CC:</strong> {', '.join(cc_list)}</p>")
-    if bcc_list:
-        sections.append(f"<p><strong>Additional BCC:</strong> {', '.join(bcc_list)}</p>")
-    sections.append("<hr style='margin:12px 0'>")
-    sections.append("<p><strong>Message sent:</strong></p>")
-    sections.append(message)
-    return "".join(sections)
 
 
 @frappe.whitelist(allow_guest=False)
@@ -1271,6 +1204,31 @@ def parse_bulk_email_csv(content):
     extra = [h for h in headers if h.lower() not in skip]
     merge_fields = common + [e for e in extra if e not in common]
 
+    # Group the flat rows into per-student send groups (student + their guardians),
+    # so the composer can post `groups` straight to bulk_send_email — one ticket +
+    # one email per student. Rows sharing a `_student` collapse into one group.
+    groups_by_student = {}
+    group_order = []
+    for r in rows:
+        sid = cstr((r.get("data") or {}).get("_student") or "").strip()
+        key = sid.lower() if sid else f"__free__{r['email']}"
+        grp = groups_by_student.get(key)
+        if grp is None:
+            grp = {
+                "student": sid or None,
+                "emails": [],
+                "data": {k: v for k, v in (r.get("data") or {}).items() if k != "_student"},
+            }
+            groups_by_student[key] = grp
+            group_order.append(key)
+        if r["email"] not in grp["emails"]:
+            grp["emails"].append(r["email"])
+    groups = [groups_by_student[k] for k in group_order]
+
+    # `truncated` => the CSV had more recipients than the per-send cap; the UI warns
+    # so the agent knows to split the batch rather than silently under-sending.
+    truncated = len(rows) >= RECIPIENT_HARD_CAP
+
     return {
         "headers": headers,
         "id_column": id_col,
@@ -1279,6 +1237,8 @@ def parse_bulk_email_csv(content):
         "school_bcc": school_bcc,
         "merge_fields": merge_fields,
         "rows": rows,
+        "groups": groups,
+        "group_count": len(groups),
         "count": len(rows),
         "student_count": student_added,
         "guardian_count": guardian_added,
@@ -1286,4 +1246,5 @@ def parse_bulk_email_csv(content):
         "school_mismatch_count": school_mismatch,
         "no_email_count": no_email,
         "duplicate_count": duplicates,
+        "truncated": truncated,
     }

@@ -1,76 +1,86 @@
 <template>
   <section class="page">
     <div class="toolbar">
-      <select v-model="filters.status" @change="applyFiltersAndReload">
-        <option value="">Status: All</option>
-        <option>Open</option>
-        <option>Replied</option>
-        <option>On Hold</option>
-        <option>Resolved</option>
-        <option>Closed</option>
-      </select>
-      <select v-model="filters.priority" @change="applyFiltersAndReload">
-        <option value="">Priority: All</option>
-        <option>High</option>
-        <option>Medium</option>
-        <option>Low</option>
-      </select>
-      <select v-model="filters.ticket_type" @change="applyFiltersAndReload">
-        <option value="">Ticket Type: All</option>
-        <option v-for="type in ticketTypes" :key="type.name" :value="type.name">
-          {{ type.name }}
-        </option>
-      </select>
-      <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
-      <select
-        v-if="props.view === 'all'"
-        v-model="filters.assigned_to"
-        @change="applyFiltersAndReload"
-      >
-        <option value="">Assigned: All</option>
-        <option value="Unassigned">Unassigned</option>
-        <option v-for="agent in agents" :key="agent.name" :value="agent.name">
-          {{ agent.full_name || agent.name }}
-        </option>
-      </select>
-      <span v-else class="badge blue">Assigned to me</span>
-      <div ref="dateRangeRef" class="date-range-trigger">
-        <button
-          type="button"
-          class="date-range-btn"
-          :class="{ 'has-value': filters.created_from || filters.created_to }"
-          :title="dateRangeLabel"
-          @click="toggleDateRange"
+      <div class="filter-group" :class="{ open: filtersOpen }">
+        <select v-model="filters.status" @change="applyFiltersAndReload">
+          <option value="">Status: All</option>
+          <option>Open</option>
+          <option>Replied</option>
+          <option>On Hold</option>
+          <option>Resolved</option>
+          <option>Closed</option>
+        </select>
+        <select v-model="filters.priority" @change="applyFiltersAndReload">
+          <option value="">Priority: All</option>
+          <option>High</option>
+          <option>Medium</option>
+          <option>Low</option>
+        </select>
+        <select v-model="filters.ticket_type" @change="applyFiltersAndReload">
+          <option value="">Ticket Type: All</option>
+          <option
+            v-for="type in ticketTypes"
+            :key="type.name"
+            :value="type.name"
+          >
+            {{ type.name }}
+          </option>
+        </select>
+        <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
+        <select
+          v-if="props.view === 'all'"
+          v-model="filters.assigned_to"
+          @change="applyFiltersAndReload"
         >
-          <span class="date-range-icon" aria-hidden="true">📅</span>
-          <span class="date-range-label">{{ dateRangeLabel }}</span>
-        </button>
-        <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
-          <div class="date-range-pop-row">
-            <label class="date-range-field">
-              <span>From</span>
-              <input
-                v-model="dateRangeDraft.from"
-                type="date"
-                :max="dateRangeDraft.to || undefined"
-              />
-            </label>
-            <label class="date-range-field">
-              <span>To</span>
-              <input
-                v-model="dateRangeDraft.to"
-                type="date"
-                :min="dateRangeDraft.from || undefined"
-              />
-            </label>
-          </div>
-          <div class="date-range-pop-actions">
-            <button type="button" class="btn secondary" @click="clearDateRange">
-              Clear
-            </button>
-            <button type="button" class="btn" @click="applyDateRange">
-              Apply
-            </button>
+          <option value="">Assigned: All</option>
+          <option value="Unassigned">Unassigned</option>
+          <option v-for="agent in agents" :key="agent.name" :value="agent.name">
+            {{ agent.full_name || agent.name }}
+          </option>
+        </select>
+        <span v-else class="badge blue">Assigned to me</span>
+        <div ref="dateRangeRef" class="date-range-trigger">
+          <button
+            type="button"
+            class="date-range-btn"
+            :class="{ 'has-value': filters.created_from || filters.created_to }"
+            :title="dateRangeLabel"
+            @click="toggleDateRange"
+          >
+            <span class="date-range-icon" aria-hidden="true">📅</span>
+            <span class="date-range-label">{{ dateRangeLabel }}</span>
+          </button>
+          <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
+            <div class="date-range-pop-row">
+              <label class="date-range-field">
+                <span>From</span>
+                <input
+                  v-model="dateRangeDraft.from"
+                  type="date"
+                  :max="dateRangeDraft.to || undefined"
+                />
+              </label>
+              <label class="date-range-field">
+                <span>To</span>
+                <input
+                  v-model="dateRangeDraft.to"
+                  type="date"
+                  :min="dateRangeDraft.from || undefined"
+                />
+              </label>
+            </div>
+            <div class="date-range-pop-actions">
+              <button
+                type="button"
+                class="btn secondary"
+                @click="clearDateRange"
+              >
+                Clear
+              </button>
+              <button type="button" class="btn" @click="applyDateRange">
+                Apply
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -186,28 +196,39 @@
           </li>
         </ul>
       </div>
-      <button
-        class="btn secondary toolbar-search"
-        type="button"
-        @click="submitSearch"
-      >
-        Search
-      </button>
-      <button
-        class="btn secondary toolbar-refresh"
-        type="button"
-        @click="refreshList"
-      >
-        Refresh
-      </button>
-      <button
-        class="btn secondary toolbar-columns"
-        type="button"
-        title="Customize columns"
-        @click="openColumnPanel"
-      >
-        Columns
-      </button>
+      <div class="toolbar-actions">
+        <button
+          type="button"
+          class="btn secondary filters-toggle"
+          @click="filtersOpen = !filtersOpen"
+        >
+          Filters<span v-if="activeFilterCount" class="filters-toggle-badge">{{
+            activeFilterCount
+          }}</span>
+        </button>
+        <button
+          class="btn secondary toolbar-search"
+          type="button"
+          @click="submitSearch"
+        >
+          Search
+        </button>
+        <button
+          class="btn secondary toolbar-refresh"
+          type="button"
+          @click="refreshList"
+        >
+          Refresh
+        </button>
+        <button
+          class="btn secondary toolbar-columns"
+          type="button"
+          title="Customize columns"
+          @click="openColumnPanel"
+        >
+          Columns
+        </button>
+      </div>
     </div>
 
     <div
@@ -642,6 +663,42 @@
                     {{ ticket.custom_search_student_names }}
                   </small>
                 </template>
+                <template v-else-if="col.key === 'summary'">
+                  <div class="summary-cell">
+                    <div class="summary-top">
+                      <span class="summary-subject">{{
+                        ticket.subject || "No subject"
+                      }}</span>
+                      <span
+                        v-if="ticket.ticket_type"
+                        class="badge summary-type"
+                        :class="
+                          !ticketTypeStyle(ticket.ticket_type) &&
+                          ticketTypeClass(ticket.ticket_type)
+                        "
+                        :style="ticketTypeStyle(ticket.ticket_type) || null"
+                        >{{ ticket.ticket_type }}</span
+                      >
+                    </div>
+                    <div class="summary-meta">
+                      <span
+                        class="badge"
+                        :class="ticket.status_indicator?.color"
+                        >{{
+                          ticket.status_indicator?.label || ticket.status
+                        }}</span
+                      >
+                      <span class="muted">{{
+                        ticket.assignee?.full_name ||
+                        ticket.assignee?.name ||
+                        "Unassigned"
+                      }}</span>
+                      <span class="muted">{{
+                        formatDateTime(ticket.creation)
+                      }}</span>
+                    </div>
+                  </div>
+                </template>
                 <template v-else-if="col.key === 'ticket_type'">
                   <select
                     v-model="editState[ticket.name].ticket_type"
@@ -757,7 +814,7 @@
                   </select>
                 </template>
                 <template v-else-if="col.key === 'creation'">
-                  {{ formatDate(ticket.creation) }}
+                  {{ formatDateTime(ticket.creation) }}
                 </template>
                 <template v-else-if="col.key === 'custom_is_on_hold'">
                   <span v-if="ticket.custom_is_on_hold">
@@ -794,6 +851,61 @@
             </tr>
           </tbody>
         </table>
+        <!-- Mobile-only: compact summary cards (the wide table is hidden ≤640px) -->
+        <div class="ticket-cards">
+          <article
+            v-for="ticket in tickets"
+            :key="`card-${ticket.name}`"
+            class="ticket-card"
+            :class="{
+              'portal-ticket':
+                ticket.custom_via_unity_portal && !ticket.custom_is_bulk_email,
+              'bulk-email-ticket': ticket.custom_is_bulk_email,
+              'row-selected': isSelected(ticket.name),
+            }"
+            @click="openTicket(ticket.name)"
+          >
+            <div class="ticket-card-top">
+              <label class="ticket-card-check" @click.stop>
+                <input
+                  type="checkbox"
+                  :checked="isSelected(ticket.name)"
+                  @click.stop="toggleRow(ticket.name)"
+                />
+              </label>
+              <span class="ticket-card-id">#{{ ticket.name }}</span>
+              <span class="badge" :class="ticket.status_indicator?.color">{{
+                ticket.status_indicator?.label || ticket.status
+              }}</span>
+            </div>
+            <div class="ticket-card-subject">
+              {{ ticket.subject || "No subject" }}
+            </div>
+            <div class="ticket-card-meta">
+              <span
+                v-if="ticket.ticket_type"
+                class="badge"
+                :class="
+                  !ticketTypeStyle(ticket.ticket_type) &&
+                  ticketTypeClass(ticket.ticket_type)
+                "
+                :style="ticketTypeStyle(ticket.ticket_type) || null"
+                >{{ ticket.ticket_type }}</span
+              >
+              <span class="muted">{{
+                ticket.assignee?.full_name ||
+                ticket.assignee?.name ||
+                "Unassigned"
+              }}</span>
+              <span class="muted">{{ formatDateTime(ticket.creation) }}</span>
+            </div>
+            <small
+              v-if="ticket.custom_search_student_names"
+              class="student-names"
+              >{{ ticket.custom_search_student_names }}</small
+            >
+          </article>
+        </div>
       </div>
       <div class="table-header">
         <label class="page-size-control" title="Rows fetched per request">
@@ -938,6 +1050,19 @@ const filters = reactive({
   created_from: "",
   created_to: "",
 });
+// Mobile: the filter row collapses behind a "Filters" toggle. On desktop the
+// filter group is always shown via CSS (display:contents), so this only gates mobile.
+const filtersOpen = ref(false);
+const activeFilterCount = computed(
+  () =>
+    [
+      filters.status,
+      filters.priority,
+      filters.ticket_type,
+      filters.assigned_to,
+      filters.created_from || filters.created_to,
+    ].filter(Boolean).length
+);
 let activeController = null;
 let activeRequestId = 0;
 

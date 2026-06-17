@@ -19,6 +19,12 @@ from frappe.utils import cstr
 from helpdesk.api.unity_helpdesk import _require_unity_access
 
 EMAIL_TEMPLATE_DOCTYPE = "Email Template"
+# Category support is provided by the edu_quality app (the "Email Template Category"
+# doctype + an optional `email_template_category` Link field on core Email Template).
+# Everything here is guarded with exists()/has_column() so the helpdesk degrades to a
+# flat, category-less template list when edu_quality isn't installed/migrated.
+EMAIL_TEMPLATE_CATEGORY_DOCTYPE = "Email Template Category"
+EMAIL_TEMPLATE_CATEGORY_FIELD = "email_template_category"
 LIST_DEFAULT_LIMIT = 50
 
 
@@ -31,14 +37,49 @@ def _require_bulk_email_access():
     return capabilities
 
 
+def _has_category_field():
+    return frappe.db.has_column(EMAIL_TEMPLATE_DOCTYPE, EMAIL_TEMPLATE_CATEGORY_FIELD)
+
+
 @frappe.whitelist()
-def list_email_templates(search=None, limit=LIST_DEFAULT_LIMIT):
-    """List Frappe Email Templates (name + subject) for the composer picker."""
+def list_email_template_categories():
+    """List Email Template Categories for the composer's category dropdown.
+
+    Returns [] when the edu_quality "Email Template Category" doctype is absent, so
+    the picker simply shows no category filter on sites without it."""
+    _require_bulk_email_access()
+    if not frappe.db.exists("DocType", EMAIL_TEMPLATE_CATEGORY_DOCTYPE):
+        return []
+    try:
+        return frappe.get_all(
+            EMAIL_TEMPLATE_CATEGORY_DOCTYPE,
+            fields=["name", "category_name"],
+            order_by="category_name asc",
+            limit=200,
+        )
+    except Exception:
+        return []
+
+
+@frappe.whitelist()
+def list_email_templates(search=None, limit=LIST_DEFAULT_LIMIT, category=None):
+    """List Frappe Email Templates (name + subject [+ category]) for the picker,
+    optionally filtered to a single Email Template Category."""
     _require_bulk_email_access()
     try:
         limit = max(1, min(int(limit or LIST_DEFAULT_LIMIT), 200))
     except (TypeError, ValueError):
         limit = LIST_DEFAULT_LIMIT
+
+    has_category = _has_category_field()
+    fields = ["name", "subject"]
+    if has_category:
+        fields.append(EMAIL_TEMPLATE_CATEGORY_FIELD)
+
+    filters = {}
+    category = cstr(category or "").strip()
+    if category and has_category:
+        filters[EMAIL_TEMPLATE_CATEGORY_FIELD] = category
 
     or_filters = None
     search = cstr(search or "").strip()
@@ -49,7 +90,8 @@ def list_email_templates(search=None, limit=LIST_DEFAULT_LIMIT):
         ]
     return frappe.get_all(
         EMAIL_TEMPLATE_DOCTYPE,
-        fields=["name", "subject"],
+        fields=fields,
+        filters=filters or None,
         or_filters=or_filters,
         order_by="modified desc",
         limit=limit,

@@ -102,7 +102,12 @@ class TestBulkSendEmailValidation(FrappeTestCase):
 
 
 class TestBulkSendEmailSendPath(FrappeTestCase):
-	"""End-to-end tests that mock outgoing-account + sendmail."""
+	"""End-to-end tests for the PER-STUDENT bulk send (mocks outgoing-account + sendmail).
+
+	The send model creates ONE HD Ticket + ONE visible email per group (a student +
+	their guardians, or a single free address). No school/default BCC; recipients are
+	visible; the ticket description is the rendered message ONLY.
+	"""
 
 	@classmethod
 	def setUpClass(cls):
@@ -118,11 +123,21 @@ class TestBulkSendEmailSendPath(FrappeTestCase):
 		frappe.db.commit()
 		super().tearDownClass()
 
+	@staticmethod
+	def _groups(*groups):
+		"""Build a JSON `groups` payload from {student, emails, data} dicts."""
+		return json.dumps(
+			[
+				{"student": g.get("student"), "emails": g["emails"], "data": g.get("data", {})}
+				for g in groups
+			]
+		)
+
 	def _run(self, **kwargs):
 		defaults = {
 			"subject": "Test bulk",
 			"message": "<p>Hello world</p>",
-			"recipients": json.dumps(["a@x.com", "b@x.com"]),
+			"groups": self._groups({"emails": ["a@x.com", "b@x.com"]}),
 			"ticket_type": self._ticket_type,
 		}
 		defaults.update(kwargs)
@@ -131,8 +146,8 @@ class TestBulkSendEmailSendPath(FrappeTestCase):
 			patch("frappe.sendmail") as mock_sendmail,
 		):
 			result = bulk_send_email(**defaults)
-		if result.get("ticket"):
-			self._created_tickets.append(result["ticket"])
+		for ticket in result.get("tickets") or []:
+			self._created_tickets.append(ticket)
 		return result, mock_sendmail
 
 	def test_no_valid_recipients_throws(self):
@@ -141,92 +156,133 @@ class TestBulkSendEmailSendPath(FrappeTestCase):
 				bulk_send_email(
 					subject="x",
 					message="<p>hi</p>",
-					recipients=json.dumps(["not-an-email", "also bad"]),
+					groups=self._groups({"emails": ["not-an-email", "also bad"]}),
 					ticket_type=self._ticket_type,
 				)
 
-	def test_invalid_emails_counted_and_dropped(self):
-		result, _ = self._run(recipients=json.dumps(["a@x.com", "notanemail", "b@x.com"]))
-		self.assertEqual(result["queued"], 2)
-		self.assertEqual(result["invalid_count"], 1)
+	def test_one_ticket_and_send_per_group(self):
+		# Two student groups -> two tickets, two emails.
+		result, mock_sendmail = self._run(
+			groups=self._groups(
+				{"student": None, "emails": ["a@x.com"]},
+				{"student": None, "emails": ["b@x.com"]},
+			)
+		)
+		self.assertEqual(result["ticket_count"], 2)
+		self.assertEqual(mock_sendmail.call_count, 2)
 
-	def test_recipients_deduplicated_case_insensitive(self):
-		result, _ = self._run(recipients=json.dumps(["A@x.com", "a@x.com", "B@x.com"]))
-		self.assertEqual(result["queued"], 2)
+	def test_sendmail_uses_visible_recipients_not_bcc(self):
+		# Per-student emails go to visible recipients (student + guardians), not BCC.
+		_, mock_sendmail = self._run(
+			groups=self._groups({"emails": ["a@x.com", "b@x.com"]})
+		)
+		mock_sendmail.assert_called_once()
+		_, kwargs = mock_sendmail.call_args
+		self.assertIn("a@x.com", kwargs.get("recipients") or [])
+		self.assertIn("b@x.com", kwargs.get("recipients") or [])
+		self.assertFalse(kwargs.get("bcc"))
+		self.assertEqual(kwargs.get("expose_recipients"), "header")
+
+	def test_invalid_emails_counted_and_dropped(self):
+		result, _ = self._run(
+			groups=self._groups({"emails": ["a@x.com", "notanemail", "b@x.com"]})
+		)
+		self.assertEqual(result["invalid_count"], 1)
+		self.assertEqual(result["recipient_count"], 2)
+
+	def test_emails_deduplicated_within_group(self):
+		_, mock_sendmail = self._run(
+			groups=self._groups({"emails": ["A@x.com", "a@x.com", "B@x.com"]})
+		)
+		_, kwargs = mock_sendmail.call_args
+		self.assertEqual(sorted(kwargs.get("recipients") or []), ["a@x.com", "b@x.com"])
 
 	def test_recipient_cap_exceeded_throws(self):
-		recipients = [f"u{i}@x.com" for i in range(RECIPIENT_HARD_CAP + 1)]
+		groups = self._groups(
+			{"emails": [f"u{i}@x.com" for i in range(RECIPIENT_HARD_CAP + 1)]}
+		)
 		with _has_outgoing_account_patch():
 			with self.assertRaises(frappe.exceptions.ValidationError):
 				bulk_send_email(
 					subject="x",
 					message="<p>hi</p>",
-					recipients=json.dumps(recipients),
+					groups=groups,
 					ticket_type=self._ticket_type,
 				)
 
-	def test_html_message_sanitized_no_active_script(self):
-		# sanitize_html HTML-escapes script tags so they render as inert text.
-		# What matters is that no executable <script> survives in the DOM.
+	def test_description_is_message_only_no_recipient_preamble(self):
+		# Fixes the "Mail Body" column showing recipient/CC/BCC lines.
 		result, _ = self._run(
-			message="<script>alert(1)</script><p>hello</p>",
+			groups=self._groups({"emails": ["a@x.com", "b@x.com"]})
 		)
-		desc = frappe.db.get_value("HD Ticket", result["ticket"], "description") or ""
-		# No raw <script> tag — escaped form is fine (&lt;script&gt;) since it renders as text.
+		desc = frappe.db.get_value("HD Ticket", result["tickets"][0], "description") or ""
+		self.assertIn("hello world", desc.lower())
+		self.assertNotIn("recipients (", desc.lower())
+		self.assertNotIn("additional bcc", desc.lower())
+
+	def test_merge_fields_rendered_per_group(self):
+		# {{first_name}} fills from the group's merge data.
+		result, _ = self._run(
+			subject="Hi {{first_name}}",
+			message="<p>Dear {{first_name}}, welcome.</p>",
+			groups=self._groups(
+				{"student": None, "emails": ["a@x.com"], "data": {"first_name": "Asha"}}
+			),
+		)
+		ticket = frappe.db.get_value(
+			"HD Ticket", result["tickets"][0], ["subject", "description"], as_dict=True
+		)
+		self.assertEqual(ticket.subject, "Hi Asha")
+		self.assertIn("dear asha", (ticket.description or "").lower())
+
+	def test_html_message_sanitized_no_active_script(self):
+		result, _ = self._run(message="<script>alert(1)</script><p>hello</p>")
+		desc = frappe.db.get_value("HD Ticket", result["tickets"][0], "description") or ""
 		self.assertNotIn("<script>", desc.lower())
 		self.assertIn("&lt;script&gt;", desc.lower())
 		self.assertIn("hello", desc.lower())
 
 	def test_html_message_onerror_handler_stripped(self):
-		# Inline event handlers must be stripped, not just escaped.
-		result, _ = self._run(
-			message='<img src=x onerror="alert(1)"><p>safe text</p>',
-		)
-		desc = frappe.db.get_value("HD Ticket", result["ticket"], "description") or ""
+		result, _ = self._run(message='<img src=x onerror="alert(1)"><p>safe text</p>')
+		desc = frappe.db.get_value("HD Ticket", result["tickets"][0], "description") or ""
 		self.assertNotIn("onerror", desc.lower())
 		self.assertIn("safe text", desc.lower())
 
-	def test_audit_ticket_has_unity_portal_flag(self):
+	def test_ticket_has_unity_portal_flag(self):
 		result, _ = self._run()
-		flag = frappe.db.get_value("HD Ticket", result["ticket"], "custom_via_unity_portal")
+		flag = frappe.db.get_value("HD Ticket", result["tickets"][0], "custom_via_unity_portal")
 		self.assertEqual(int(flag or 0), 1)
 
-	def test_audit_ticket_has_bulk_email_flag(self):
+	def test_ticket_has_bulk_email_flag(self):
 		result, _ = self._run()
-		flag = frappe.db.get_value("HD Ticket", result["ticket"], "custom_is_bulk_email")
+		flag = frappe.db.get_value("HD Ticket", result["tickets"][0], "custom_is_bulk_email")
 		self.assertEqual(int(flag or 0), 1)
 
-	def test_invalid_cc_bcc_counts_in_response(self):
-		result, _ = self._run(
-			recipients=json.dumps(["good@x.com"]),
+	def test_cc_passed_as_visible_cc_and_counts_invalid(self):
+		result, mock_sendmail = self._run(
+			groups=self._groups({"emails": ["good@x.com"]}),
 			cc="okcc@x.com, badcc, alsobad",
-			bcc="okbcc@x.com, malformed",
 		)
 		self.assertEqual(result["invalid_cc_count"], 2)
-		self.assertEqual(result["invalid_bcc_count"], 1)
-
-	def test_sendmail_uses_bcc_for_recipients(self):
-		# BCC behavior is what hides recipients from one another
-		_, mock_sendmail = self._run(recipients=json.dumps(["a@x.com", "b@x.com"]))
-		mock_sendmail.assert_called_once()
 		_, kwargs = mock_sendmail.call_args
-		self.assertIn("a@x.com", kwargs.get("bcc") or [])
-		self.assertIn("b@x.com", kwargs.get("bcc") or [])
+		self.assertIn("okcc@x.com", kwargs.get("cc") or [])
 
-	def test_cc_bcc_accept_json_array_payload(self):
-		# SPA now sends cc/bcc as JSON-encoded arrays. Regression guard: this must
-		# not be CSV-split into garbage like '"a@x.com"'.
+	def test_cc_accepts_json_array_payload(self):
 		result, mock_sendmail = self._run(
-			recipients=json.dumps(["good@x.com"]),
+			groups=self._groups({"emails": ["good@x.com"]}),
 			cc=json.dumps(["cc1@x.com", "cc2@x.com"]),
-			bcc=json.dumps(["bcc1@x.com"]),
 		)
 		self.assertEqual(result["invalid_cc_count"], 0)
-		self.assertEqual(result["invalid_bcc_count"], 0)
 		_, kwargs = mock_sendmail.call_args
 		self.assertIn("cc1@x.com", kwargs.get("cc") or [])
 		self.assertIn("cc2@x.com", kwargs.get("cc") or [])
-		self.assertIn("bcc1@x.com", kwargs.get("bcc") or [])
+
+	def test_legacy_recipients_param_still_works(self):
+		# Back-compat: a flat `recipients` list becomes one ticket per email.
+		result, mock_sendmail = self._run(
+			groups=None, recipients=json.dumps(["a@x.com", "b@x.com"])
+		)
+		self.assertEqual(result["ticket_count"], 2)
 
 
 def _delete_if_exists(doctype, name):
