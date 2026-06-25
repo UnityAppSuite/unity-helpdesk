@@ -611,7 +611,7 @@ def _fetch_school_locations(students_by_id, enrollment_rows):
 	return {row.get("name"): cstr(row.get("location") or "").strip() or None for row in rows}
 
 
-def _pick_program_enrollment(rows):
+def _pick_program_enrollment(rows, current_year=None):
 	if not rows:
 		return None, []
 
@@ -620,12 +620,26 @@ def _pick_program_enrollment(rows):
 		key=lambda row: (get_datetime(row.get("modified")), cstr(row.get("name"))),
 		reverse=True,
 	)
-	submitted = [row for row in sorted_rows if int(row.get("docstatus") or 0) == 1]
-	selected = submitted[0] if submitted else sorted_rows[0]
-	status_messages = []
-	if not submitted:
-		status_messages.append("Current-year enrollment is not submitted yet")
-	return selected, status_messages
+
+	def _select(pool):
+		submitted = [row for row in pool if int(row.get("docstatus") or 0) == 1]
+		return (submitted[0] if submitted else pool[0]), bool(submitted)
+
+	# Prefer the current academic year when the student is enrolled this year
+	# (the normal current-student case). Alumni / Cancelled / not-yet-re-enrolled
+	# students have no current-year row, so fall back to their LATEST enrolment so
+	# the card reflects their actual most-recent academic year — not the global
+	# current year.
+	if current_year:
+		current_pool = [
+			row for row in sorted_rows if cstr(row.get("academic_year")) == cstr(current_year)
+		]
+		if current_pool:
+			selected, has_submitted = _select(current_pool)
+			return selected, ([] if has_submitted else ["Current-year enrollment is not submitted yet"])
+
+	selected, _has_submitted = _select(sorted_rows)
+	return selected, []
 
 
 def _pick_fee_record(rows, enrollment_name):
@@ -927,9 +941,10 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			"docstatus",
 			"modified",
 		],
-		filters={"student": ["in", all_student_ids], "academic_year": current_year}
-		if current_year
-		else {"name": "__none"},
+		# Fetch ALL of the student's enrolments (no academic-year filter). The picker
+		# prefers the current year for current students and falls back to the latest
+		# year for Alumni / Cancelled / not-yet-re-enrolled students.
+		filters={"student": ["in", all_student_ids]} if all_student_ids else {"name": "__none"},
 		page_length=0,
 		order_by="modified desc",
 	)
@@ -950,9 +965,9 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			"docstatus",
 			"modified",
 		],
-		filters={"student": ["in", all_student_ids], "academic_year": current_year}
-		if current_year
-		else {"name": "__none"},
+		# All fee records for the students; _pick_fee_record selects the one linked
+		# to the chosen enrolment (so the year matches the enrolment shown).
+		filters={"student": ["in", all_student_ids]} if all_student_ids else {"name": "__none"},
 		page_length=0,
 		order_by="modified desc",
 	)
@@ -987,24 +1002,24 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 
 		status_messages = []
 		selected_enrollment, enrollment_messages = _pick_program_enrollment(
-			enrollments_by_student.get(student_id, [])
+			enrollments_by_student.get(student_id, []), current_year
 		)
 		status_messages.extend(enrollment_messages)
 		if not selected_enrollment:
-			status_messages.append("No current-year enrollment found")
+			status_messages.append("No enrollment found")
 
 		selected_fee = _pick_fee_record(
 			fees_by_student.get(student_id, []),
 			selected_enrollment.get("name") if selected_enrollment else None,
 		)
 		if not selected_fee:
-			status_messages.append("No fees record found for current-year enrollment")
+			status_messages.append("No fees record found")
 		elif (
 			selected_enrollment
 			and cstr(selected_fee.get("program_enrollment")).strip()
 			and cstr(selected_fee.get("program_enrollment")).strip() != cstr(selected_enrollment.get("name")).strip()
 		):
-			status_messages.append("Fees record is not linked to the selected current-year enrollment")
+			status_messages.append("Fees record is not linked to the selected enrollment")
 
 		student_guardian_rows = guardians_by_student.get(student_id, [])
 		student_guardian_ids = [
@@ -1072,6 +1087,12 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"guardian_emails": sorted(set(guardian_emails)),
 				"guardians": guardian_cards,
 				"reference_number": student.get("reference_number"),
+				# The academic year this student is actually shown for — the current
+				# year for current students, else their latest enrolled year (Alumni/
+				# Cancelled). The SPA shows this per student instead of the global year.
+				"academic_year": (
+					selected_enrollment.get("academic_year") if selected_enrollment else None
+				),
 				"enrollment": (
 					{
 						"name": selected_enrollment.get("name"),
@@ -2680,20 +2701,47 @@ def _assigned_ticket_names(user):
 	cache = _request_cache().setdefault("_assigned_ticket_names", {})
 	if user in cache:
 		return cache[user]
+	# Candidate set: every ticket EVER assigned to the user (ANY ToDo status),
+	# resolved via the indexed ToDo table — never an `_assign LIKE` scan. The
+	# assignee is `allocated_to` (the `owner` is whoever DID the assigning, e.g. the
+	# funnel bot), with `owner` kept as a fallback for legacy rows. Newest first so
+	# the MAX cap keeps the rows a user would actually look at.
 	rows = frappe.get_all(
 		"ToDo",
-		filters={
-			"reference_type": TICKET_DOCTYPE,
-			"owner": user,
-			"status": "Open",
-		},
+		filters={"reference_type": TICKET_DOCTYPE},
+		or_filters={"allocated_to": user, "owner": user},
 		fields=["reference_name"],
-		# Most-recent assignments first, so silent truncation at MAX still
-		# returns the rows a user would actually be looking at.
 		order_by="creation desc",
 		page_length=MAX_ASSIGNED_LOOKUP,
 	)
-	names = {row.reference_name for row in rows if row.reference_name}
+	candidates = []
+	seen = set()
+	for row in rows:
+		name = row.reference_name
+		if name and name not in seen:
+			seen.add(name)
+			candidates.append(name)
+
+	# Keep only tickets where the user is the CURRENT assignee per HD Ticket._assign.
+	# This makes a CLOSED ticket the user was last assigned still appear under them,
+	# and drops a ticket that was reassigned away — both regardless of ToDo status
+	# (closing/reassigning moves the ToDo out of "Open"). Chunked IN on the indexed
+	# `name` PK keeps it fast.
+	names = set()
+	CHUNK = 2000
+	for i in range(0, len(candidates), CHUNK):
+		chunk = candidates[i : i + CHUNK]
+		for row in frappe.get_all(
+			TICKET_DOCTYPE,
+			filters={"name": ["in", chunk]},
+			fields=["name", "_assign"],
+			page_length=len(chunk),
+		):
+			assignees = frappe.parse_json(row.get("_assign") or "[]") or []
+			if user in assignees:
+				# HD Ticket names are numeric; get_all returns them as int. Cast to
+				# str so the set matches ToDo.reference_name / the original contract.
+				names.add(cstr(row.get("name")))
 	cache[user] = names
 	return names
 

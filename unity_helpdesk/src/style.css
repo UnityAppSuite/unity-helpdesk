@@ -406,6 +406,12 @@ nav a.router-link-active {
   width: auto;
   margin: 0;
 }
+.bulk-recipient-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0;
+}
 .required-asterisk { color: #ef4444; margin-left: 2px; }
 
 .recipient-input-wrap {
@@ -2380,6 +2386,11 @@ tbody tr.bulk-email-ticket:hover {
 .chat-msg--customer .chat-msg-label {
   background: #dcfce7;
   color: #16a34a;
+}
+.chat-msg-author {
+  font-size: 12px;
+  font-weight: 600;
+  color: #334155;
 }
 .chat-msg-sender {
   font-size: 12px;
