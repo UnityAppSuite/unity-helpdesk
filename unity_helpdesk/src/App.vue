@@ -396,25 +396,6 @@
                 </span>
               </div>
             </label>
-            <label class="bulk-email-guardian-toggle">
-              <input v-model="includeGuardians" type="checkbox" />
-              Include guardian emails
-              <span
-                v-if="guardianCountLabel"
-                class="muted"
-                style="margin-left: 6px"
-                >{{ guardianCountLabel }}</span
-              >
-            </label>
-            <label v-if="includeGuardians && recipientsPreview">
-              Recipients (student + guardian emails)
-              <textarea
-                class="recipients-preview"
-                :value="recipientsPreview"
-                rows="4"
-                readonly
-              ></textarea>
-            </label>
           </template>
 
           <!-- CSV mode -->
@@ -473,21 +454,35 @@
                   </button>
                 </span>
               </div>
-              <p class="muted bulk-email-guardian-auto">
-                Guardians are included automatically from each student id in the
-                CSV.
-              </p>
-            </label>
-            <label v-if="recipientsPreview">
-              Recipients (student + guardian emails)
-              <textarea
-                class="recipients-preview"
-                :value="recipientsPreview"
-                rows="4"
-                readonly
-              ></textarea>
             </label>
           </template>
+
+          <!-- Recipient options (both modes): choose students and/or guardians -->
+          <div v-if="bulkEmail.students.length" class="bulk-recipient-options">
+            <label class="bulk-email-guardian-toggle">
+              <input v-model="includeGuardians" type="checkbox" />
+              Include guardian emails
+              <span
+                v-if="guardianCountLabel"
+                class="muted"
+                style="margin-left: 6px"
+                >{{ guardianCountLabel }}</span
+              >
+            </label>
+            <label class="bulk-email-guardian-toggle">
+              <input v-model="excludeStudent" type="checkbox" />
+              Exclude student email (send to guardians only)
+            </label>
+          </div>
+          <label v-if="recipientsPreview">
+            Recipients
+            <textarea
+              class="recipients-preview"
+              :value="recipientsPreview"
+              rows="4"
+              readonly
+            ></textarea>
+          </label>
 
           <!-- Concise hint: any Student field works as a merge token. -->
           <div class="merge-fields-hint">
@@ -735,6 +730,9 @@ const bulkEmail = reactive({
   csvImported: false,
 });
 const includeGuardians = ref(false);
+// Recipient toggles (both modes): exclude the student's own email (send to
+// guardians only). includeGuardians defaults on in CSV mode (see setBulkMode).
+const excludeStudent = ref(false);
 // All Student doctype fields, fetched once when the bulk modal opens — used to
 // show the full merge-field list and to flag {{tokens}} that won't auto-fill.
 const studentMergeFields = ref([]);
@@ -1059,9 +1057,10 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // Deliverable emails for one student: the student + (optionally) their guardians,
 // deduped WITHIN the student. Siblings sharing a guardian still each get their own
 // personalised ticket that mails that guardian.
-function studentGroupEmails(s, includeG) {
+function studentGroupEmails(s, includeStudent, includeGuardians) {
   const out = [];
   const seen = new Set();
+  const studentEmail = (s.email || "").toLowerCase().trim();
   const push = (e) => {
     const x = (e || "").toLowerCase().trim();
     if (x && EMAIL_REGEX.test(x) && !seen.has(x)) {
@@ -1069,18 +1068,31 @@ function studentGroupEmails(s, includeG) {
       out.push(x);
     }
   };
-  push(s.email);
-  if (includeG) (s.guardian_emails || []).forEach(push);
+  if (includeStudent && studentEmail) push(studentEmail);
+  if (includeGuardians) {
+    for (const g of s.guardian_emails || []) {
+      // Never re-introduce the student's own email via the guardian list, so
+      // "Exclude student email" truly excludes it even if the data lists it twice.
+      if ((g || "").toLowerCase().trim() === studentEmail) continue;
+      push(g);
+    }
+  }
   return out;
 }
 
+// Current recipient selection (applies to both reference and CSV modes).
+const recipientFlags = computed(() => ({
+  includeStudent: !excludeStudent.value,
+  includeGuardians: includeGuardians.value,
+}));
+
 // One send group per resolved student (or free email) -> one ticket + one email.
 const bulkEmailGroups = computed(() => {
-  const includeG = bulkEmail.mode === "csv" ? true : includeGuardians.value;
+  const { includeStudent, includeGuardians: incG } = recipientFlags.value;
   const groups = [];
   for (const s of bulkEmail.students) {
     if (s.status === "notfound") continue;
-    const emails = studentGroupEmails(s, includeG);
+    const emails = studentGroupEmails(s, includeStudent, incG);
     if (!emails.length) continue;
     groups.push({ student: s.student || null, emails, data: s.data || {} });
   }
@@ -1088,7 +1100,7 @@ const bulkEmailGroups = computed(() => {
 });
 const bulkEmailStudentCount = computed(() => bulkEmailGroups.value.length);
 const guardianCountLabel = computed(() => {
-  if (bulkEmail.mode !== "reference" || !includeGuardians.value) return "";
+  if (!includeGuardians.value) return "";
   const total = bulkEmail.students.reduce(
     (n, s) => n + (s.guardian_emails || []).length,
     0
@@ -1096,14 +1108,13 @@ const guardianCountLabel = computed(() => {
   return total ? `${total} guardian email(s) will be included` : "";
 });
 
-// Read-only preview of exactly who gets emailed — one line per student:
-// "Name: studentEmail, guardian1, guardian2".
+// Read-only preview of exactly who gets emailed — one line per student.
 const recipientsPreview = computed(() => {
-  const includeG = bulkEmail.mode === "csv" ? true : includeGuardians.value;
+  const { includeStudent, includeGuardians: incG } = recipientFlags.value;
   return bulkEmail.students
     .filter((s) => s.status !== "notfound")
     .map((s) => {
-      const emails = studentGroupEmails(s, includeG);
+      const emails = studentGroupEmails(s, includeStudent, incG);
       return emails.length ? `${s.name}: ${emails.join(", ")}` : null;
     })
     .filter(Boolean)
@@ -1147,6 +1158,10 @@ function setBulkMode(mode) {
   bccResults.value = [];
   bulkEmailWarning.value = "";
   bulkEmailError.value = "";
+  // CSV imports historically include guardians by default; reference entry starts
+  // students-only. The agent can change both via the recipient toggles.
+  includeGuardians.value = mode === "csv";
+  excludeStudent.value = false;
 }
 
 function chipTitle(s) {
@@ -1395,6 +1410,7 @@ function resetBulkEmail() {
   bccSearchQuery.value = "";
   bccResults.value = [];
   includeGuardians.value = false;
+  excludeStudent.value = false;
 }
 
 function closeBulkEmail() {
@@ -1513,13 +1529,23 @@ function removeBulkEmailAttachment(name) {
 async function sendBulkEmail() {
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  // One group per student (or free email): the student + their guardians.
+  // One group per student (or free email): the student and/or their guardians,
+  // per the recipient toggles.
   const groups = bulkEmailGroups.value;
   if (!groups.length) {
-    bulkEmailError.value =
-      bulkEmail.mode === "csv"
-        ? "Import a CSV with at least one student that has an email."
-        : "Add at least one student (reference number) or recipient before sending.";
+    const hasStudents = bulkEmail.students.some((s) => s.status !== "notfound");
+    if (hasStudents && excludeStudent.value && !includeGuardians.value) {
+      bulkEmailError.value =
+        "Recipient options exclude everyone — enable “Include guardian emails” or uncheck “Exclude student email”.";
+    } else if (hasStudents) {
+      bulkEmailError.value =
+        "No deliverable email for the selected recipients — check Include guardians / Exclude student.";
+    } else {
+      bulkEmailError.value =
+        bulkEmail.mode === "csv"
+          ? "Import a CSV with at least one student that has an email."
+          : "Add at least one student (reference number) or recipient before sending.";
+    }
     return;
   }
   if (!bulkEmail.subject.trim()) {

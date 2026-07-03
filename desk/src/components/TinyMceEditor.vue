@@ -86,6 +86,10 @@ const editorConfig = computed(() => ({
   // detaches it and floats it over the page when the editor sits in a scrolling
   // modal (the bulk-email composer), so it's explicitly disabled.
   toolbar_sticky: false,
+  // Wrap overflow buttons onto extra rows instead of the default "floating" drawer
+  // (the "…" popup that stayed open over the form and didn't close on
+  // template-select / outside-click). Wrapping keeps every button visible inline.
+  toolbar_mode: "wrap",
   toolbar:
     "undo redo | blocks | bold italic underline | bullist numlist | blockquote table link | removeformat code |" +
     " templates" +

@@ -1144,7 +1144,7 @@ def parse_bulk_email_csv(content):
     guardians = _guardian_emails_for_students(student_ids)
 
     rows = []
-    seen = set()
+    processed_students = set()
     unmatched = 0
     school_mismatch = 0
     no_email = 0
@@ -1162,26 +1162,32 @@ def parse_bulk_email_csv(content):
             school_mismatch += 1
             continue
         canonical_id = cstr(student.get("name") or sid).strip()
+        # Skip a student repeated across CSV rows (they map to one ticket anyway).
+        if canonical_id.lower() in processed_students:
+            duplicates += 1
+            continue
+        processed_students.add(canonical_id.lower())
         # Carried context shared by the student AND their guardians.
         ctx = {**row, "_student": canonical_id}
         display = _student_display_name(student, sid)
 
+        # Dedup WITHIN this student only — so siblings who share a guardian each get
+        # that guardian in their own ticket (a global dedup would drop it from the
+        # later sibling, the "only one guardian" bug).
+        local_seen = set()
         email = cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
         if email and validate_email_address(email, throw=False):
-            if email in seen:
-                duplicates += 1
-            else:
-                seen.add(email)
-                rows.append({"email": email, "name": display, "data": ctx})
-                student_added += 1
+            local_seen.add(email)
+            rows.append({"email": email, "name": display, "data": ctx})
+            student_added += 1
         else:
             no_email += 1
 
         # Auto-include guardians — each inherits the student's merge context.
         for gemail in guardians.get(canonical_id, []):
             ge = cstr(gemail).strip().lower()
-            if ge and validate_email_address(ge, throw=False) and ge not in seen:
-                seen.add(ge)
+            if ge and validate_email_address(ge, throw=False) and ge not in local_seen:
+                local_seen.add(ge)
                 rows.append({"email": ge, "name": f"{display} (guardian)", "data": ctx})
                 guardian_added += 1
 

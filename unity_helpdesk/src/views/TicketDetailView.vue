@@ -460,6 +460,9 @@
                   >
                   <template v-else>Customer</template>
                 </span>
+                <span v-if="threadAuthor(item)" class="chat-msg-author">{{
+                  threadAuthor(item)
+                }}</span>
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
@@ -1404,6 +1407,25 @@ function threadContent(item) {
   return normalizeTicketLinksInHtml(item?.content || "");
 }
 
+// Display name of who sent the message / added the note (backend attaches
+// item.user via get_user_info_for_avatar on sender/commented_by).
+function threadAuthor(item) {
+  const u = item?.user || {};
+  return u.full_name || u.name || item?.sender || "";
+}
+
+// HTML to parse the student / fee / previous-ticket side panels from. Bulk-email
+// tickets keep a clean description, so prefer the auto "Student Information" intake
+// communication's body (which carries the full blocks); fall back to the ticket
+// description for normal tickets (where the same content lives inline).
+function studentInfoSourceHtml() {
+  const comms = ticket.value?.communications || ticket.value?.thread || [];
+  const intake = comms.find(
+    (c) => (c.subject || "").trim().toLowerCase() === "student information"
+  );
+  return (intake && intake.content) || ticket.value?.description || "";
+}
+
 // The edu_quality auto-intake is created as a "Student Information" communication
 // carrying the STUDENT DETAILS / fee / previous-ticket template (already shown in
 // the side panel). Hide it from the thread. A customer message (Received) and any
@@ -1477,9 +1499,11 @@ async function loadTicket() {
     ticket.value = detail;
     communications.value = ticket.value.communications || [];
     comments.value = ticket.value.comments || [];
-    parsedDescription.value = parseTicketDescription(
-      ticket.value.description || ""
-    );
+    // Parse the student / fee / previous-ticket blocks from the "Student
+    // Information" intake comm when present (bulk-email tickets keep a clean
+    // description, but that intake comm carries the full blocks). Normal tickets
+    // fall back to the description (where the same content lives).
+    parsedDescription.value = parseTicketDescription(studentInfoSourceHtml());
     applyForm();
     queueMicrotask(() => {
       if (requestId === activeTicketRequestId) {
