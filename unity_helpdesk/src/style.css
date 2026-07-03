@@ -2372,6 +2372,9 @@ tbody tr.bulk-email-ticket:hover {
   flex-wrap: wrap;
 }
 .chat-msg-label {
+  /* Hidden from the UI (kept in the DOM/template on purpose). Remove this one
+     line to bring the Customer / Agent / Note badges back. */
+  display: none;
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;

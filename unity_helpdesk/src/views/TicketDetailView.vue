@@ -460,9 +460,9 @@
                   >
                   <template v-else>Customer</template>
                 </span>
-                <span v-if="threadAuthor(item)" class="chat-msg-author"
-                  >· {{ threadAuthor(item) }}</span
-                >
+                <span v-if="threadAuthor(item)" class="chat-msg-author">{{
+                  threadAuthor(item)
+                }}</span>
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
