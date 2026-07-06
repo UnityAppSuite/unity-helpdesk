@@ -625,20 +625,39 @@ def _pick_program_enrollment(rows, current_year=None):
 		submitted = [row for row in pool if int(row.get("docstatus") or 0) == 1]
 		return (submitted[0] if submitted else pool[0]), bool(submitted)
 
-	# Prefer the current academic year when the student is enrolled this year
-	# (the normal current-student case). Alumni / Cancelled / not-yet-re-enrolled
-	# students have no current-year row, so fall back to their LATEST enrolment so
-	# the card reflects their actual most-recent academic year — not the global
-	# current year.
+	# Prefer the current academic year when the student has a NON-CANCELLED row this
+	# year (the normal current-student case). Alumni / left / cancelled / not-yet-
+	# re-enrolled students have no usable current-year row, so fall back to their
+	# LATEST academic year — a cancelled (docstatus=2) current-year row must NOT
+	# pin the card to the current year.
 	if current_year:
 		current_pool = [
-			row for row in sorted_rows if cstr(row.get("academic_year")) == cstr(current_year)
+			row
+			for row in sorted_rows
+			if cstr(row.get("academic_year")) == cstr(current_year)
+			and int(row.get("docstatus") or 0) != 2
 		]
 		if current_pool:
 			selected, has_submitted = _select(current_pool)
 			return selected, ([] if has_submitted else ["Current-year enrollment is not submitted yet"])
 
-	selected, _has_submitted = _select(sorted_rows)
+	# Fallback: the student's most-recent enrolled YEAR — cancelled or not (the
+	# Status column separately shows Alumni/Cancelled). Rank by latest academic year
+	# first, then a submitted row within that year, then most-recently modified. Using
+	# the latest YEAR (not the latest-modified row) means an older year re-saved
+	# recently can't win, and a student whose latest enrolment was cancelled still
+	# shows that latest year (e.g. a cancelled 2025-2026 shows 2025-2026, not an older
+	# 2024-2025).
+	selected = sorted(
+		sorted_rows,
+		key=lambda row: (
+			cstr(row.get("academic_year")),
+			int(row.get("docstatus") or 0) == 1,
+			get_datetime(row.get("modified")),
+			cstr(row.get("name")),
+		),
+		reverse=True,
+	)[0]
 	return selected, []
 
 

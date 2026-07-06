@@ -1994,6 +1994,8 @@ tbody tr.bulk-email-ticket:hover {
   font-weight: 600;
 }
 .student-id-link:hover { color: #3730a3; }
+/* The student's own academic year, shown next to their ref id. */
+.student-ay { color: var(--muted); margin-left: 4px; }
 
 .student-context-banner {
   display: flex;
