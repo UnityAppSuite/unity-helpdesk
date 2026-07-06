@@ -545,7 +545,7 @@ def _safe_render(text, context):
 
 def _students_by_email(emails):
     """Map lowercased email -> Student field dict for a batch of recipient emails
-    (matched on student_email_id OR user) in ONE query, so per-recipient merge
+    (matched on the Student's `user` email) in ONE query, so per-recipient merge
     context can include Student fields (walsh-admin style ``{**student, **row}``).
     Returns {} for sites without the education app; best-effort, never raises."""
     normalized = {e for e in (cstr(x or "").strip().lower() for x in (emails or [])) if e}
@@ -555,16 +555,13 @@ def _students_by_email(emails):
     try:
         rows = frappe.get_all(
             "Student",
-            or_filters={
-                "student_email_id": ["in", list(normalized)],
-                "user": ["in", list(normalized)],
-            },
+            filters={"user": ["in", list(normalized)]},
             fields=["*"],
         )
     except Exception:
         return {}
     for row in rows:
-        for key in ("student_email_id", "user"):
+        for key in ("user",):
             value = cstr(row.get(key) or "").strip().lower()
             if value in normalized and value not in out:
                 out[value] = row
@@ -663,16 +660,20 @@ def _school_bcc_emails(school):
 
 
 def _student_primary_email(student):
-    """The student's own deliverable email (student_email_id, else login user)."""
+    """The student's own deliverable email — the Student's `user` (login) email.
+
+    student_email_id is deliberately NOT used: it's frequently blank or points at a
+    stale/wrong address, whereas `user` is the authoritative student email.
+    """
     if not student:
         return ""
-    return cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
+    return cstr(student.get("user") or "").strip().lower()
 
 
 def _merge_context_for_email(email):
     """Best-effort merge context (Student field dict) for ONE recipient email — used
     to personalize {{first_name}} etc. on single-ticket / reply sends. Matches
-    Student.student_email_id / user. Returns {} for a guardian-only or external
+    Student.user. Returns {} for a guardian-only or external
     address, so unknown placeholders simply render blank (the "render blank, still
     send" rule)."""
     email = cstr(email or "").strip().lower()
@@ -1080,8 +1081,8 @@ def parse_bulk_email_csv(content):
     """Parse a bulk-email CSV (walsh-admin style): an `id` (Student.name) column +
     a `school` column.
 
-    Each id resolves a Student -> recipient (student_email_id, falling back to
-    `user`) and all student fields become merge context at send time. **Guardians
+    Each id resolves a Student -> recipient (the Student's `user` email) and all
+    student fields become merge context at send time. **Guardians
     are auto-included** — each guardian is added as a recipient that inherits its
     student's merge context (via a carried ``_student`` key). `school` enforces
     one-school-per-CSV and that every student belongs to it, and yields the school
@@ -1175,7 +1176,7 @@ def parse_bulk_email_csv(content):
         # that guardian in their own ticket (a global dedup would drop it from the
         # later sibling, the "only one guardian" bug).
         local_seen = set()
-        email = cstr(student.get("student_email_id") or student.get("user") or "").strip().lower()
+        email = cstr(student.get("user") or "").strip().lower()
         if email and validate_email_address(email, throw=False):
             local_seen.add(email)
             rows.append({"email": email, "name": display, "data": ctx})

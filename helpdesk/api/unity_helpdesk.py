@@ -1926,8 +1926,6 @@ def _family_terms_for_student_ids(student_ids, seed_terms=None):
 	# Pull each student's identifiers: id, ref, name, login + contact emails.
 	if _has_doctype("Student"):
 		student_fields = ["name", "first_name", "last_name", "reference_number", "user"]
-		if frappe.db.has_column("Student", "student_email_id"):
-			student_fields.append("student_email_id")
 		for row in frappe.get_all(
 			"Student",
 			fields=student_fields,
@@ -1945,10 +1943,9 @@ def _family_terms_for_student_ids(student_ids, seed_terms=None):
 			).strip()
 			if full_name:
 				terms["student_names"].add(full_name)
-			for email_field in ("user", "student_email_id"):
-				email_value = cstr(row.get(email_field) or "").strip().lower()
-				if email_value and "@" in email_value:
-					terms["emails"].add(email_value)
+			email_value = cstr(row.get("user") or "").strip().lower()
+			if email_value and "@" in email_value:
+				terms["emails"].add(email_value)
 
 	return terms
 
@@ -1975,16 +1972,13 @@ def _expand_email_to_family_search_terms(email):
 		guardian_ids.add(row.name)
 	student_ids = _student_ids_for_guardian_ids(guardian_ids)
 
-	# 2) email belongs to a student directly (Student.user / student_email_id) —
-	#    a student-raised ticket. Fan out to the SAME family so a student email
-	#    surfaces siblings + guardians, symmetric with the guardian path.
-	if _has_doctype("Student"):
-		for field in ("user", "student_email_id"):
-			if not frappe.db.has_column("Student", field):
-				continue
-			for row in frappe.get_all("Student", fields=["name"], filters={field: email}, page_length=0):
-				if row.name:
-					student_ids.add(row.name)
+	# 2) email belongs to a student directly (Student.user) — a student-raised
+	#    ticket. Fan out to the SAME family so a student email surfaces siblings +
+	#    guardians, symmetric with the guardian path.
+	if _has_doctype("Student") and frappe.db.has_column("Student", "user"):
+		for row in frappe.get_all("Student", fields=["name"], filters={"user": email}, page_length=0):
+			if row.name:
+				student_ids.add(row.name)
 
 	return _family_terms_for_student_ids(student_ids, seed_terms=terms)
 
@@ -2138,7 +2132,7 @@ def _family_candidate_names(terms, base_filters, match_recipients=False):
 	"""Resolve a family's tickets fast, safe and PRECISE.
 
 	Primary probe (always): a single index-backed raised_by probe — equality on
-	every family email (guardians + student logins + student_email_ids) plus an
+	every family email (guardians + student `user` logins) plus an
 	indexed prefix range on each student id (BFOA01 -> 'bfoa01@%'). All conditions
 	are on the one raised_by_unity_idx column, so MariaDB index-merges instead of
 	full-scanning. Statement-guarded.
@@ -4456,15 +4450,15 @@ def search_contacts(query):
 			results.append({"email": e, "name": name or e})
 
 	# Search Student by id / reference number / name / email — return the student's
-	# OWN email (student_email_id, fallback user) so the BCC picker resolves students
-	# by reference number or name, not only guardians/contacts. Listed first so a
+	# OWN email (the `user` login email) so the BCC picker resolves students by
+	# reference number or name, not only guardians/contacts. Listed first so a
 	# code/ref search surfaces the student.
 	if frappe.db.exists("DocType", "Student"):
 		try:
-			student_fields = ["name", "first_name", "last_name", "student_email_id", "user"]
+			student_fields = ["name", "first_name", "last_name", "user"]
 			optional = [f for f in ("student_name", "reference_number") if frappe.db.has_column("Student", f)]
 			student_or = [["name", "like", f"%{q}%"]]
-			for f in ("reference_number", "student_name", "first_name", "last_name", "student_email_id"):
+			for f in ("reference_number", "student_name", "first_name", "last_name", "user"):
 				if frappe.db.has_column("Student", f):
 					student_or.append([f, "like", f"%{q}%"])
 			for s in frappe.get_all(
@@ -4476,7 +4470,7 @@ def search_contacts(query):
 				display = " ".join(
 					p for p in (cstr(s.get("first_name")), cstr(s.get("last_name"))) if p.strip()
 				).strip() or cstr(s.get("student_name") or "").strip() or cstr(s.get("name"))
-				_add(s.get("student_email_id") or s.get("user"), display)
+				_add(s.get("user"), display)
 		except Exception:
 			pass
 
@@ -4599,7 +4593,7 @@ def get_student_guardian_emails(student_emails):
 	"""Look up guardian emails for a list of student emails.
 
 	Used by the bulk-email composer to auto-populate BCC with each student's
-	guardian emails when a recipient matches a Student.student_email_id.
+	guardian emails when a recipient matches a Student's `user` email.
 
 	Response shape (changed from a bare {email: [guardians]} dict):
 
@@ -4607,14 +4601,14 @@ def get_student_guardian_emails(student_emails):
 	      "mapping": {student_email: [guardian_email, ...], ...},
 	      "diagnostic": {
 	        "input_count":            <int>,
-	        "students_matched":       <int>,  # rows where student_email_id matched
+	        "students_matched":       <int>,  # rows where the student `user` email matched
 	        "students_with_guardians": <int>, # students that yielded guardian emails
 	        "unmatched_emails":       [...],  # input emails with no Student record
 	      },
 	    }
 
 	The diagnostic block lets the SPA surface a non-blocking warning when
-	the auto-fill silently produces nothing (e.g. wrong student_email_id
+	the auto-fill silently produces nothing (e.g. wrong/blank `user`
 	on the env, missing Student Guardian rows). Previously the empty
 	result was indistinguishable from "no guardians on file" and
 	swallowed silently in App.vue:996.
@@ -4658,33 +4652,21 @@ def get_student_guardian_emails(student_emails):
 	if not normalized:
 		return _empty()
 
-	# Match each input email against BOTH Student.student_email_id and
-	# Student.user — some sites store the contactable address on `user`.
+	# Match each input email against the Student's `user` email — the authoritative
+	# student address. student_email_id is deliberately NOT used (often blank/stale).
 	students = frappe.get_all(
 		"Student",
-		fields=["name", "student_email_id", "user"],
-		or_filters={
-			"student_email_id": ["in", normalized],
-			"user": ["in", normalized],
-		},
+		fields=["name", "user"],
+		filters={"user": ["in", normalized]},
 		page_length=len(normalized) + 1,
 	)
 	if not students:
 		return _empty()
 
-	normalized_set = set(normalized)
 	email_by_student_id = {}
 	for s in students:
-		email_id = cstr(s.student_email_id or "").strip().lower()
 		user_id = cstr(s.user or "").strip().lower()
-		# Key on whichever field actually matched one of the input emails.
-		if email_id in normalized_set:
-			email_by_student_id[s.name] = email_id
-		elif user_id in normalized_set:
-			email_by_student_id[s.name] = user_id
-		elif email_id:
-			email_by_student_id[s.name] = email_id
-		else:
+		if user_id:
 			email_by_student_id[s.name] = user_id
 	matched_emails = set(email_by_student_id.values())
 	unmatched_emails = [e for e in normalized if e not in matched_emails]
@@ -4712,8 +4694,8 @@ def resolve_bulk_email_students(refs):
 	"""Resolve reference numbers / student ids / emails to per-student bulk-email
 	groups for the composer's "reference number" mode.
 
-	For each input matching a Student (by name, reference_number, student_email_id
-	or user) returns the student's deliverable email, that student's guardian
+	For each input matching a Student (by name, reference_number or user)
+	returns the student's deliverable email, that student's guardian
 	emails, and a merge ``data`` dict (common Student fields). The composer builds
 	one ticket + one email per student (student + guardians when the
 	Include-guardians toggle is on). Unresolvable inputs come back in ``unmatched``;
@@ -4746,11 +4728,10 @@ def resolve_bulk_email_students(refs):
 	lowered = [t.lower() for t in tokens]
 	meta = frappe.get_meta("Student")
 	has_ref = meta.has_field("reference_number")
-	has_email_id = meta.has_field("student_email_id")
 	has_user = meta.has_field("user")
 
 	fetch_fields = ["name", "student_name", "first_name", "middle_name", "last_name"]
-	for field in ("student_email_id", "user", "reference_number", "school"):
+	for field in ("user", "reference_number", "school"):
 		if meta.has_field(field):
 			fetch_fields.append(field)
 	fetch_fields = list(dict.fromkeys(fetch_fields))
@@ -4758,8 +4739,6 @@ def resolve_bulk_email_students(refs):
 	or_filters = {"name": ["in", tokens]}
 	if has_ref:
 		or_filters["reference_number"] = ["in", tokens]
-	if has_email_id:
-		or_filters["student_email_id"] = ["in", lowered]
 	if has_user:
 		or_filters["user"] = ["in", lowered]
 
@@ -4780,10 +4759,9 @@ def resolve_bulk_email_students(refs):
 		ref = cstr(row.get("reference_number") or "").strip().lower()
 		if ref:
 			by_ref.setdefault(ref, row)
-		for field in ("student_email_id", "user"):
-			value = cstr(row.get(field) or "").strip().lower()
-			if value:
-				by_email.setdefault(value, row)
+		value = cstr(row.get("user") or "").strip().lower()
+		if value:
+			by_email.setdefault(value, row)
 
 	resolved = {}
 	order = []
@@ -4805,7 +4783,7 @@ def resolve_bulk_email_students(refs):
 	no_email = []
 	for sid in order:
 		row = resolved[sid]
-		email = cstr(row.get("student_email_id") or row.get("user") or "").strip().lower()
+		email = cstr(row.get("user") or "").strip().lower()
 		data = {
 			"first_name": cstr(row.get("first_name") or ""),
 			"middle_name": cstr(row.get("middle_name") or ""),

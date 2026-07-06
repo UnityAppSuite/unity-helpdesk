@@ -347,8 +347,8 @@ def diagnose_guardian_lookup(emails):
 
 	# Step 2: required fields exist on each doctype?
 	_step(
-		"field::Student.student_email_id",
-		present=_has_field("Student", "student_email_id") if frappe.db.exists("DocType", "Student") else False,
+		"field::Student.user",
+		present=_has_field("Student", "user") if frappe.db.exists("DocType", "Student") else False,
 	)
 	_step(
 		"field::Guardian.email_address",
@@ -359,30 +359,19 @@ def diagnose_guardian_lookup(emails):
 		_step("input_empty", note="No emails passed; aborting further checks")
 		return report
 
-	# Step 3: Student lookup by student_email_id OR user (dual-field match).
+	# Step 3: Student lookup by the `user` email (the authoritative student address).
 	try:
 		students = frappe.get_all(
 			"Student",
-			fields=["name", "student_email_id", "user"],
-			or_filters={
-				"student_email_id": ["in", normalized],
-				"user": ["in", normalized],
-			},
+			fields=["name", "user"],
+			filters={"user": ["in", normalized]},
 			page_length=200,
 		)
 	except Exception as exc:
 		_step("student_lookup_error", error=str(exc))
 		return report
-	_normalized_set = set(normalized)
 	for s in students:
-		_email_id = (s.student_email_id or "").strip().lower()
-		_user_id = (s.user or "").strip().lower()
-		if _email_id in _normalized_set:
-			s["matched_email"] = _email_id
-		elif _user_id in _normalized_set:
-			s["matched_email"] = _user_id
-		else:
-			s["matched_email"] = _email_id or _user_id
+		s["matched_email"] = (s.user or "").strip().lower()
 	_step(
 		"student_lookup",
 		input_count=len(normalized),
@@ -394,7 +383,7 @@ def diagnose_guardian_lookup(emails):
 		_step(
 			"no_students_matched",
 			note=(
-				"None of the input emails are listed as `student_email_id` on a Student record. "
+				"None of the input emails are listed as `user` on a Student record. "
 				"Confirm the Student records on this site actually have those emails populated."
 			),
 		)
