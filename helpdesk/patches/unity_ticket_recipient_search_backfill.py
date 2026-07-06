@@ -63,6 +63,7 @@ def run_recipient_search_backfill(limit=None):
 
 	remaining = int(limit) if limit else None
 	processed = 0
+	prev_batch_names = None
 	while remaining is None or remaining > 0:
 		page = _BATCH if remaining is None else min(_BATCH, remaining)
 		# Re-query each batch: once a ticket's recipient field is written (to emails
@@ -76,6 +77,19 @@ def run_recipient_search_backfill(limit=None):
 		)
 		if not batch:
 			break
+		batch_names = [row.name for row in batch]
+		# Safety net: a full batch that repeats unchanged means none of these rows
+		# cleared (e.g. a ticket whose update_ticket_message_search_index persistently
+		# raises below) — the IS NULL head would then loop forever. Break + log once
+		# instead of pinning the worker and flooding the Error Log.
+		if batch_names == prev_batch_names:
+			frappe.log_error(
+				f"recipient-search-backfill stalled on {len(batch_names)} unpopulated "
+				f"ticket(s) (e.g. {batch_names[:5]}); aborting to avoid an infinite loop",
+				"unity_ticket_recipient_search_backfill",
+			)
+			break
+		prev_batch_names = batch_names
 		for row in batch:
 			try:
 				# Rebuilds body + recipients in one thread fetch (idempotent).

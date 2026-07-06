@@ -1159,10 +1159,33 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 
 
 def populate_ticket_student_search_fields(ticket):
-	ticket_doc = frappe.get_doc(TICKET_DOCTYPE, ticket) if isinstance(ticket, str) else ticket
+	# `ticket` may be an HD Ticket doc, or a name passed as a str OR an int. HD
+	# Ticket names are numeric, so `frappe.get_all(...).name` comes back as an int
+	# (the student-search backfill passes it straight in). Treat any non-doc value
+	# as a name to fetch, so an int name doesn't crash on `.get()` below.
+	if isinstance(ticket, (str, int)):
+		ticket_doc = frappe.get_doc(TICKET_DOCTYPE, cstr(ticket))
+	else:
+		ticket_doc = ticket
 	if not ticket_doc or not cstr(ticket_doc.get("raised_by")).strip():
 		ticket_name = cstr(ticket_doc.name if ticket_doc else ticket).strip()
 		if ticket_name:
+			# Stamp the student-search fields empty (non-NULL) so a ticket with no
+			# raised_by is marked PROCESSED and drops out of the backfill's IS NULL
+			# pending set instead of being re-queried forever.
+			blank_update = {
+				field: ""
+				for field in (
+					"custom_search_student_names",
+					"custom_search_student_refs",
+					"custom_search_guardian_emails",
+				)
+				if frappe.db.has_column(TICKET_DOCTYPE, field)
+			}
+			if blank_update:
+				frappe.db.set_value(
+					TICKET_DOCTYPE, ticket_name, blank_update, update_modified=False
+				)
 			update_ticket_message_search_index(ticket_name, ticket_doc=ticket_doc)
 		return {}
 

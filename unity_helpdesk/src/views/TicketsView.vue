@@ -622,7 +622,8 @@
                 'bulk-email-ticket': ticket.custom_is_bulk_email,
                 'row-selected': isSelected(ticket.name),
               }"
-              @click="openTicket(ticket.name)"
+              @click="openTicket(ticket.name, $event)"
+              @auxclick.middle="openTicket(ticket.name, $event)"
             >
               <td class="checkbox-cell" @click.stop>
                 <input
@@ -646,7 +647,8 @@
                   <button
                     class="link-btn"
                     type="button"
-                    @click.stop="openTicket(ticket.name)"
+                    @click.stop="openTicket(ticket.name, $event)"
+                    @auxclick.middle.stop="openTicket(ticket.name, $event)"
                   >
                     #{{ ticket.name }}
                   </button>
@@ -863,7 +865,8 @@
               'bulk-email-ticket': ticket.custom_is_bulk_email,
               'row-selected': isSelected(ticket.name),
             }"
-            @click="openTicket(ticket.name)"
+            @click="openTicket(ticket.name, $event)"
+            @auxclick.middle="openTicket(ticket.name, $event)"
           >
             <div class="ticket-card-top">
               <label class="ticket-card-check" @click.stop>
@@ -1226,16 +1229,46 @@ function onColDragOver(e, idx) {
   colDragIdx.value = idx;
 }
 
-async function onColDragEnd() {
-  colDragIdx.value = null;
-  await persistColumnPrefs(unitySession?.settings?.column_preferences || []);
+// Column reorder / add / remove is purely visual for data that's already loaded —
+// only a column whose field wasn't in the last fetch actually needs a refetch.
+// So apply the change locally (instant) and save prefs in the background, and skip
+// the full ticket-list reload unless the new column genuinely needs data. This
+// keeps column tweaks snappy instead of round-tripping the whole list every time.
+function setColumnPrefsLocal(prefs) {
+  if (unitySession) unitySession.settings.column_preferences = prefs;
 }
 
-async function removeColumn(key) {
+function persistColumnPrefsQuiet(prefs) {
+  // Fire-and-forget save; the table already reflects `prefs` locally.
+  call("helpdesk.api.unity_helpdesk.update_column_preferences", {
+    column_preferences: JSON.stringify(prefs),
+  }).catch((err) => {
+    error.value = err.message;
+  });
+}
+
+function columnNeedsFetch(def) {
+  // Virtual columns are composed client-side from already-fetched fields.
+  if (!def || def.virtual) return false;
+  const rows = tickets.value;
+  if (!rows.length) return false; // nothing rendered yet — nothing to backfill
+  // If the field key is absent from the loaded rows, the backend didn't SELECT it
+  // for the current column set, so one reload is needed to fetch it.
+  return !(def.key in rows[0]);
+}
+
+async function onColDragEnd() {
+  colDragIdx.value = null;
+  // Reorder never changes which data is needed — persist quietly, no reload.
+  persistColumnPrefsQuiet(unitySession?.settings?.column_preferences || []);
+}
+
+function removeColumn(key) {
   const prefs = (unitySession?.settings?.column_preferences || []).filter(
     (p) => p.key !== key
   );
-  await persistColumnPrefs(prefs);
+  setColumnPrefsLocal(prefs);
+  persistColumnPrefsQuiet(prefs); // removing a column never needs new data
 }
 
 async function addColumn(key) {
@@ -1246,7 +1279,13 @@ async function addColumn(key) {
     { key, width: def.width || 140 },
   ];
   showAddCol.value = false;
-  await persistColumnPrefs(prefs);
+  setColumnPrefsLocal(prefs); // column shows instantly using already-loaded data
+  if (columnNeedsFetch(def)) {
+    // Only the few extra-field columns (SLA dates, mail body) hit this.
+    await persistColumnPrefs(prefs);
+  } else {
+    persistColumnPrefsQuiet(prefs);
+  }
 }
 
 // Close add-column dropdown on outside click
@@ -2270,8 +2309,24 @@ function formatHoldWindow(ticket) {
   return formatDate(ticket.custom_hold_from || ticket.custom_hold_to);
 }
 
-function openTicket(name) {
-  // Store current list for prev/next navigation in ticket detail
+function openTicket(name, event) {
+  const target = {
+    path: `/tickets/${name}`,
+    query: {
+      ...routeQueryFromState(),
+      list_view: props.view,
+    },
+  };
+  // Ctrl / Cmd / middle-click (or Shift) → open in a new browser tab, like a real
+  // link. `event.button === 1` covers middle-click via @auxclick.middle.
+  if (
+    event &&
+    (event.metaKey || event.ctrlKey || event.shiftKey || event.button === 1)
+  ) {
+    window.open(router.resolve(target).href, "_blank", "noopener");
+    return;
+  }
+  // Plain click → same-tab SPA navigation. Store the current list for prev/next.
   sessionStorage.setItem(
     "unity:ticket_nav",
     JSON.stringify({
@@ -2279,13 +2334,7 @@ function openTicket(name) {
       view: props.view,
     })
   );
-  router.push({
-    path: `/tickets/${name}`,
-    query: {
-      ...routeQueryFromState(),
-      list_view: props.view,
-    },
-  });
+  router.push(target);
 }
 
 function assignmentClass(assignee) {

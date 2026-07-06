@@ -163,30 +163,31 @@ def _ensure_raised_by_index():
 def _backfill_is_complete():
 	"""Short-circuit when there's nothing left to backfill. Cheap COUNT only.
 
-	Use the Frappe "is / not set" operator so the count catches both NULL
-	(field newly added) and empty-string (explicit "" sentinel) rows. A plain
-	`["in", ["", None]]` filter misses NULLs because `column IN (NULL)` never
-	matches in SQL.
+	Completeness is tracked with a raw `IS NULL` count, NOT Frappe's "is / not
+	set" (which also matches ''): a ticket that legitimately resolves to no
+	students — or has no raised_by — is stored as the empty-string sentinel ""
+	(non-NULL), so IS NULL distinguishes "never processed" from "processed, none"
+	and the sweep terminates instead of staying forever-incomplete and
+	re-enqueuing on every migrate. Mirrors unity_ticket_recipient_search_backfill.
 	"""
-	total = frappe.db.count("HD Ticket")
-	if total == 0:
+	if not frappe.db.has_column("HD Ticket", "custom_search_student_names"):
 		return True
-	pending = frappe.db.count(
-		"HD Ticket",
-		filters=[["custom_search_student_names", "is", "not set"]],
-	)
-	return pending == 0
+	pending = frappe.db.sql(
+		"SELECT COUNT(*) FROM `tabHD Ticket` WHERE `custom_search_student_names` IS NULL"
+	)[0][0]
+	return not pending
 
 
-def run_student_search_backfill():
+def run_student_search_backfill(limit=None):
 	"""Background job: populate custom_search_student_* fields for tickets that
 	don't have them yet. Idempotent — re-running on a fully-populated DB is a
-	single COUNT(*) and then a return.
+	single COUNT(*) and then a return. ``limit`` (optional) caps the number of
+	tickets processed this run — useful for a bounded smoke test or an off-peak
+	chunk; omit to drain everything.
 
-	Refactored to fetch in paginated batches instead of loading every pending
-	ticket into memory at once (the old `page_length=0` query loaded ~90K
-	rows on UAT). Each batch commits + sleeps briefly so foreground SPA
-	requests stay responsive while the sweep is running.
+	Fetches in paginated batches (the old `page_length=0` query loaded ~90K rows
+	on UAT). Each batch commits + sleeps briefly so foreground SPA requests stay
+	responsive while the sweep is running.
 	"""
 	if _backfill_is_complete():
 		frappe.logger().info(
@@ -202,20 +203,36 @@ def run_student_search_backfill():
 	if not frappe.db.has_column("HD Ticket", "custom_search_student_names"):
 		return
 
-	while True:
-		# Re-query each batch so as soon as the field is populated, the row
-		# drops out of the "pending" set — limit_start always points at the
-		# next pending head. Avoids needing to track offsets manually and
-		# survives concurrent runtime writes.
-		batch = frappe.get_all(
-			"HD Ticket",
-			filters=[["HD Ticket", "custom_search_student_names", "is", "not set"]],
-			fields=["name", "raised_by"],
-			order_by="modified desc",
-			page_length=_BATCH,
+	remaining = int(limit) if limit else None
+	prev_batch_names = None
+	while remaining is None or remaining > 0:
+		page = _BATCH if remaining is None else min(_BATCH, remaining)
+		# Re-query the pending head each batch (rows never processed = IS NULL). A
+		# processed ticket that resolves to no students — or has no raised_by — is
+		# written "" (non-NULL) by the callee and drops out here, so the sweep
+		# terminates. Raw IS NULL (not Frappe "is not set", which also matches "").
+		batch = frappe.db.sql(
+			"""SELECT name FROM `tabHD Ticket`
+			   WHERE `custom_search_student_names` IS NULL
+			   ORDER BY modified DESC LIMIT %s""",
+			(page,),
+			as_dict=True,
 		)
 		if not batch:
 			break
+		batch_names = [t.name for t in batch]
+		# Safety net: if a full batch makes NO progress (every row still pending
+		# after we processed it — e.g. a row that always raises), the re-query
+		# returns the same head forever. Break instead of looping + flooding the
+		# Error Log. One diagnostic log so the stall stays visible.
+		if batch_names == prev_batch_names:
+			frappe.log_error(
+				f"student-search-backfill stalled on {len(batch_names)} unpopulated "
+				f"ticket(s) (e.g. {batch_names[:5]}); aborting to avoid an infinite loop",
+				"unity_helpdesk_student_search_fields backfill",
+			)
+			break
+		prev_batch_names = batch_names
 		for t in batch:
 			try:
 				populate_ticket_student_search_fields(t.name)
@@ -225,6 +242,8 @@ def run_student_search_backfill():
 					"unity_helpdesk_student_search_fields backfill",
 				)
 		frappe.db.commit()
-		if len(batch) < _BATCH:
+		if remaining is not None:
+			remaining -= len(batch)
+		if len(batch) < page:
 			break
 		time.sleep(_BATCH_SLEEP_SEC)
