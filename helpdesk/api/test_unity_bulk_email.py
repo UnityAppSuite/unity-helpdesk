@@ -350,7 +350,7 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 		).insert(ignore_permissions=True)
 		cls._guardians.append(g_no_email.name)
 
-		# Students. Each student email is unique (Student.student_email_id is unique).
+		# Students. Unity Helpdesk resolves a student's email from Student.user.
 		cls._students = []
 
 		def _make_student(local, guardian_names):
@@ -361,10 +361,13 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 				{
 					"doctype": "Student",
 					"first_name": f"{cls._PREFIX}-{local}",
-					"student_email_id": email,
 					"guardians": [{"guardian": gn} for gn in guardian_names],
 				}
 			).insert(ignore_permissions=True)
+			# Unity Helpdesk matches/sends by Student.user (a Link→User). Set the
+			# column directly: get_all queries the column, no real User row needed,
+			# and this bypasses Link validation on insert.
+			frappe.db.set_value("Student", doc.name, "user", email, update_modified=False)
 			cls._students.append((doc.name, email))
 			return doc.name, email
 
@@ -399,12 +402,12 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 
 	def test_no_match_returns_empty(self):
 		result = get_student_guardian_emails(json.dumps(["nobody.exists@nowhere.test"]))
-		self.assertEqual(result, {})
+		self.assertEqual(result["mapping"], {})
 
 	def test_single_student_returns_guardian_emails(self):
 		result = get_student_guardian_emails(json.dumps([self._student_a_email]))
-		self.assertIn(self._student_a_email, result)
-		emails = set(result[self._student_a_email])
+		self.assertIn(self._student_a_email, result["mapping"])
+		emails = set(result["mapping"][self._student_a_email])
 		self.assertEqual(
 			emails,
 			{
@@ -418,14 +421,14 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 			json.dumps([self._student_a_email, self._student_b_email])
 		)
 		self.assertEqual(
-			set(result[self._student_a_email]),
+			set(result["mapping"][self._student_a_email]),
 			{
 				f"g1.{self._PREFIX.lower()}@x.in",
 				f"g2.{self._PREFIX.lower()}@x.in",
 			},
 		)
 		self.assertEqual(
-			set(result[self._student_b_email]),
+			set(result["mapping"][self._student_b_email]),
 			{f"g1.{self._PREFIX.lower()}@x.in"},
 		)
 
@@ -435,13 +438,13 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 			json.dumps([self._student_a_email, self._student_b_email])
 		)
 		shared = f"g1.{self._PREFIX.lower()}@x.in"
-		self.assertIn(shared, result[self._student_a_email])
-		self.assertIn(shared, result[self._student_b_email])
+		self.assertIn(shared, result["mapping"][self._student_a_email])
+		self.assertIn(shared, result["mapping"][self._student_b_email])
 
 	def test_guardian_without_email_skipped(self):
 		# Student C has only a guardian with no email_address → omitted entirely.
 		result = get_student_guardian_emails(json.dumps([self._student_c_email]))
-		self.assertNotIn(self._student_c_email, result)
+		self.assertNotIn(self._student_c_email, result["mapping"])
 
 	def test_mixed_valid_invalid_input_silently_skips(self):
 		# Invalid emails are dropped at normalization; valid match still resolves.
@@ -449,16 +452,16 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 			json.dumps(["not-an-email", "  ", self._student_b_email, ""])
 		)
 		self.assertEqual(
-			set(result[self._student_b_email]),
+			set(result["mapping"][self._student_b_email]),
 			{f"g1.{self._PREFIX.lower()}@x.in"},
 		)
-		self.assertEqual(len(result), 1)
+		self.assertEqual(len(result["mapping"]), 1)
 
 	def test_mixed_guardians_filter_empty_email(self):
 		# Student D has one no-email guardian + one with email. Only the real one returns.
 		result = get_student_guardian_emails(json.dumps([self._student_d_email]))
 		self.assertEqual(
-			set(result[self._student_d_email]),
+			set(result["mapping"][self._student_d_email]),
 			{f"shared.{self._PREFIX.lower()}@x.in"},
 		)
 
@@ -472,7 +475,7 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 		result = get_student_guardian_emails(
 			json.dumps([self._student_a_email, self._student_a_email.upper()])
 		)
-		self.assertEqual(len(result), 1)
+		self.assertEqual(len(result["mapping"]), 1)
 
 	def test_permission_required(self):
 		original = frappe.session.user

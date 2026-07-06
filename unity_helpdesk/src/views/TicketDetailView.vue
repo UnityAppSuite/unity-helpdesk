@@ -123,9 +123,6 @@
               :class="studentContextBannerClass(studentContext)"
             >
               <strong>{{ studentContextBanner(studentContext) }}</strong>
-              <span v-if="studentContext.current_academic_year">
-                Academic Year: {{ studentContext.current_academic_year }}
-              </span>
               <p v-if="studentContext.message">{{ studentContext.message }}</p>
             </div>
 
@@ -147,6 +144,9 @@
                             rel="noopener noreferrer"
                             class="student-id-link"
                             >{{ student.id }}</a
+                          >
+                          <span v-if="student.academicYear" class="student-ay"
+                            >- {{ student.academicYear }}</span
                           >
                         </small>
                         <span v-if="student.role" class="student-context-pill">
@@ -885,6 +885,11 @@ const structuredStudentColumns = computed(() =>
     id: student.student_id || `Student ${index + 1}`,
     name: student.student_name || student.student_id || `Student ${index + 1}`,
     role: studentRoleLabel(student),
+    // The student's OWN academic year (current year for active students, else
+    // their latest enrolled year for Alumni/left/Cancelled) — shown next to the
+    // ref so a mixed sibling family isn't all labelled the global current year.
+    academicYear:
+      student.academic_year || student.enrollment?.academic_year || "",
   }))
 );
 const structuredStudentRows = computed(() => {
