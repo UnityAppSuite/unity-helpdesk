@@ -3186,6 +3186,46 @@ body.col-resizing .ticket-table * {
   font-size: 11.5px;
 }
 
+/* ── Optional "send a test copy first" step ──────────────────────────────── */
+
+.test-mail-step {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--accent-light);
+}
+
+.test-mail-toggle {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.test-mail-toggle input {
+  width: auto;
+  margin: 0;
+}
+
+.test-mail-body {
+  margin-top: 10px;
+}
+
+.test-mail-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.test-mail-hint.success {
+  color: var(--success);
+  font-weight: 600;
+}
+
 @media (max-width: 980px) {
   body {
     overflow: auto;
