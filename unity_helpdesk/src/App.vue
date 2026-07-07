@@ -277,10 +277,74 @@
               </div>
             </div>
           </label>
+
+          <!-- Optional: send a test copy first, then verify before the real send -->
+          <div class="test-mail-step">
+            <label class="test-mail-toggle">
+              <input v-model="composer.testEnabled" type="checkbox" />
+              Send a test copy first
+            </label>
+            <div v-if="composer.testEnabled" class="test-mail-body">
+              <div class="input-with-action">
+                <input
+                  v-model="composer.testEmail"
+                  type="text"
+                  placeholder="you@example.com, colleague@example.com"
+                  autocomplete="off"
+                  @input="onCreateTestEmailInput"
+                  @focus="onCreateTestEmailInput"
+                />
+                <button
+                  type="button"
+                  class="btn secondary input-action-btn"
+                  :disabled="composerTestSending"
+                  @click="sendCreateTestEmail"
+                >
+                  {{ composerTestSending ? "Sending…" : "Send Test" }}
+                </button>
+              </div>
+              <ul
+                v-if="composerTestSuggestions.length"
+                class="user-suggestions"
+              >
+                <li
+                  v-for="u in composerTestSuggestions"
+                  :key="u.name"
+                  @mousedown.prevent="selectCreateTestUser(u)"
+                >
+                  <span
+                    class="avatar"
+                    style="width: 20px; height: 20px; font-size: 9px"
+                  >
+                    {{ initials(u.full_name || u.name) }}
+                  </span>
+                  <span>{{ u.full_name || u.name }}</span>
+                  <small>{{ u.email || u.name }}</small>
+                </li>
+              </ul>
+              <p v-if="composer.testSent" class="muted test-mail-hint success">
+                ✓ Test sent to
+                {{ splitTestEmails(composer.testEmail).join(", ") }} — verify
+                it, then Create &amp; Send. Editing the email re-requires a
+                test.
+              </p>
+              <p v-else class="muted test-mail-hint">
+                Sends a copy (rendered like the customer's email) to the
+                address(es) above — separate multiple with commas. Verify it,
+                then the Create &amp; Send button unlocks.
+              </p>
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn secondary" @click="closeComposer">Cancel</button>
-          <button class="btn" :disabled="composerSaving" @click="createTicket">
+          <button
+            class="btn"
+            :disabled="
+              composerSaving || (composer.testEnabled && !composer.testSent)
+            "
+            @click="createTicket"
+          >
             {{ composerSaving ? "Sending..." : "Create & Send Email" }}
           </button>
         </div>
@@ -623,12 +687,71 @@
               </div>
             </div>
           </label>
+
+          <!-- Optional: send a test copy first, then verify before the real send -->
+          <div class="test-mail-step">
+            <label class="test-mail-toggle">
+              <input v-model="bulkEmail.testEnabled" type="checkbox" />
+              Send a test copy first
+            </label>
+            <div v-if="bulkEmail.testEnabled" class="test-mail-body">
+              <div class="input-with-action">
+                <input
+                  v-model="bulkEmail.testEmail"
+                  type="text"
+                  placeholder="you@example.com, colleague@example.com"
+                  autocomplete="off"
+                  @input="onBulkTestEmailInput"
+                  @focus="onBulkTestEmailInput"
+                />
+                <button
+                  type="button"
+                  class="btn secondary input-action-btn"
+                  :disabled="bulkTestSending"
+                  @click="sendBulkTestEmail"
+                >
+                  {{ bulkTestSending ? "Sending…" : "Send Test" }}
+                </button>
+              </div>
+              <ul v-if="bulkTestSuggestions.length" class="user-suggestions">
+                <li
+                  v-for="u in bulkTestSuggestions"
+                  :key="u.name"
+                  @mousedown.prevent="selectBulkTestUser(u)"
+                >
+                  <span
+                    class="avatar"
+                    style="width: 20px; height: 20px; font-size: 9px"
+                  >
+                    {{ initials(u.full_name || u.name) }}
+                  </span>
+                  <span>{{ u.full_name || u.name }}</span>
+                  <small>{{ u.email || u.name }}</small>
+                </li>
+              </ul>
+              <p v-if="bulkEmail.testSent" class="muted test-mail-hint success">
+                ✓ Test sent to
+                {{ splitTestEmails(bulkEmail.testEmail).join(", ") }} — verify
+                it, then Send to all. Editing the email or recipients
+                re-requires a test.
+              </p>
+              <p v-else class="muted test-mail-hint">
+                Sends a copy (rendered like the first recipient's email) to the
+                address(es) above — separate multiple with commas. Verify it,
+                then the Send button unlocks.
+              </p>
+            </div>
+          </div>
         </div>
         <div class="modal-footer">
           <button class="btn secondary" @click="closeBulkEmail">Cancel</button>
           <button
             class="btn"
-            :disabled="bulkEmailSending || !bulkEmailStudentCount"
+            :disabled="
+              bulkEmailSending ||
+              !bulkEmailStudentCount ||
+              (bulkEmail.testEnabled && !bulkEmail.testSent)
+            "
             @click="sendBulkEmail"
           >
             {{
@@ -702,7 +825,16 @@ const composer = reactive({
   ticket_type: "",
   assignee: "",
   attachments: [],
+  // Optional "send a test copy first" step (manual preview → verify → unlock send).
+  testEnabled: false,
+  testEmail: "",
+  testSent: false,
 });
+// Test-mail step (create composer): its own typeahead list + in-flight flag, so it
+// never collides with the raised_by (customer email) typeahead above.
+const composerTestSending = ref(false);
+const composerTestSuggestions = ref([]);
+let composerTestSuggestTimeout = null;
 
 // --- Bulk email state ---
 const openBulkEmail = ref(false);
@@ -728,7 +860,15 @@ const bulkEmail = reactive({
   attachments: [],
   mergeFields: [], // student fields usable as {{field}}
   csvImported: false,
+  // Optional "send a test copy first" step (manual preview → verify → unlock send).
+  testEnabled: false,
+  testEmail: "",
+  testSent: false,
 });
+// Test-mail step (bulk composer): its own typeahead list + in-flight flag.
+const bulkTestSending = ref(false);
+const bulkTestSuggestions = ref([]);
+let bulkTestSuggestTimeout = null;
 const includeGuardians = ref(false);
 // Recipient toggles (both modes): exclude the student's own email (send to
 // guardians only). includeGuardians defaults on in CSV mode (see setBulkMode).
@@ -896,6 +1036,11 @@ function closeComposer() {
   composer.ticket_type = "";
   composer.assignee = "";
   composer.attachments = [];
+  composer.testEnabled = false;
+  composer.testEmail = "";
+  composer.testSent = false;
+  composerTestSuggestions.value = [];
+  composerTestSending.value = false;
 }
 
 function applyTemplateSubjectToComposer(subject) {
@@ -976,6 +1121,78 @@ function selectUser(user) {
   userSuggestions.value = [];
 }
 
+// --- Create-composer test-mail step ---
+function onCreateTestEmailInput() {
+  clearTimeout(composerTestSuggestTimeout);
+  const query = lastEmailToken(composer.testEmail);
+  if (!query || query.length < 2) {
+    composerTestSuggestions.value = [];
+    return;
+  }
+  composerTestSuggestTimeout = setTimeout(async () => {
+    try {
+      composerTestSuggestions.value = await searchUsers(query);
+    } catch {
+      composerTestSuggestions.value = [];
+    }
+  }, 300);
+}
+
+function selectCreateTestUser(user) {
+  composer.testEmail = appendPickedEmail(
+    composer.testEmail,
+    user.email || user.name
+  );
+  composerTestSuggestions.value = [];
+}
+
+// Send ONE test copy of the create-ticket email (rendered like the customer's own
+// email, via raised_by) to one or more verifiers — no ticket is created. Unlocks
+// the real "Create & Send".
+async function sendCreateTestEmail() {
+  composerError.value = "";
+  if (!composer.subject || !composer.subject.trim()) {
+    composerError.value = "Subject is required before sending a test.";
+    return;
+  }
+  if (!composer.message || !composer.message.trim()) {
+    composerError.value = "Message is required before sending a test.";
+    return;
+  }
+  const testEmails = splitTestEmails(composer.testEmail);
+  if (!testEmails.length || !testEmails.every((e) => EMAIL_REGEX.test(e))) {
+    composerError.value =
+      "Enter one or more valid email addresses (comma-separated) for the test copy.";
+    return;
+  }
+  composerTestSending.value = true;
+  composerTestSuggestions.value = [];
+  try {
+    await call("helpdesk.api.unity_helpdesk_ext.send_test_email", {
+      subject: composer.subject,
+      message: composer.message,
+      test_email: testEmails.join(", "),
+      ticket_type: composer.ticket_type,
+      raised_by: composer.raised_by,
+      attachments: JSON.stringify(
+        composer.attachments.map((attachment) => attachment.name)
+      ),
+    });
+    composer.testSent = true;
+    showGlobalNotice(
+      `Test sent to ${testEmails.join(
+        ", "
+      )} — check the inbox, then Create & Send.`,
+      "success",
+      8000
+    );
+  } catch (err) {
+    composerError.value = "Test send failed: " + (err?.message || err);
+  } finally {
+    composerTestSending.value = false;
+  }
+}
+
 async function handleComposerAttachments(event) {
   const files = Array.from(event.target.files || []);
   if (!files.length) return;
@@ -1053,6 +1270,40 @@ async function createTicket() {
 
 // --- Bulk email ---
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+// --- Shared helpers for the "send a test copy first" step (multiple verifiers) ---
+// Split a comma/semicolon/whitespace-separated string into trimmed, lowercased,
+// deduped emails.
+function splitTestEmails(str) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of (str || "").split(/[\s,;]+/)) {
+    const e = raw.trim().toLowerCase();
+    if (e && !seen.has(e)) {
+      seen.add(e);
+      out.push(e);
+    }
+  }
+  return out;
+}
+// The address the user is currently typing = text after the last separator, so the
+// typeahead searches just that token (not the whole "a@x.com, prad…" string).
+function lastEmailToken(str) {
+  const parts = (str || "").split(/[,;]/);
+  return (parts[parts.length - 1] || "").trim();
+}
+// Replace the token being typed with the picked email + a trailing separator, so
+// the user can keep adding more recipients.
+function appendPickedEmail(current, email) {
+  const parts = (current || "").split(/[,;]/);
+  parts[parts.length - 1] = email;
+  return (
+    parts
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .join(", ") + ", "
+  );
+}
 
 // Deliverable emails for one student: the student + (optionally) their guardians,
 // deduped WITHIN the student. Siblings sharing a guardian still each get their own
@@ -1406,6 +1657,11 @@ function resetBulkEmail() {
   bulkEmail.attachments = [];
   bulkEmail.mergeFields = [];
   bulkEmail.csvImported = false;
+  bulkEmail.testEnabled = false;
+  bulkEmail.testEmail = "";
+  bulkEmail.testSent = false;
+  bulkTestSuggestions.value = [];
+  bulkTestSending.value = false;
   ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
@@ -1610,4 +1866,110 @@ async function sendBulkEmail() {
     );
   }
 }
+
+// --- Bulk-composer test-mail step ---
+function onBulkTestEmailInput() {
+  clearTimeout(bulkTestSuggestTimeout);
+  const query = lastEmailToken(bulkEmail.testEmail);
+  if (!query || query.length < 2) {
+    bulkTestSuggestions.value = [];
+    return;
+  }
+  bulkTestSuggestTimeout = setTimeout(async () => {
+    try {
+      bulkTestSuggestions.value = await searchUsers(query);
+    } catch {
+      bulkTestSuggestions.value = [];
+    }
+  }, 300);
+}
+
+function selectBulkTestUser(user) {
+  bulkEmail.testEmail = appendPickedEmail(
+    bulkEmail.testEmail,
+    user.email || user.name
+  );
+  bulkTestSuggestions.value = [];
+}
+
+// Send ONE test copy of the bulk email, rendered with the FIRST recipient's real
+// merge data (first group), to one or more verifiers — no tickets are created.
+// Unlocks the real "Send to N".
+async function sendBulkTestEmail() {
+  bulkEmailError.value = "";
+  const groups = bulkEmailGroups.value;
+  if (!groups.length) {
+    bulkEmailError.value = "Add at least one recipient before sending a test.";
+    return;
+  }
+  if (!bulkEmail.subject.trim()) {
+    bulkEmailError.value = "Subject is required before sending a test.";
+    return;
+  }
+  if (!bulkEmail.message.trim()) {
+    bulkEmailError.value = "Message is required before sending a test.";
+    return;
+  }
+  const testEmails = splitTestEmails(bulkEmail.testEmail);
+  if (!testEmails.length || !testEmails.every((e) => EMAIL_REGEX.test(e))) {
+    bulkEmailError.value =
+      "Enter one or more valid email addresses (comma-separated) for the test copy.";
+    return;
+  }
+  bulkTestSending.value = true;
+  bulkTestSuggestions.value = [];
+  try {
+    await call("helpdesk.api.unity_helpdesk_ext.send_test_email", {
+      subject: bulkEmail.subject,
+      message: bulkEmail.message,
+      test_email: testEmails.join(", "),
+      ticket_type: bulkEmail.ticket_type,
+      groups: JSON.stringify(groups),
+      attachments: JSON.stringify(
+        bulkEmail.attachments.map((attachment) => attachment.name)
+      ),
+    });
+    bulkEmail.testSent = true;
+    showGlobalNotice(
+      `Test sent to ${testEmails.join(
+        ", "
+      )} — check the inbox, then Send to all.`,
+      "success",
+      8000
+    );
+  } catch (err) {
+    bulkEmailError.value = "Test send failed: " + (err?.message || err);
+  } finally {
+    bulkTestSending.value = false;
+  }
+}
+
+// Re-require a fresh test whenever the content or recipients change — a test that
+// was verified for the old copy no longer proves the new one is correct.
+watch(
+  () => [
+    composer.subject,
+    composer.message,
+    composer.raised_by,
+    composer.ticket_type,
+    composer.attachments.length,
+  ],
+  () => {
+    if (composer.testSent) composer.testSent = false;
+  }
+);
+watch(
+  () => [
+    bulkEmail.subject,
+    bulkEmail.message,
+    bulkEmail.ticket_type,
+    bulkEmail.attachments.length,
+    bulkEmailStudentCount.value,
+    bulkEmailGroups.value[0]?.student,
+    bulkEmailGroups.value[0]?.emails?.[0],
+  ],
+  () => {
+    if (bulkEmail.testSent) bulkEmail.testSent = false;
+  }
+);
 </script>

@@ -1028,6 +1028,123 @@ def _bulk_send_email_job(
             raise
 
 
+@frappe.whitelist()
+def send_test_email(
+    subject,
+    message,
+    test_email,
+    ticket_type=None,
+    groups=None,
+    raised_by=None,
+    attachments=None,
+):
+    """Send ONE test copy of a bulk / new-ticket email to `test_email` before the
+    real send, so an admin can eyeball the rendered result in their own inbox.
+
+    It walks the SAME validate → render → attach → send path as the real send
+    (bulk_send_email / create_ticket's reply_via_agent) but:
+      * creates NO ticket and mails ONLY `test_email` (never the real recipients/CC),
+      * renders against the FIRST real recipient's merge context — the first
+        `groups` entry's ``{**student, **data}`` (bulk), or
+        ``_merge_context_for_email(raised_by)`` (new-ticket) — so what the admin
+        sees is exactly what the first parent would get,
+      * prefixes the subject with ``[TEST] `` and sends immediately (delayed=False).
+
+    Reusing the real path's checks means a misconfigured outgoing account, an
+    invalid ticket type, or a bad template surfaces at TEST time, not mid-batch.
+    """
+    # Gate to match the operation being tested, not stricter: the bulk path
+    # (`groups`) needs can_view_all_tickets exactly like bulk_send_email; the
+    # new-ticket path needs only basic access, exactly like create_ticket — else an
+    # agent who can create+send a single ticket but lacks all-tickets access would
+    # be blocked from testing it (and stuck, since the real send is gated on it).
+    capabilities = _require_unity_access()
+    if groups and not capabilities.get("can_view_all_tickets"):
+        frappe.throw(
+            _("You are not allowed to send bulk test emails"),
+            frappe.PermissionError,
+        )
+
+    subject = cstr(subject or "").strip()
+    raw_message = cstr(message or "").strip()
+    ticket_type = cstr(ticket_type or "").strip()
+    if not subject:
+        frappe.throw(_("Subject is required"))
+    if not raw_message:
+        frappe.throw(_("Message is required"))
+    if ticket_type and not frappe.db.exists("HD Ticket Type", ticket_type):
+        frappe.throw(_("Invalid Ticket Type: {0}").format(ticket_type))
+
+    # One or more comma/semicolon-separated tester addresses — validated, lowercased
+    # and deduped. A test can go to several verifiers at once (all in one send).
+    test_emails, invalid_test_count = _split_email_list_with_counts(test_email)
+    if not test_emails:
+        frappe.throw(_("Enter at least one valid email address to send the test copy to"))
+    if invalid_test_count:
+        frappe.throw(
+            _("{0} test email address(es) are invalid — fix or remove them").format(invalid_test_count)
+        )
+
+    # Strip script tags, on* handlers, javascript: URLs, etc. — same as the real send.
+    from frappe.utils import sanitize_html
+    message = sanitize_html(raw_message)
+    if not cstr(message).strip():
+        frappe.throw(_("Message is required"))
+
+    # Fail fast if there's no outgoing email account (same guard as bulk_send_email).
+    from frappe.email.doctype.email_account.email_account import EmailAccount
+    if not EmailAccount.find_default_outgoing():
+        frappe.throw(
+            _("No default outgoing Email Account is configured. Please configure one before sending a test email."),
+            frappe.OutgoingEmailError,
+        )
+
+    # Merge context = the FIRST real recipient's data, so the test renders exactly
+    # like the first parent's mail. Bulk: first normalized group's student+row.
+    # New-ticket: the raised_by student's record. Neither present -> blank render.
+    context = {}
+    if groups:
+        normalized_groups, _invalid, _total = _normalize_bulk_email_groups(groups)
+        if not normalized_groups:
+            frappe.throw(_("Add at least one recipient (student) before sending a test"))
+        first = normalized_groups[0]
+        sid = cstr(first.get("student") or "").strip()
+        student = _students_by_name([sid]).get(sid.lower()) if sid else None
+        context = {**(student or {}), **(first.get("data") or {})}
+    elif raised_by:
+        context = _merge_context_for_email(raised_by)
+
+    rendered_subject = _safe_render(subject, context) or subject
+    rendered_message = _safe_render(message, context)
+
+    # Resolve attachment File names cheaply (single IN(...) query) — same as bulk.
+    attachment_list = [n for n in (_parse_json(attachments, []) or []) if n]
+    if attachment_list:
+        existing_files = set(
+            frappe.get_all(
+                "File",
+                filters={"name": ["in", attachment_list]},
+                pluck="name",
+            )
+        )
+        file_names = [name for name in attachment_list if name in existing_files]
+    else:
+        file_names = []
+    sendmail_attachments = [{"fid": name} for name in file_names]
+
+    # ONE mail, to the tester(s) only. No cc, no reference ticket. Sent immediately so
+    # it lands in the verifiers' inboxes right away.
+    frappe.sendmail(
+        recipients=test_emails,
+        subject="[TEST] " + rendered_subject,
+        message=rendered_message,
+        attachments=sendmail_attachments,
+        delayed=False,
+    )
+
+    return {"ok": True, "sent_to": test_emails}
+
+
 def _split_email_list(value):
     out, _invalid = _split_email_list_with_counts(value)
     return out
