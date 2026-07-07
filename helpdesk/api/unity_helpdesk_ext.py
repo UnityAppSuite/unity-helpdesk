@@ -330,6 +330,16 @@ def update_ticket(
         ticket.custom_hold_to = hold_to
     if hold_reason is not None and _has_field(TICKET_DOCTYPE, "custom_hold_reason"):
         ticket.custom_hold_reason = hold_reason
+        # A non-empty hold reason implies the ticket is On Hold — unless the caller
+        # explicitly cleared the flag (is_on_hold == 0) in the same request. Keeps the
+        # reason and the "Issues On Hold" indicator consistent (e.g. a reason typed
+        # from the list must reflect as On Hold, not silently do nothing).
+        if (
+            cstr(hold_reason).strip()
+            and (is_on_hold is None or int(bool(int(is_on_hold))))
+            and _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
+        ):
+            ticket.custom_is_on_hold = 1
     if ticket.status in FINAL_STATUSES and _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
         ticket.custom_is_on_hold = 0
 
@@ -493,7 +503,7 @@ def add_comment(name, content):
     _require_ticket_access(name, capabilities)
     if not content:
         frappe.throw(_("Please enter a comment"))
-    frappe.get_doc({
+    comment = frappe.get_doc({
         "doctype": "HD Ticket Comment",
         "commented_by": frappe.session.user,
         "content": content,
@@ -502,7 +512,21 @@ def add_comment(name, content):
     }).insert(ignore_permissions=True)
     # The comment insert fires the search-index doc hook, which refreshes the index
     # asynchronously — no inline rebuild (that was the "add note" latency).
-    return {"ok": True}
+    # Return the created comment so the SPA can append it optimistically (no reload).
+    return {
+        "ok": True,
+        "comment": {
+            "name": comment.name,
+            "content": comment.content,
+            "commented_by": comment.commented_by,
+            "creation": str(comment.creation),
+            "is_pinned": comment.is_pinned,
+            "user": {
+                "name": comment.commented_by,
+                "full_name": frappe.utils.get_fullname(comment.commented_by),
+            },
+        },
+    }
 
 
 # ---------------------------------------------------------------------------

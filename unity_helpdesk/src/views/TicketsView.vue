@@ -1910,19 +1910,36 @@ async function applyBulkUpdate() {
       };
     }
     bulkResult.value = { updated, failed };
+    // Optimistically reflect the change on the affected rows so the list updates
+    // instantly instead of repainting stale values until the refresh lands.
+    if (updated.length) {
+      const updatedNames = new Set(
+        updated.map((u) => (u && u.name != null ? u.name : u))
+      );
+      const patched = [];
+      for (const row of result.data) {
+        if (updatedNames.has(row.name)) {
+          row[bulkField.value] = bulkValue.value;
+          patched.push(row);
+        }
+      }
+      if (patched.length) syncEditState(patched);
+    }
     if (!failed.length) {
       closeBulkModal();
       clearSelection();
     }
-    await reload();
+    // Fresh refresh (bypass stale cache) so the just-updated rows don't flash back
+    // to their old state (the original "close shows Open then closes later" bug).
+    await reload({ fresh: true });
   } finally {
     bulkSaving.value = false;
   }
 }
 
-async function reload() {
+async function reload(opts = {}) {
   result.start = 0;
-  await load({ append: false });
+  await load({ append: false, ...opts });
 }
 
 function routeQueryFromState() {
@@ -2026,7 +2043,7 @@ function _writeListCache(data) {
   }
 }
 
-async function load({ append = false } = {}) {
+async function load({ append = false, fresh = false } = {}) {
   const requestId = activeRequestId + 1;
   activeRequestId = requestId;
   activeController?.abort();
@@ -2036,8 +2053,10 @@ async function load({ append = false } = {}) {
   // filter set, paint it immediately and treat the API call as a background
   // refresh (no "Searching…" spinner). Cache only applies to first-page,
   // non-append loads.
+  // `fresh` (post-mutation refresh) skips the stale cache so an inline/bulk edit
+  // can't be repainted with pre-edit values.
   let usedCache = false;
-  if (!append) {
+  if (!append && !fresh) {
     const cached = _readListCache();
     if (cached && Array.isArray(cached.data)) {
       result.data = cached.data;
@@ -2051,12 +2070,13 @@ async function load({ append = false } = {}) {
 
   if (append) {
     loadingMore.value = true;
-  } else if (!usedCache) {
-    loading.value = true;
-  } else {
-    // Cache hit — keep the list visible, just show the unobtrusive reload
-    // indicator while the background refresh runs.
+  } else if (usedCache || (fresh && result.data.length)) {
+    // Cache hit, OR a post-mutation fresh refresh with rows already on screen —
+    // keep the list visible and show only the unobtrusive reload indicator
+    // (never blank to the skeleton after an edit).
     reloading.value = true;
+  } else {
+    loading.value = true;
   }
   error.value = "";
   reloadPrompt.value = false;
@@ -2204,31 +2224,48 @@ async function loadMore() {
 async function quickUpdate(ticket, field, value) {
   rowSaving[ticket.name] = true;
   error.value = "";
-  try {
-    const payload = {
-      name: ticket.name,
-      [field]: value,
-    };
-    if (field === "status") {
-      payload.is_on_hold = value === "On Hold" ? 1 : 0;
-      if (value === "On Hold") {
-        payload.hold_from = ticket.custom_hold_from || todayString();
-        payload.hold_reason = editState[ticket.name].hold_reason || "";
-      }
+  const payload = {
+    name: ticket.name,
+    [field]: value,
+  };
+  if (field === "status") {
+    payload.is_on_hold = value === "On Hold" ? 1 : 0;
+    if (value === "On Hold") {
+      payload.hold_from = ticket.custom_hold_from || todayString();
+      payload.hold_reason = editState[ticket.name].hold_reason || "";
     }
+  } else if (field === "hold_reason" && value) {
+    // Typing a Reason Of Hold puts the ticket On Hold: co-send the flag + a
+    // hold-from date so the "Issues On Hold" indicator reflects immediately.
+    payload.is_on_hold = 1;
+    payload.hold_from = ticket.custom_hold_from || todayString();
+  }
+  // Reflect the change on the row immediately — BEFORE the POST — so it never
+  // flashes back to the old value while the (heavy) save runs.
+  const index = result.data.findIndex((row) => row.name === ticket.name);
+  if (index >= 0) {
+    result.data[index][field] = value;
+    if (payload.is_on_hold != null)
+      result.data[index].custom_is_on_hold = payload.is_on_hold;
+    if (payload.hold_from)
+      result.data[index].custom_hold_from = payload.hold_from;
+    syncEditState([result.data[index]]);
+  }
+  try {
     const updated = await call(
       "helpdesk.api.unity_helpdesk_ext.update_ticket",
       payload
     );
-    const index = result.data.findIndex((row) => row.name === ticket.name);
     if (index >= 0) {
+      // Replace with the fresh server row, then quietly reconcile the list
+      // (fresh = bypass the stale cache so nothing repaints pre-edit values).
       result.data[index] = updated;
       syncEditState([updated]);
     }
-    await reload();
+    await reload({ fresh: true });
   } catch (err) {
     error.value = err.message;
-    await load();
+    await load({ fresh: true });
   } finally {
     rowSaving[ticket.name] = false;
   }

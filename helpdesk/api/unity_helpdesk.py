@@ -4165,6 +4165,16 @@ def update_ticket(
 		ticket.custom_hold_to = hold_to
 	if hold_reason is not None and _has_field(TICKET_DOCTYPE, "custom_hold_reason"):
 		ticket.custom_hold_reason = hold_reason
+		# A non-empty hold reason implies the ticket is On Hold — unless the caller
+		# explicitly cleared the flag (is_on_hold == 0) in the same request. Keeps the
+		# reason and the "Issues On Hold" indicator consistent (e.g. a reason typed
+		# from the list must reflect as On Hold, not silently do nothing).
+		if (
+			cstr(hold_reason).strip()
+			and (is_on_hold is None or int(bool(int(is_on_hold))))
+			and _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
+		):
+			ticket.custom_is_on_hold = 1
 	if ticket.status in FINAL_STATUSES and _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
 		ticket.custom_is_on_hold = 0
 

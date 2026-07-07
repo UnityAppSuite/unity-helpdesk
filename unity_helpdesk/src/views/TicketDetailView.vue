@@ -1477,12 +1477,20 @@ async function loadLookups() {
     typeResult.status === "fulfilled" ? typeResult.value || [] : [];
 }
 
-async function loadTicket() {
+async function loadTicket({ silent = false, skipHeavy = false } = {}) {
   const requestId = activeTicketRequestId + 1;
   activeTicketRequestId = requestId;
-  loading.value = true;
+  // silent: a post-action reconcile — keep the page visible with the small
+  // "Reloading…" banner instead of blanking to the full-page skeleton.
+  // skipHeavy: don't re-run the student-context / previous-tickets / replied-to
+  // chain (unchanged by a reply/note/field save) — only initial + route loads do.
+  if (silent) {
+    reloading.value = true;
+  } else {
+    loading.value = true;
+    reloading.value = false;
+  }
   error.value = "";
-  reloading.value = false;
   reloadPrompt.value = false;
   notice.value = sessionStorage.getItem(TICKET_NOTICE_KEY) || "";
   if (notice.value) {
@@ -1511,7 +1519,7 @@ async function loadTicket() {
     parsedDescription.value = parseTicketDescription(studentInfoSourceHtml());
     applyForm();
     queueMicrotask(() => {
-      if (requestId === activeTicketRequestId) {
+      if (requestId === activeTicketRequestId && !skipHeavy) {
         loadPreviousTicketDetails();
         loadRepliedToSummary();
         // Fire the student-context call separately so its ~10+ Education
@@ -1706,11 +1714,44 @@ function ticketTypeColor(name) {
   return (match && match.custom_color) || "#94a3b8";
 }
 
+// Mirror of the backend _status_indicator so the header badge can update instantly
+// after an optimistic save (no reload).
+function localStatusIndicator() {
+  if (form.status === "On Hold" || form.is_on_hold)
+    return { label: "On Hold", color: "yellow" };
+  if (form.status === "Closed") return { label: "Closed", color: "grey" };
+  if (form.status === "Resolved") return { label: "Resolved", color: "green" };
+  if (!form.assignee) return { label: "Unassigned", color: "pink" };
+  return { label: "Assigned", color: "blue" };
+}
+
 async function saveTicket() {
   saving.value = true;
   actionError.value = "";
+  const isOnHold = form.status === "On Hold" ? 1 : form.is_on_hold ? 1 : 0;
+  // Reflect the change immediately — BEFORE the POST — so the header/badge updates
+  // instantly regardless of the (core-Frappe) save time. No full loadTicket() (which
+  // blanks the page to a skeleton and re-runs the student-context chain). Reconciled
+  // in the catch if the save fails.
+  if (ticket.value) {
+    const t = ticket.value;
+    // "On Hold" is a virtual status; the real status stays as-is (a final status is
+    // re-opened server-side when put on hold).
+    t.status =
+      form.status === "On Hold"
+        ? ["Resolved", "Closed"].includes(t.status)
+          ? "Open"
+          : t.status
+        : form.status;
+    t.priority = form.priority;
+    t.ticket_type = form.ticket_type;
+    t.custom_is_on_hold = isOnHold;
+    t.custom_hold_from = form.hold_from;
+    t.custom_hold_to = form.hold_to;
+    t.custom_hold_reason = form.hold_reason;
+    t.status_indicator = localStatusIndicator();
+  }
   try {
-    const isOnHold = form.status === "On Hold" ? 1 : form.is_on_hold ? 1 : 0;
     await call("helpdesk.api.unity_helpdesk_ext.update_ticket", {
       name: props.ticketId,
       assignee: form.assignee,
@@ -1722,9 +1763,10 @@ async function saveTicket() {
       hold_to: form.hold_to,
       hold_reason: form.hold_reason,
     });
-    await loadTicket();
   } catch (err) {
     actionError.value = err.message;
+    // Save failed — reconcile the optimistic change back to server truth.
+    loadTicket({ silent: true, skipHeavy: true });
   } finally {
     saving.value = false;
   }
@@ -1765,12 +1807,12 @@ async function sendReply() {
         ticket.value.thread = [...ticket.value.thread, threadItem];
       }
       communications.value = [...communications.value, threadItem];
-      // Fire-and-forget background refresh for eventual consistency
-      // (attachments, server-side mutations) without blocking the UI.
-      loadTicket();
+      // Fire-and-forget SILENT reconcile (no skeleton, no student-context re-run)
+      // for eventual consistency (server-side status flip, sanitized content).
+      loadTicket({ silent: true, skipHeavy: true });
     } else {
       // Fallback for older backends that don't return the communication.
-      await loadTicket();
+      await loadTicket({ silent: true, skipHeavy: true });
     }
   } catch (err) {
     actionError.value = err.message;
@@ -1783,12 +1825,24 @@ async function sendComment() {
   saving.value = true;
   actionError.value = "";
   try {
-    await call("helpdesk.api.unity_helpdesk_ext.add_comment", {
+    const res = await call("helpdesk.api.unity_helpdesk_ext.add_comment", {
       name: props.ticketId,
       content: composerCommentHtml(),
     });
     await resetComposer();
-    await loadTicket();
+    // Optimistically append the note so it shows immediately, then a silent
+    // reconcile (no skeleton, no student-context re-run) fills in server truth.
+    const c = res && res.comment;
+    if (c) {
+      const item = { ...c, _type: "comment" };
+      if (ticket.value && Array.isArray(ticket.value.thread)) {
+        ticket.value.thread = [...ticket.value.thread, item];
+      }
+      comments.value = [...comments.value, item];
+      loadTicket({ silent: true, skipHeavy: true });
+    } else {
+      await loadTicket({ silent: true, skipHeavy: true });
+    }
   } catch (err) {
     actionError.value = err.message;
   } finally {
