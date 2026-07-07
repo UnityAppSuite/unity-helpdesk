@@ -18,20 +18,41 @@ def _safe(call_kind, fn):
 
 
 def on_ticket_after_insert(doc, method=None):
-	"""Populate student-identity + message-body search fields on a new ticket."""
-	from helpdesk.api.unity_helpdesk import (
-		populate_ticket_student_search_fields,
-		update_ticket_message_search_index,
-	)
+	"""Populate student-identity + message-body search fields for a NEW ticket —
+	OFF the request. Resolving the student context hits ~10+ Education-app queries
+	(Student / Guardian / Program Enrollment / Fees / Payment Schedule); running that
+	synchronously made ticket CREATION slow wherever those tables are large or
+	unindexed (e.g. a local snapshot). Enqueue it like the communication/comment
+	hooks so creation returns immediately — a couple-second delay before the new
+	ticket is searchable is fine. Falls back to a sync populate only if enqueue
+	itself fails (no worker)."""
+	_enqueue_ticket_index(doc.name)
 
-	_safe(
-		"populate_ticket_student_search_fields",
-		lambda: populate_ticket_student_search_fields(doc),
-	)
-	_safe(
-		"update_ticket_message_search_index (after_insert)",
-		lambda: update_ticket_message_search_index(doc.name, ticket_doc=doc),
-	)
+
+def _enqueue_ticket_index(ticket_name):
+	"""Enqueue the FULL new-ticket index build (student fields + message body).
+	populate_ticket_student_search_fields writes both, so it supersedes the
+	message-only job; sharing the `unity_search_idx::<ticket>` job_id (with populate
+	enqueued first, here in after_insert) coalesces it with any initial-communication
+	message-index job into a single worker run."""
+	if not ticket_name:
+		return
+	from helpdesk.api.unity_helpdesk import populate_ticket_student_search_fields
+
+	try:
+		frappe.enqueue(
+			"helpdesk.api.unity_helpdesk.populate_ticket_student_search_fields",
+			ticket=ticket_name,
+			queue="short",
+			job_id=f"unity_search_idx::{ticket_name}",
+			deduplicate=True,
+			enqueue_after_commit=True,
+		)
+	except Exception:
+		_safe(
+			"populate_ticket_student_search_fields (sync fallback)",
+			lambda: populate_ticket_student_search_fields(ticket_name),
+		)
 
 
 def _enqueue_search_index(ticket_name):

@@ -252,12 +252,19 @@ class HDTicket(Document):
 		self.remove_assignment_if_not_in_team()
 		self.publish_update()
 		self.update_search_index()
-		try:
-			from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
+		# The Unity message-search body is built from the ticket's subject + thread
+		# content, so it only needs rebuilding when the ticket's OWN subject/description
+		# changes. Skipping it for scalar edits (status/priority/hold/assignee) avoids a
+		# full whole-thread re-fetch (+ N+1) on every save — the dominant cost of a slow
+		# "Put On Hold"/status save. Communication / HD Ticket Comment edits re-index via
+		# their own hooks, and new tickets index via the after_insert search hook.
+		if self.has_value_changed("subject") or self.has_value_changed("description"):
+			try:
+				from helpdesk.api.unity_helpdesk import update_ticket_message_search_index
 
-			update_ticket_message_search_index(self.name, ticket_doc=self)
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
+				update_ticket_message_search_index(self.name, ticket_doc=self)
+			except Exception:
+				frappe.log_error(frappe.get_traceback(), "HD Ticket message search index on_update")
 
 	def notify_agent(self, agent, notification_type="Assignment"):
 		frappe.get_doc(frappe._dict(
