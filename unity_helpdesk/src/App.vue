@@ -323,8 +323,10 @@
                 </li>
               </ul>
               <p v-if="composer.testSent" class="muted test-mail-hint success">
-                ✓ Test sent to {{ composer.testEmail }} — verify it, then Create
-                &amp; Send. Editing the email re-requires a test.
+                ✓ Test sent to
+                {{ splitTestEmails(composer.testEmail).join(", ") }} — verify
+                it, then Create &amp; Send. Editing the email re-requires a
+                test.
               </p>
               <p v-else class="muted test-mail-hint">
                 Sends a copy (rendered like the customer's email) to the
@@ -728,8 +730,10 @@
                 </li>
               </ul>
               <p v-if="bulkEmail.testSent" class="muted test-mail-hint success">
-                ✓ Test sent to {{ bulkEmail.testEmail }} — verify it, then Send
-                to all. Editing the email or recipients re-requires a test.
+                ✓ Test sent to
+                {{ splitTestEmails(bulkEmail.testEmail).join(", ") }} — verify
+                it, then Send to all. Editing the email or recipients
+                re-requires a test.
               </p>
               <p v-else class="muted test-mail-hint">
                 Sends a copy (rendered like the first recipient's email) to the

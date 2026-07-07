@@ -1053,10 +1053,15 @@ def send_test_email(
     Reusing the real path's checks means a misconfigured outgoing account, an
     invalid ticket type, or a bad template surfaces at TEST time, not mid-batch.
     """
+    # Gate to match the operation being tested, not stricter: the bulk path
+    # (`groups`) needs can_view_all_tickets exactly like bulk_send_email; the
+    # new-ticket path needs only basic access, exactly like create_ticket — else an
+    # agent who can create+send a single ticket but lacks all-tickets access would
+    # be blocked from testing it (and stuck, since the real send is gated on it).
     capabilities = _require_unity_access()
-    if not capabilities.get("can_view_all_tickets"):
+    if groups and not capabilities.get("can_view_all_tickets"):
         frappe.throw(
-            _("You are not allowed to send test emails"),
+            _("You are not allowed to send bulk test emails"),
             frappe.PermissionError,
         )
 
