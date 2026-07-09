@@ -790,33 +790,36 @@
                   </select>
                 </template>
                 <template v-else-if="col.key === '_assign'">
-                  <select
-                    v-model="editState[ticket.name].assignee"
-                    :class="[
-                      'select-chip',
-                      assignmentClass(editState[ticket.name].assignee),
-                    ]"
-                    :disabled="isSaving(ticket.name)"
-                    @change="
-                      quickUpdate(
-                        ticket,
-                        'assignee',
-                        editState[ticket.name].assignee
-                      )
+                  <!-- Searchable (type-to-filter) assignee via a native datalist —
+                       escapes table clipping and needs no custom dropdown. -->
+                  <input
+                    :key="
+                      'assign-' +
+                      ticket.name +
+                      '-' +
+                      (assignInputKey[ticket.name] || 0)
                     "
-                  >
-                    <option value="">Unassigned</option>
-                    <option
-                      v-for="agent in agents"
-                      :key="agent.name"
-                      :value="agent.name"
-                    >
-                      {{ agent.full_name || agent.name }}
-                    </option>
-                  </select>
+                    class="select-chip assign-input"
+                    :class="assignmentClass(editState[ticket.name].assignee)"
+                    :value="assigneeLabel(editState[ticket.name].assignee)"
+                    list="unity-agent-datalist"
+                    placeholder="Unassigned"
+                    autocomplete="off"
+                    :disabled="isSaving(ticket.name)"
+                    @change="onRowAssignChange(ticket, $event.target.value)"
+                  />
                 </template>
                 <template v-else-if="col.key === 'creation'">
                   {{ formatDateTime(ticket.creation) }}
+                </template>
+                <template v-else-if="col.key === 'owner'">
+                  <span
+                    v-if="ticket.created_by || ticket.owner"
+                    :title="ticket.created_by?.email || ticket.owner"
+                  >
+                    {{ ticket.created_by?.full_name || ticket.owner }}
+                  </span>
+                  <span v-else class="muted">-</span>
                 </template>
                 <template v-else-if="col.key === 'custom_is_on_hold'">
                   <span v-if="ticket.custom_is_on_hold">
@@ -853,6 +856,15 @@
             </tr>
           </tbody>
         </table>
+        <!-- Shared options for the searchable "Assigned To" cell inputs (A–Z). -->
+        <datalist id="unity-agent-datalist">
+          <option value="Unassigned"></option>
+          <option
+            v-for="agent in agentsAsc"
+            :key="agent.name"
+            :value="agent.full_name || agent.name"
+          ></option>
+        </datalist>
         <!-- Mobile-only: compact summary cards (the wide table is hidden ≤640px) -->
         <div class="ticket-cards">
           <article
@@ -990,9 +1002,10 @@ const PAGE_SIZE_OPTIONS = [20, 50, 100, 500];
 const PAGE_SIZE_STORAGE_KEY = "unity_helpdesk_page_size";
 
 function _initialPageSize() {
-  // Always start at the smallest page size on load so the first paint is fast
-  // and can never inherit a stale large preference (e.g. 500) that times out.
-  // The user can still raise "Rows per page" for the rest of the session.
+  // Always start at the smallest page size on load/reload so the first paint is
+  // fast and never inherits a large page (e.g. 500) that slows the first render.
+  // Changing "Rows per page" to 500 still works for the rest of the session (it
+  // refetches immediately); it just resets to 20 on the next reload/remount.
   return 20;
 }
 
@@ -2376,6 +2389,43 @@ function openTicket(name, event) {
 
 function assignmentClass(assignee) {
   return assignee ? "blue" : "pink";
+}
+
+// --- Searchable "Assigned To" cell (native datalist) ---
+// Agents A–Z for the datalist options.
+const agentsAsc = computed(() =>
+  [...agents.value].sort((a, b) =>
+    (a.full_name || a.name || "").localeCompare(b.full_name || b.name || "")
+  )
+);
+// The datalist matches on the agent's DISPLAY name; map it back to the docname.
+function assigneeLabel(name) {
+  if (!name) return "";
+  const a = agents.value.find((x) => x.name === name);
+  return a ? a.full_name || a.name : name;
+}
+// Bumped per row to force the input to snap back to the known value when the typed
+// text doesn't match any agent (so a stray keystroke can't leave garbage on screen).
+const assignInputKey = reactive({});
+function onRowAssignChange(ticket, text) {
+  const t = (text || "").trim();
+  let name = "";
+  if (t && t.toLowerCase() !== "unassigned") {
+    const agent = agents.value.find(
+      (a) =>
+        (a.full_name || a.name || "").toLowerCase() === t.toLowerCase() ||
+        (a.email || "").toLowerCase() === t.toLowerCase() ||
+        a.name === t
+    );
+    if (!agent) {
+      assignInputKey[ticket.name] = (assignInputKey[ticket.name] || 0) + 1;
+      return;
+    }
+    name = agent.name;
+  }
+  if (editState[ticket.name].assignee === name) return; // no change
+  editState[ticket.name].assignee = name;
+  quickUpdate(ticket, "assignee", name);
 }
 
 function statusClass(ticket, selectedStatus) {

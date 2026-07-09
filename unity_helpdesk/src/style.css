@@ -3186,6 +3186,30 @@ body.col-resizing .ticket-table * {
   font-size: 11.5px;
 }
 
+.user-suggestions li.disabled {
+  cursor: default;
+  justify-content: center;
+}
+
+.user-suggestions li.disabled:hover {
+  background: transparent;
+}
+
+/* ── Searchable "Assign To" combobox ─────────────────────────────────────── */
+
+.assignee-combobox {
+  position: relative;
+}
+
+/* Overlay the matches instead of pushing the modal content down. */
+.assignee-combobox .user-suggestions {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+}
+
 /* ── Optional "send a test copy first" step ──────────────────────────────── */
 
 .test-mail-step {

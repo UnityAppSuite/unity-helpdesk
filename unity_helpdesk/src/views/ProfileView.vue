@@ -493,18 +493,30 @@
           <p v-if="agentsError" class="error">{{ agentsError }}</p>
           <label>
             Add Agent
-            <select v-model="selectedUser">
-              <option value="">Select a user</option>
-              <option
-                v-for="candidate in candidates"
-                :key="candidate.name"
-                :value="candidate.name"
-              >
-                {{ candidate.full_name || candidate.name }} ({{
-                  candidate.email || candidate.name
-                }})
-              </option>
-            </select>
+            <div class="assignee-combobox">
+              <input
+                v-model="candidateQuery"
+                type="text"
+                placeholder="Search a user to add…"
+                autocomplete="off"
+                @input="onCandidateInput"
+                @focus="onCandidateFocus"
+                @blur="onCandidateBlur"
+              />
+              <ul v-if="candidateOpen" class="user-suggestions">
+                <li
+                  v-for="candidate in candidateMatches"
+                  :key="candidate.name"
+                  @mousedown.prevent="pickCandidate(candidate)"
+                >
+                  <span>{{ candidate.full_name || candidate.name }}</span>
+                  <small>{{ candidate.email || candidate.name }}</small>
+                </li>
+                <li v-if="!candidateMatches.length" class="disabled">
+                  <small class="muted">No users match</small>
+                </li>
+              </ul>
+            </div>
           </label>
           <div class="inline-actions">
             <a
@@ -663,6 +675,9 @@ const agentsError = ref("");
 const agentSearch = ref("");
 const selectedUser = ref("");
 const creatingAgent = ref(false);
+// Searchable "Add Agent" candidate combobox.
+const candidateQuery = ref("");
+const candidateOpen = ref(false);
 
 const ticketTypes = ref([]);
 const ticketTypeError = ref("");
@@ -722,10 +737,17 @@ const canManageUnitySettings = computed(
 const canManageAgents = computed(
   () => !!unitySession.capabilities?.can_manage_agents
 );
+const _agentsAsc = computed(() =>
+  [...agents.value].sort((a, b) =>
+    (a.full_name || a.user || a.name || "").localeCompare(
+      b.full_name || b.user || b.name || ""
+    )
+  )
+);
 const filteredAgents = computed(() => {
   const term = agentSearch.value.trim().toLowerCase();
-  if (!term) return agents.value;
-  return agents.value.filter((agent) =>
+  if (!term) return _agentsAsc.value;
+  return _agentsAsc.value.filter((agent) =>
     [agent.name, agent.user, agent.full_name].some((v) =>
       String(v || "")
         .toLowerCase()
@@ -733,6 +755,48 @@ const filteredAgents = computed(() => {
     )
   );
 });
+
+// --- Searchable "Add Agent" candidate combobox ---
+const _candidatesAsc = computed(() =>
+  [...candidates.value].sort((a, b) =>
+    (a.full_name || a.name || "").localeCompare(b.full_name || b.name || "")
+  )
+);
+const candidateMatches = computed(() => {
+  const q = candidateQuery.value.trim().toLowerCase();
+  if (!q) return _candidatesAsc.value;
+  return _candidatesAsc.value.filter((c) =>
+    [c.name, c.full_name, c.email].some((v) =>
+      String(v || "")
+        .toLowerCase()
+        .includes(q)
+    )
+  );
+});
+function candidateLabel(name) {
+  if (!name) return "";
+  const c = candidates.value.find((x) => x.name === name);
+  return c ? `${c.full_name || c.name} (${c.email || c.name})` : name;
+}
+function onCandidateInput() {
+  candidateOpen.value = true;
+}
+function onCandidateFocus() {
+  candidateOpen.value = true;
+}
+function onCandidateBlur() {
+  setTimeout(() => {
+    candidateOpen.value = false;
+    candidateQuery.value = candidateLabel(selectedUser.value);
+  }, 120);
+}
+function pickCandidate(candidate) {
+  selectedUser.value = candidate.name;
+  candidateQuery.value = `${candidate.full_name || candidate.name} (${
+    candidate.email || candidate.name
+  })`;
+  candidateOpen.value = false;
+}
 
 const templateFormValid = computed(
   () =>
@@ -901,6 +965,7 @@ async function handleCreateAgent() {
   try {
     await createAgent(selectedUser.value);
     selectedUser.value = "";
+    candidateQuery.value = "";
     await Promise.allSettled([loadAgents(), loadCandidates()]);
   } catch (err) {
     agentsError.value = err.message;

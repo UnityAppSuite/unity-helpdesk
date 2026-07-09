@@ -52,6 +52,9 @@ UNITY_TICKET_FIELDS = [
 	"name",
 	"subject",
 	"raised_by",
+	# HD Ticket.owner = the user who created the ticket. Fetched so the "Created By"
+	# list column can resolve it to the creator's full name (_decorate_ticket_rows).
+	"owner",
 	"status",
 	"priority",
 	"ticket_type",
@@ -283,6 +286,9 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "status", "label": "Status", "default": True, "fixed": False, "width": 140},
 	{"key": "_assign", "label": "Assigned To", "default": True, "fixed": False, "width": 170},
 	{"key": "creation", "label": "Created On", "default": True, "fixed": False, "width": 130},
+	# HD Ticket.owner (creator). The SPA renders the resolved full name from
+	# row.created_by (see _decorate_ticket_rows), falling back to the raw owner email.
+	{"key": "owner", "label": "Created By", "default": True, "fixed": False, "width": 180},
 	{"key": "custom_is_on_hold", "label": "Issues On Hold", "default": True, "fixed": False, "width": 140},
 	{"key": "custom_hold_reason", "label": "Reason Of Hold", "default": True, "fixed": False, "width": 200},
 	{"key": "raised_by", "label": "Raised By", "default": False, "fixed": False, "width": 220},
@@ -302,6 +308,14 @@ COLUMN_PREFS_DEFAULT_KEY = "unity_helpdesk_columns"
 COLUMN_WIDTH_MIN = 60
 COLUMN_WIDTH_MAX = 1400
 COLUMN_PREFS_MAX_ITEMS = 100
+
+# Default columns introduced AFTER users already had saved column preferences. We
+# inject each ONCE (guarded by a per-user flag) so it appears for existing users
+# without their manual action — while still letting them hide it afterwards (the
+# flag stops us re-adding it on every load). Users with no saved prefs already get
+# these via _default_column_preferences() since they're marked default:True.
+NEWLY_DEFAULTED_COLUMNS = ["owner"]
+COLUMN_AUTOADD_DEFAULT_KEY = "unity_helpdesk_columns_autoadded"
 
 
 def _localized_available_columns():
@@ -356,7 +370,45 @@ def _load_column_preferences():
 		width = next(c["width"] for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key)
 		cleaned.insert(0, {"key": key, "width": width})
 		seen.add(key)
+	# One-time injection of columns added after this user saved their preferences.
+	cleaned = _inject_new_default_columns(cleaned, seen)
 	return cleaned or _default_column_preferences()
+
+
+def _inject_new_default_columns(cleaned, seen):
+	"""Append any NEWLY_DEFAULTED_COLUMNS the user hasn't seen yet, once. Guarded by a
+	per-user flag so hiding the column afterwards sticks. Best-effort: never raises."""
+	pending = [
+		k for k in NEWLY_DEFAULTED_COLUMNS
+		if k in AVAILABLE_TICKET_COLUMN_KEYS and k not in seen
+	]
+	if not pending:
+		return cleaned
+	already = set()
+	try:
+		raw = frappe.db.get_default(COLUMN_AUTOADD_DEFAULT_KEY, frappe.session.user)
+		if raw:
+			val = json.loads(raw) if isinstance(raw, str) else raw
+			if isinstance(val, list | tuple):
+				already = {cstr(x) for x in val}
+	except (TypeError, ValueError):
+		already = set()
+	to_add = [k for k in pending if k not in already]
+	if not to_add:
+		return cleaned
+	for key in to_add:
+		width = next((c["width"] for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key), 160)
+		cleaned.append({"key": key, "width": width})
+		seen.add(key)
+	try:
+		frappe.db.set_default(
+			COLUMN_AUTOADD_DEFAULT_KEY,
+			json.dumps(sorted(already | set(to_add))),
+			frappe.session.user,
+		)
+	except Exception:
+		pass
+	return cleaned
 
 
 def _selected_column_fields():
@@ -434,6 +486,9 @@ def _decorate_ticket_rows(rows):
 			users_needed.update(a for a in assignees if a)
 		else:
 			todo_lookup_names.append(row_dict.get("name"))
+		# owner (creator) is resolved to a full name for the "Created By" column.
+		if row_dict.get("owner"):
+			users_needed.add(row_dict.get("owner"))
 
 	# One ToDo lookup for the empty-_assign fallback (matches _assignee_from_assign).
 	if todo_lookup_names:
@@ -472,6 +527,16 @@ def _decorate_ticket_rows(rows):
 			row_dict.assignee = user_map.get(first) or {"name": first, "full_name": first}
 		else:
 			row_dict.assignee = None
+		# "Created By": resolve owner -> full name (fallback the raw owner id/email).
+		owner = row_dict.get("owner")
+		if owner:
+			ou = user_map.get(owner)
+			row_dict.created_by = {
+				"full_name": (ou.get("full_name") if ou else "") or owner,
+				"email": (ou.get("email") if ou else "") or owner,
+			}
+		else:
+			row_dict.created_by = None
 		row_dict.status_indicator = _status_indicator(row_dict)
 		row_dict.priority_target = PRIORITY_TARGETS.get(row_dict.get("priority"), "")
 		# Drop the heavy ranking-only / HTML fields before they hit the wire.
