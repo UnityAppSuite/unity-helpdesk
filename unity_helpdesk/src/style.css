@@ -1242,6 +1242,96 @@ tbody tr.bulk-email-ticket:hover {
   border-color: #fcd34d;
 }
 
+/* ── Searchable "Assigned To" cell trigger + teleported popover ───────────── */
+/* Match the native column selects (Status / Ticket Type): same box + a
+   right-aligned chevron. The `.ticket-table td >` scope beats the generic
+   `.ticket-table td > .select-chip { display:block }` so flex layout wins. */
+.ticket-table td > .assign-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+}
+.assign-trigger {
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #f8fbff;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  cursor: pointer;
+  text-align: left;
+}
+.assign-trigger:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+.assign-trigger-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.assign-caret {
+  flex-shrink: 0;
+  font-size: 11px;
+  opacity: 0.55;
+}
+.assign-popover-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+}
+.assign-popover {
+  position: fixed;
+  z-index: 121;
+  display: flex;
+  flex-direction: column;
+  max-height: 300px;
+  min-width: 200px;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+}
+.assign-search {
+  flex: 0 0 auto;
+  width: 100%;
+  margin-bottom: 6px;
+}
+.assign-options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.assign-option {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.assign-option:hover {
+  background: var(--accent-light);
+}
+.assign-option.disabled {
+  color: var(--muted);
+  cursor: default;
+}
+.assign-option.disabled:hover {
+  background: transparent;
+}
+
 .inline-person {
   display: flex;
   align-items: center;
@@ -3184,6 +3274,30 @@ body.col-resizing .ticket-table * {
   margin-left: auto;
   color: var(--muted);
   font-size: 11.5px;
+}
+
+.user-suggestions li.disabled {
+  cursor: default;
+  justify-content: center;
+}
+
+.user-suggestions li.disabled:hover {
+  background: transparent;
+}
+
+/* ── Searchable "Assign To" combobox ─────────────────────────────────────── */
+
+.assignee-combobox {
+  position: relative;
+}
+
+/* Overlay the matches instead of pushing the modal content down. */
+.assignee-combobox .user-suggestions {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  z-index: 20;
 }
 
 /* ── Optional "send a test copy first" step ──────────────────────────────── */

@@ -790,33 +790,33 @@
                   </select>
                 </template>
                 <template v-else-if="col.key === '_assign'">
-                  <select
-                    v-model="editState[ticket.name].assignee"
-                    :class="[
-                      'select-chip',
-                      assignmentClass(editState[ticket.name].assignee),
-                    ]"
+                  <!-- Opens a searchable dropdown (teleported to body so it escapes
+                       the scroll container's clipping). -->
+                  <button
+                    type="button"
+                    class="select-chip assign-trigger"
+                    :class="assignmentClass(editState[ticket.name].assignee)"
                     :disabled="isSaving(ticket.name)"
-                    @change="
-                      quickUpdate(
-                        ticket,
-                        'assignee',
-                        editState[ticket.name].assignee
-                      )
-                    "
+                    @click.stop="openAssign(ticket, $event)"
                   >
-                    <option value="">Unassigned</option>
-                    <option
-                      v-for="agent in agents"
-                      :key="agent.name"
-                      :value="agent.name"
-                    >
-                      {{ agent.full_name || agent.name }}
-                    </option>
-                  </select>
+                    <span class="assign-trigger-label">{{
+                      assigneeLabel(editState[ticket.name].assignee) ||
+                      "Unassigned"
+                    }}</span>
+                    <span class="assign-caret" aria-hidden="true">▾</span>
+                  </button>
                 </template>
                 <template v-else-if="col.key === 'creation'">
                   {{ formatDateTime(ticket.creation) }}
+                </template>
+                <template v-else-if="col.key === 'owner'">
+                  <span
+                    v-if="ticket.created_by || ticket.owner"
+                    :title="ticket.created_by?.email || ticket.owner"
+                  >
+                    {{ ticket.created_by?.full_name || ticket.owner }}
+                  </span>
+                  <span v-else class="muted">-</span>
                 </template>
                 <template v-else-if="col.key === 'custom_is_on_hold'">
                   <span v-if="ticket.custom_is_on_hold">
@@ -853,6 +853,44 @@
             </tr>
           </tbody>
         </table>
+        <!-- Searchable "Assigned To" dropdown, teleported to <body> so the table's
+             overflow can never clip it. Only one is open at a time. -->
+        <Teleport to="body">
+          <template v-if="assignOpen">
+            <div class="assign-popover-backdrop" @click="closeAssign"></div>
+            <div
+              ref="assignPopoverRef"
+              class="assign-popover"
+              :style="assignPopoverStyle"
+            >
+              <input
+                ref="assignSearchRef"
+                v-model="assignQuery"
+                class="assign-search"
+                type="text"
+                placeholder="Search agent…"
+                autocomplete="off"
+                @keydown.escape="closeAssign"
+              />
+              <ul class="assign-options">
+                <li class="assign-option" @click="pickAssign('')">
+                  Unassigned
+                </li>
+                <li
+                  v-for="agent in assignMatches"
+                  :key="agent.name"
+                  class="assign-option"
+                  @click="pickAssign(agent.name)"
+                >
+                  {{ agentDisplay(agent) || agent.name }}
+                </li>
+                <li v-if="!assignMatches.length" class="assign-option disabled">
+                  No agents match
+                </li>
+              </ul>
+            </div>
+          </template>
+        </Teleport>
         <!-- Mobile-only: compact summary cards (the wide table is hidden ≤640px) -->
         <div class="ticket-cards">
           <article
@@ -934,6 +972,7 @@
 import {
   computed,
   inject,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   reactive,
@@ -990,9 +1029,10 @@ const PAGE_SIZE_OPTIONS = [20, 50, 100, 500];
 const PAGE_SIZE_STORAGE_KEY = "unity_helpdesk_page_size";
 
 function _initialPageSize() {
-  // Always start at the smallest page size on load so the first paint is fast
-  // and can never inherit a stale large preference (e.g. 500) that times out.
-  // The user can still raise "Rows per page" for the rest of the session.
+  // Always start at the smallest page size on load/reload so the first paint is
+  // fast and never inherits a large page (e.g. 500) that slows the first render.
+  // Changing "Rows per page" to 500 still works for the rest of the session (it
+  // refetches immediately); it just resets to 20 on the next reload/remount.
   return 20;
 }
 
@@ -1719,11 +1759,25 @@ function syncEditState(rows) {
 
 // Keep local lookups in sync with App.vue's once they finish loading — saves
 // the duplicate get_agents / get_ticket_types round-trips on every navigation.
+// Sort agents A→Z by display name (case-insensitive) — used everywhere agents are
+// listed so the order is always alphabetical regardless of backend/insertion order.
+function _agentSortKey(a) {
+  // Trim so a stray leading/trailing space in an agent's name (a data-entry quirk
+  // on some User records) can't sort it ahead of everyone else.
+  return (a.full_name || a.name || "").trim();
+}
+function _byAgentName(a, b) {
+  return _agentSortKey(a).localeCompare(_agentSortKey(b), undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+}
 if (injectedAgents) {
   watch(
     injectedAgents,
     (val) => {
-      if (Array.isArray(val) && val.length) agents.value = val;
+      if (Array.isArray(val) && val.length)
+        agents.value = [...val].sort(_byAgentName);
     },
     { immediate: true }
   );
@@ -1751,8 +1805,11 @@ async function loadLookups() {
     getAgents(),
     getTicketTypes(),
   ]);
-  agents.value =
-    agentResult.status === "fulfilled" ? agentResult.value || [] : [];
+  agents.value = (
+    agentResult.status === "fulfilled" ? agentResult.value || [] : []
+  )
+    .slice()
+    .sort(_byAgentName);
   ticketTypes.value =
     typeResult.status === "fulfilled" ? typeResult.value || [] : [];
 }
@@ -2377,6 +2434,88 @@ function openTicket(name, event) {
 function assignmentClass(assignee) {
   return assignee ? "blue" : "pink";
 }
+
+// --- Searchable "Assigned To" cell ---
+// agents.value is already sorted A→Z at the source (see _byAgentName).
+const agentsAsc = computed(() => agents.value);
+function agentDisplay(agent) {
+  return (agent.full_name || agent.name || "").trim();
+}
+function assigneeLabel(name) {
+  if (!name) return "";
+  const a = agents.value.find((x) => x.name === name);
+  return a ? agentDisplay(a) || name : name;
+}
+
+// Searchable assignee dropdown state (one open at a time, teleported to body).
+const assignOpen = ref(null); // ticket.name currently open, or null
+const assignQuery = ref("");
+const assignSearchRef = ref(null);
+const assignPopoverRef = ref(null);
+const assignPos = reactive({ top: 0, left: 0, width: 220 });
+let _assignTicket = null;
+
+// Close on scroll/resize so the fixed popover doesn't detach from its trigger — but
+// IGNORE scrolls that happen INSIDE the popover's own option list (else scrolling
+// the agent list would collapse it). Capture phase is required to catch scrolls on
+// nested scroll containers (which don't bubble).
+function _onOutsideScroll(e) {
+  const pop = assignPopoverRef.value;
+  if (pop && e.target instanceof Node && pop.contains(e.target)) return;
+  closeAssign();
+}
+
+const assignPopoverStyle = computed(() => ({
+  top: `${assignPos.top}px`,
+  left: `${assignPos.left}px`,
+  width: `${assignPos.width}px`,
+}));
+const assignMatches = computed(() => {
+  const q = assignQuery.value.trim().toLowerCase();
+  if (!q) return agentsAsc.value;
+  return agentsAsc.value.filter((a) =>
+    [a.full_name, a.name, a.email].some((v) =>
+      String(v || "")
+        .toLowerCase()
+        .includes(q)
+    )
+  );
+});
+
+function openAssign(ticket, ev) {
+  _assignTicket = ticket;
+  assignOpen.value = ticket.name;
+  assignQuery.value = "";
+  const rect = ev.currentTarget.getBoundingClientRect();
+  // Position (fixed / viewport coords) just under the trigger.
+  assignPos.top = Math.round(rect.bottom + 4);
+  assignPos.left = Math.round(rect.left);
+  assignPos.width = Math.round(Math.max(rect.width, 200));
+  window.addEventListener("scroll", _onOutsideScroll, true);
+  window.addEventListener("resize", closeAssign, true);
+  nextTick(() => assignSearchRef.value?.focus());
+}
+function closeAssign() {
+  if (assignOpen.value === null) return;
+  assignOpen.value = null;
+  _assignTicket = null;
+  assignQuery.value = "";
+  window.removeEventListener("scroll", _onOutsideScroll, true);
+  window.removeEventListener("resize", closeAssign, true);
+}
+function pickAssign(name) {
+  const ticket = _assignTicket;
+  if (
+    ticket &&
+    editState[ticket.name] &&
+    editState[ticket.name].assignee !== name
+  ) {
+    editState[ticket.name].assignee = name;
+    quickUpdate(ticket, "assignee", name);
+  }
+  closeAssign();
+}
+onBeforeUnmount(closeAssign);
 
 function statusClass(ticket, selectedStatus) {
   if (selectedStatus === "On Hold") return "yellow";

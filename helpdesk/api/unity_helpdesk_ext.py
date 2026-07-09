@@ -868,12 +868,22 @@ def bulk_send_email(
     else:
         file_names = []
 
-    # Run IN-REQUEST (no background worker) — exactly like a single-ticket / chat
-    # reply (reply_via_agent). Every per-student ticket + Email Queue entry is
-    # created before this returns. We respect the SAME HD Settings
-    # "instantly_send_email" flag the replies use: ON -> send now; OFF -> just queue.
+    # SEND OFF THE REQUEST (background job). Creating one ticket + one email PER
+    # student inline (insert + per-row commit + sendmail, looped) blows past the
+    # gunicorn/proxy timeout on a large batch — the browser then shows "Failed to
+    # fetch" (connection killed mid-request) or a 500 ("Something went wrong").
+    # Enqueue the whole per-student job on the LONG queue instead: the request
+    # returns instantly and the tickets/emails materialise as the worker processes
+    # them (the SPA already treats bulk send as fire-and-forget — it closes the
+    # composer and refreshes the list out-of-band). frappe.enqueue captures the
+    # current session user, so the worker runs as THIS agent and each ticket's owner
+    # is this agent. Respect the SAME HD Settings "instantly_send_email" flag (ON ->
+    # the worker sends now; OFF -> it just queues the mails for the email flush).
     instant = bool(int(frappe.db.get_single_value("HD Settings", "instantly_send_email") or 0))
-    result = _bulk_send_email_job(
+    frappe.enqueue(
+        "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
+        queue="long",
+        timeout=1500,
         subject=subject,
         message=message,
         groups=normalized_groups,
@@ -882,21 +892,20 @@ def bulk_send_email(
         file_names=file_names,
         ticket_type=ticket_type,
         now=instant,
-    ) or {}
+    )
 
-    tickets = result.get("tickets") or []
     return {
         "ok": True,
+        "queued": True,
         "instant": instant,
-        "tickets": tickets,
-        # `ticket` (singular) kept for older callers — the first per-student ticket.
-        "ticket": tickets[0] if tickets else None,
-        "ticket_count": len(tickets),
-        "student_count": result.get("student_count", 0),
+        # Tickets are created asynchronously in the worker — we don't have their
+        # names yet. student_count lets the SPA say "N tickets are being created".
+        "tickets": [],
+        "ticket": None,
+        "ticket_count": 0,
+        "student_count": len(normalized_groups),
         "recipient_count": total_recipients,
         "count": total_recipients,
-        "sent": result.get("sent", 0),
-        "queued": result.get("sent", 0),
         "invalid_count": invalid_count,
         "invalid_cc_count": invalid_cc_count,
     }

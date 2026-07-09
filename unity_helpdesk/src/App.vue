@@ -220,16 +220,41 @@
           </label>
           <label>
             Assign To
-            <select v-model="composer.assignee">
-              <option value="">Unassigned</option>
-              <option
-                v-for="agent in agents"
-                :key="agent.name"
-                :value="agent.name"
-              >
-                {{ agent.full_name || agent.name }}
-              </option>
-            </select>
+            <div class="assignee-combobox">
+              <input
+                v-model="assigneeQuery"
+                type="text"
+                :placeholder="
+                  composer.assignee ? '' : 'Unassigned — search agent…'
+                "
+                autocomplete="off"
+                @input="onAssigneeInput"
+                @focus="onAssigneeFocus"
+                @blur="onAssigneeBlur"
+              />
+              <ul v-if="assigneeOpen" class="user-suggestions">
+                <li @mousedown.prevent="clearAssignee">
+                  <span class="muted">Unassigned</span>
+                </li>
+                <li
+                  v-for="agent in assigneeMatches"
+                  :key="agent.name"
+                  @mousedown.prevent="pickAssignee(agent)"
+                >
+                  <span
+                    class="avatar"
+                    style="width: 20px; height: 20px; font-size: 9px"
+                  >
+                    {{ initials(agent.full_name || agent.name) }}
+                  </span>
+                  <span>{{ agent.full_name || agent.name }}</span>
+                  <small>{{ agent.email || agent.name }}</small>
+                </li>
+                <li v-if="!assigneeMatches.length" class="disabled">
+                  <small class="muted">No agents match</small>
+                </li>
+              </ul>
+            </div>
           </label>
           <label>
             Email Message
@@ -285,66 +310,83 @@
               Send a test copy first
             </label>
             <div v-if="composer.testEnabled" class="test-mail-body">
-              <div class="input-with-action">
-                <input
-                  v-model="composer.testEmail"
-                  type="text"
-                  placeholder="you@example.com, colleague@example.com"
-                  autocomplete="off"
-                  @input="onCreateTestEmailInput"
-                  @focus="onCreateTestEmailInput"
-                />
+              <div class="recipient-multiselect" @click="focusCreateTestInput">
+                <span
+                  v-for="r in composer.testRecipients"
+                  :key="r.email"
+                  class="recipient-chip"
+                >
+                  <span class="recipient-chip-label" :title="r.email">{{
+                    r.name
+                  }}</span>
+                  <button
+                    type="button"
+                    class="recipient-chip-remove"
+                    @click.stop="removeCreateTestRecipient(r.email)"
+                  >
+                    ×
+                  </button>
+                </span>
+                <div class="recipient-input-wrap">
+                  <input
+                    ref="composerTestInputRef"
+                    v-model="composerTestQuery"
+                    type="text"
+                    class="recipient-input"
+                    placeholder="Add a user by name or email…"
+                    autocomplete="off"
+                    @input="onCreateTestEmailInput"
+                    @paste="onCreateTestPaste"
+                    @keydown.enter.prevent="addCreateTestFromInput"
+                    @keydown="onCreateTestKeydown"
+                    @focus="onCreateTestEmailInput"
+                  />
+                  <div
+                    v-if="composerTestSuggestions.length"
+                    class="recipient-dropdown"
+                  >
+                    <button
+                      v-for="u in composerTestSuggestions"
+                      :key="u.name"
+                      type="button"
+                      class="recipient-dropdown-item"
+                      @mousedown.prevent="selectCreateTestUser(u)"
+                    >
+                      <span class="rd-name">{{ u.full_name || u.name }}</span>
+                      <span class="rd-email">{{ u.email || u.name }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="composer-attachment-actions" style="margin-top: 6px">
                 <button
                   type="button"
-                  class="btn secondary input-action-btn"
-                  :disabled="composerTestSending"
+                  class="btn secondary"
+                  :disabled="
+                    composerTestSending || !composer.testRecipients.length
+                  "
                   @click="sendCreateTestEmail"
                 >
                   {{ composerTestSending ? "Sending…" : "Send Test" }}
                 </button>
               </div>
-              <ul
-                v-if="composerTestSuggestions.length"
-                class="user-suggestions"
-              >
-                <li
-                  v-for="u in composerTestSuggestions"
-                  :key="u.name"
-                  @mousedown.prevent="selectCreateTestUser(u)"
-                >
-                  <span
-                    class="avatar"
-                    style="width: 20px; height: 20px; font-size: 9px"
-                  >
-                    {{ initials(u.full_name || u.name) }}
-                  </span>
-                  <span>{{ u.full_name || u.name }}</span>
-                  <small>{{ u.email || u.name }}</small>
-                </li>
-              </ul>
               <p v-if="composer.testSent" class="muted test-mail-hint success">
                 ✓ Test sent to
-                {{ splitTestEmails(composer.testEmail).join(", ") }} — verify
-                it, then Create &amp; Send. Editing the email re-requires a
-                test.
+                {{ composer.testRecipients.map((r) => r.name).join(", ") }} —
+                verify it, then Create &amp; Send. Editing the email re-requires
+                a test.
               </p>
               <p v-else class="muted test-mail-hint">
-                Sends a copy (rendered like the customer's email) to the
-                address(es) above — separate multiple with commas. Verify it,
-                then the Create &amp; Send button unlocks.
+                Adds one or more verifiers (chips). Send them a copy rendered
+                like the customer's email; verify it, then the Create &amp; Send
+                button unlocks.
               </p>
             </div>
           </div>
         </div>
         <div class="modal-footer">
           <button class="btn secondary" @click="closeComposer">Cancel</button>
-          <button
-            class="btn"
-            :disabled="
-              composerSaving || (composer.testEnabled && !composer.testSent)
-            "
-            @click="createTicket"
-          >
+          <button class="btn" :disabled="composerSaving" @click="createTicket">
             {{ composerSaving ? "Sending..." : "Create & Send Email" }}
           </button>
         </div>
@@ -429,9 +471,10 @@
                     v-model="bccSearchQuery"
                     type="text"
                     class="recipient-input"
-                    placeholder="Type reference number, student name or email…"
+                    placeholder="Type or paste reference numbers (comma-separated)…"
                     autocomplete="off"
                     @input="onBccSearch"
+                    @paste="onBccPaste"
                     @keydown.enter.prevent="addStudentFromInput"
                     @keydown.backspace="onBccBackspace"
                     @keydown.escape="bccResults = []"
@@ -695,50 +738,76 @@
               Send a test copy first
             </label>
             <div v-if="bulkEmail.testEnabled" class="test-mail-body">
-              <div class="input-with-action">
-                <input
-                  v-model="bulkEmail.testEmail"
-                  type="text"
-                  placeholder="you@example.com, colleague@example.com"
-                  autocomplete="off"
-                  @input="onBulkTestEmailInput"
-                  @focus="onBulkTestEmailInput"
-                />
+              <div class="recipient-multiselect" @click="focusBulkTestInput">
+                <span
+                  v-for="r in bulkEmail.testRecipients"
+                  :key="r.email"
+                  class="recipient-chip"
+                >
+                  <span class="recipient-chip-label" :title="r.email">{{
+                    r.name
+                  }}</span>
+                  <button
+                    type="button"
+                    class="recipient-chip-remove"
+                    @click.stop="removeBulkTestRecipient(r.email)"
+                  >
+                    ×
+                  </button>
+                </span>
+                <div class="recipient-input-wrap">
+                  <input
+                    ref="bulkTestInputRef"
+                    v-model="bulkTestQuery"
+                    type="text"
+                    class="recipient-input"
+                    placeholder="Add a user by name or email…"
+                    autocomplete="off"
+                    @input="onBulkTestEmailInput"
+                    @paste="onBulkTestPaste"
+                    @keydown.enter.prevent="addBulkTestFromInput"
+                    @keydown="onBulkTestKeydown"
+                    @focus="onBulkTestEmailInput"
+                  />
+                  <div
+                    v-if="bulkTestSuggestions.length"
+                    class="recipient-dropdown"
+                  >
+                    <button
+                      v-for="u in bulkTestSuggestions"
+                      :key="u.name"
+                      type="button"
+                      class="recipient-dropdown-item"
+                      @mousedown.prevent="selectBulkTestUser(u)"
+                    >
+                      <span class="rd-name">{{ u.full_name || u.name }}</span>
+                      <span class="rd-email">{{ u.email || u.name }}</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="composer-attachment-actions" style="margin-top: 6px">
                 <button
                   type="button"
-                  class="btn secondary input-action-btn"
-                  :disabled="bulkTestSending"
+                  class="btn secondary"
+                  :disabled="
+                    bulkTestSending || !bulkEmail.testRecipients.length
+                  "
                   @click="sendBulkTestEmail"
                 >
                   {{ bulkTestSending ? "Sending…" : "Send Test" }}
                 </button>
               </div>
-              <ul v-if="bulkTestSuggestions.length" class="user-suggestions">
-                <li
-                  v-for="u in bulkTestSuggestions"
-                  :key="u.name"
-                  @mousedown.prevent="selectBulkTestUser(u)"
-                >
-                  <span
-                    class="avatar"
-                    style="width: 20px; height: 20px; font-size: 9px"
-                  >
-                    {{ initials(u.full_name || u.name) }}
-                  </span>
-                  <span>{{ u.full_name || u.name }}</span>
-                  <small>{{ u.email || u.name }}</small>
-                </li>
-              </ul>
               <p v-if="bulkEmail.testSent" class="muted test-mail-hint success">
                 ✓ Test sent to
-                {{ splitTestEmails(bulkEmail.testEmail).join(", ") }} — verify
-                it, then Send to all. Editing the email or recipients
+                {{ bulkEmail.testRecipients.map((r) => r.name).join(", ") }} —
+                verify it, then Send to all. Editing the email or recipients
                 re-requires a test.
               </p>
               <p v-else class="muted test-mail-hint">
-                Sends a copy (rendered like the first recipient's email) to the
-                address(es) above — separate multiple with commas. Verify it,
-                then the Send button unlocks.
+                Adds one or more verifiers (chips). Send them a copy rendered
+                like the first recipient's email; verify it, then the Send
+                button unlocks.
               </p>
             </div>
           </div>
@@ -747,11 +816,7 @@
           <button class="btn secondary" @click="closeBulkEmail">Cancel</button>
           <button
             class="btn"
-            :disabled="
-              bulkEmailSending ||
-              !bulkEmailStudentCount ||
-              (bulkEmail.testEnabled && !bulkEmail.testSent)
-            "
+            :disabled="bulkEmailSending || !bulkEmailStudentCount"
             @click="sendBulkEmail"
           >
             {{
@@ -826,15 +891,22 @@ const composer = reactive({
   assignee: "",
   attachments: [],
   // Optional "send a test copy first" step (manual preview → verify → unlock send).
+  // testRecipients: [{ email, name }] verifiers shown as chips.
   testEnabled: false,
-  testEmail: "",
+  testRecipients: [],
   testSent: false,
 });
-// Test-mail step (create composer): its own typeahead list + in-flight flag, so it
-// never collides with the raised_by (customer email) typeahead above.
+// Test-mail step (create composer): its own typeahead query/list + in-flight flag, so
+// it never collides with the raised_by (customer email) typeahead above.
 const composerTestSending = ref(false);
 const composerTestSuggestions = ref([]);
+const composerTestQuery = ref("");
+const composerTestInputRef = ref(null);
 let composerTestSuggestTimeout = null;
+// Searchable "Assign To" combobox (create composer). agents already arrive A–Z from
+// the backend; we re-sort defensively and filter by the typed query.
+const assigneeQuery = ref("");
+const assigneeOpen = ref(false);
 
 // --- Bulk email state ---
 const openBulkEmail = ref(false);
@@ -861,13 +933,16 @@ const bulkEmail = reactive({
   mergeFields: [], // student fields usable as {{field}}
   csvImported: false,
   // Optional "send a test copy first" step (manual preview → verify → unlock send).
+  // testRecipients: [{ email, name }] verifiers shown as chips.
   testEnabled: false,
-  testEmail: "",
+  testRecipients: [],
   testSent: false,
 });
-// Test-mail step (bulk composer): its own typeahead list + in-flight flag.
+// Test-mail step (bulk composer): its own typeahead query/list + in-flight flag.
 const bulkTestSending = ref(false);
 const bulkTestSuggestions = ref([]);
+const bulkTestQuery = ref("");
+const bulkTestInputRef = ref(null);
 let bulkTestSuggestTimeout = null;
 const includeGuardians = ref(false);
 // Recipient toggles (both modes): exclude the student's own email (send to
@@ -1035,10 +1110,13 @@ function closeComposer() {
   composer.priority = "";
   composer.ticket_type = "";
   composer.assignee = "";
+  assigneeQuery.value = "";
+  assigneeOpen.value = false;
   composer.attachments = [];
   composer.testEnabled = false;
-  composer.testEmail = "";
+  composer.testRecipients = [];
   composer.testSent = false;
+  composerTestQuery.value = "";
   composerTestSuggestions.value = [];
   composerTestSending.value = false;
 }
@@ -1121,11 +1199,62 @@ function selectUser(user) {
   userSuggestions.value = [];
 }
 
-// --- Create-composer test-mail step ---
+// --- Searchable "Assign To" combobox (create composer) ---
+const sortedAgents = computed(() =>
+  [...agents.value].sort((a, b) =>
+    (a.full_name || a.name || "").localeCompare(b.full_name || b.name || "")
+  )
+);
+const assigneeMatches = computed(() => {
+  const q = assigneeQuery.value.trim().toLowerCase();
+  if (!q) return sortedAgents.value;
+  return sortedAgents.value.filter((a) =>
+    [a.full_name, a.name, a.email].some((v) =>
+      String(v || "")
+        .toLowerCase()
+        .includes(q)
+    )
+  );
+});
+function assigneeLabel(name) {
+  if (!name) return "";
+  const a = agents.value.find((x) => x.name === name);
+  return a ? a.full_name || a.name : name;
+}
+function onAssigneeInput() {
+  assigneeOpen.value = true;
+}
+function onAssigneeFocus() {
+  assigneeOpen.value = true;
+}
+function onAssigneeBlur() {
+  // Let a click on an option register first, then close and snap the text back to
+  // the actual selection (so the box never shows an unpicked half-typed query).
+  setTimeout(() => {
+    assigneeOpen.value = false;
+    assigneeQuery.value = assigneeLabel(composer.assignee);
+  }, 120);
+}
+function pickAssignee(agent) {
+  composer.assignee = agent.name;
+  assigneeQuery.value = agent.full_name || agent.name;
+  assigneeOpen.value = false;
+}
+function clearAssignee() {
+  composer.assignee = "";
+  assigneeQuery.value = "";
+  assigneeOpen.value = false;
+}
+
+// --- Create-composer test-mail step (verifier chips) ---
+function focusCreateTestInput() {
+  composerTestInputRef.value?.focus();
+}
+
 function onCreateTestEmailInput() {
   clearTimeout(composerTestSuggestTimeout);
-  const query = lastEmailToken(composer.testEmail);
-  if (!query || query.length < 2) {
+  const query = (composerTestQuery.value || "").trim();
+  if (query.length < 2) {
     composerTestSuggestions.value = [];
     return;
   }
@@ -1139,11 +1268,49 @@ function onCreateTestEmailInput() {
 }
 
 function selectCreateTestUser(user) {
-  composer.testEmail = appendPickedEmail(
-    composer.testEmail,
-    user.email || user.name
+  _addTestRecipient(
+    composer.testRecipients,
+    user.email || user.name,
+    user.full_name || user.name
   );
+  composerTestQuery.value = "";
   composerTestSuggestions.value = [];
+  composerTestInputRef.value?.focus();
+}
+
+function addCreateTestFromInput() {
+  if (!composerTestQuery.value || !composerTestQuery.value.trim()) return;
+  _addTestRecipientsFromText(composer.testRecipients, composerTestQuery.value);
+  composerTestQuery.value = "";
+  composerTestSuggestions.value = [];
+}
+
+function onCreateTestKeydown(e) {
+  if (e.key === "," || e.key === ";") {
+    e.preventDefault();
+    addCreateTestFromInput();
+  } else if (
+    e.key === "Backspace" &&
+    !composerTestQuery.value &&
+    composer.testRecipients.length
+  ) {
+    composer.testRecipients.pop();
+  }
+}
+
+function onCreateTestPaste(e) {
+  const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+  if (!/[\s,;]/.test(text)) return; // single token — let default paste + typeahead work
+  e.preventDefault();
+  _addTestRecipientsFromText(composer.testRecipients, text);
+  composerTestQuery.value = "";
+  composerTestSuggestions.value = [];
+}
+
+function removeCreateTestRecipient(email) {
+  composer.testRecipients = composer.testRecipients.filter(
+    (r) => r.email !== email
+  );
 }
 
 // Send ONE test copy of the create-ticket email (rendered like the customer's own
@@ -1159,10 +1326,12 @@ async function sendCreateTestEmail() {
     composerError.value = "Message is required before sending a test.";
     return;
   }
-  const testEmails = splitTestEmails(composer.testEmail);
-  if (!testEmails.length || !testEmails.every((e) => EMAIL_REGEX.test(e))) {
+  // Fold in any half-typed address still in the input.
+  if (composerTestQuery.value.trim()) addCreateTestFromInput();
+  const emails = composer.testRecipients.map((r) => r.email);
+  if (!emails.length) {
     composerError.value =
-      "Enter one or more valid email addresses (comma-separated) for the test copy.";
+      "Add at least one valid verifier email for the test copy.";
     return;
   }
   composerTestSending.value = true;
@@ -1171,7 +1340,7 @@ async function sendCreateTestEmail() {
     await call("helpdesk.api.unity_helpdesk_ext.send_test_email", {
       subject: composer.subject,
       message: composer.message,
-      test_email: testEmails.join(", "),
+      test_email: emails.join(", "),
       ticket_type: composer.ticket_type,
       raised_by: composer.raised_by,
       attachments: JSON.stringify(
@@ -1180,9 +1349,9 @@ async function sendCreateTestEmail() {
     });
     composer.testSent = true;
     showGlobalNotice(
-      `Test sent to ${testEmails.join(
-        ", "
-      )} — check the inbox, then Create & Send.`,
+      `Test sent to ${composer.testRecipients
+        .map((r) => r.name)
+        .join(", ")} — check the inbox, then Create & Send.`,
       "success",
       8000
     );
@@ -1230,6 +1399,13 @@ async function createTicket() {
     composerError.value = "Ticket Type is required.";
     return;
   }
+  // Verification gate: if "Send a test copy first" is on, a test must be sent before
+  // the real send. Explain rather than silently doing nothing.
+  if (composer.testEnabled && !composer.testSent) {
+    composerError.value =
+      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly.";
+    return;
+  }
   // Snapshot the payload BEFORE closing (closeComposer resets the form). Then close
   // the composer immediately and report progress out-of-band — the request runs in
   // the background so the UI never hangs on a slow send. The new ticket appears in
@@ -1271,9 +1447,9 @@ async function createTicket() {
 // --- Bulk email ---
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
-// --- Shared helpers for the "send a test copy first" step (multiple verifiers) ---
+// --- Shared helpers for the "send a test copy first" step (verifier chips) ---
 // Split a comma/semicolon/whitespace-separated string into trimmed, lowercased,
-// deduped emails.
+// deduped emails (test verifiers are emails, so splitting on spaces is safe here).
 function splitTestEmails(str) {
   const out = [];
   const seen = new Set();
@@ -1286,23 +1462,22 @@ function splitTestEmails(str) {
   }
   return out;
 }
-// The address the user is currently typing = text after the last separator, so the
-// typeahead searches just that token (not the whole "a@x.com, prad…" string).
-function lastEmailToken(str) {
-  const parts = (str || "").split(/[,;]/);
-  return (parts[parts.length - 1] || "").trim();
+// Add ONE {email, name} verifier chip to a list (validated + deduped). Returns true
+// if added.
+function _addTestRecipient(list, email, name) {
+  const e = (email || "").trim().toLowerCase();
+  if (!e || !EMAIL_REGEX.test(e)) return false;
+  if (list.some((r) => r.email === e)) return false;
+  list.push({ email: e, name: (name || "").trim() || e });
+  return true;
 }
-// Replace the token being typed with the picked email + a trailing separator, so
-// the user can keep adding more recipients.
-function appendPickedEmail(current, email) {
-  const parts = (current || "").split(/[,;]/);
-  parts[parts.length - 1] = email;
-  return (
-    parts
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .join(", ") + ", "
-  );
+// Add every valid email found in a typed/pasted string as its own chip.
+function _addTestRecipientsFromText(list, text) {
+  let added = false;
+  for (const email of splitTestEmails(text)) {
+    if (_addTestRecipient(list, email)) added = true;
+  }
+  return added;
 }
 
 // Deliverable emails for one student: the student + (optionally) their guardians,
@@ -1462,12 +1637,33 @@ function focusBccInput() {
 // Add a reference number / student name / email the agent typed or picked. The
 // backend resolve_bulk_email_students turns each token into a student (with
 // guardians + merge data) or a free email.
-function addStudentToken(token) {
+// Reference numbers / emails are separated by comma, semicolon, newline or tab when
+// a list is typed or pasted (e.g. "SHRB72, SHTA94" or an Excel column). Plain spaces
+// are NOT separators — a typed student name ("John Smith") must stay one token.
+const REF_SPLIT_RE = /[,;\n\r\t]+/;
+
+// Push ONE raw token (case-insensitive dedupe). Returns true if it was added.
+function _pushStudentToken(token) {
   const t = (token || "").trim();
-  if (!t) return;
-  if (bulkEmail.tokens.some((x) => x.toLowerCase() === t.toLowerCase())) return;
+  if (!t) return false;
+  if (bulkEmail.tokens.some((x) => x.toLowerCase() === t.toLowerCase()))
+    return false;
   bulkEmail.tokens.push(t);
-  resolveStudents();
+  return true;
+}
+
+function addStudentToken(token) {
+  if (_pushStudentToken(token)) resolveStudents();
+}
+
+// Add MANY tokens at once (a pasted/typed list), resolving only ONCE at the end so a
+// 180-reference paste is a single backend round-trip, not 180.
+function addStudentTokens(list) {
+  let added = false;
+  for (const raw of list) {
+    if (_pushStudentToken(raw)) added = true;
+  }
+  if (added) resolveStudents();
 }
 
 function selectStudent(r) {
@@ -1478,9 +1674,25 @@ function selectStudent(r) {
 }
 
 function addStudentFromInput() {
-  const val = bccSearchQuery.value.trim();
-  if (!val) return;
-  addStudentToken(val);
+  const raw = bccSearchQuery.value;
+  if (!raw || !raw.trim()) return;
+  // Split a typed list (comma/semicolon/newline/tab) into individual references so
+  // each becomes its own resolved student chip instead of one "not found" blob.
+  const parts = raw.split(REF_SPLIT_RE).filter((p) => p.trim());
+  if (parts.length > 1) addStudentTokens(parts);
+  else addStudentToken(raw);
+  bccSearchQuery.value = "";
+  bccResults.value = [];
+}
+
+// Paste of a multi-reference list: tokenize immediately (no Enter needed). A single
+// pasted value falls through to the default paste so the typeahead still works.
+function onBccPaste(e) {
+  const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+  const parts = text.split(REF_SPLIT_RE).filter((p) => p.trim());
+  if (parts.length <= 1) return; // let the browser paste it normally
+  e.preventDefault();
+  addStudentTokens(parts);
   bccSearchQuery.value = "";
   bccResults.value = [];
 }
@@ -1658,8 +1870,9 @@ function resetBulkEmail() {
   bulkEmail.mergeFields = [];
   bulkEmail.csvImported = false;
   bulkEmail.testEnabled = false;
-  bulkEmail.testEmail = "";
+  bulkEmail.testRecipients = [];
   bulkEmail.testSent = false;
+  bulkTestQuery.value = "";
   bulkTestSuggestions.value = [];
   bulkTestSending.value = false;
   ccInputQuery.value = "";
@@ -1816,6 +2029,14 @@ async function sendBulkEmail() {
     bulkEmailError.value = "Message is required.";
     return;
   }
+  // Verification gate: if "Send a test copy first" is on, a test must be sent (and
+  // eyeballed) before the real send. Tell the user exactly what to do rather than
+  // silently doing nothing.
+  if (bulkEmail.testEnabled && !bulkEmail.testSent) {
+    bulkEmailError.value =
+      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly.";
+    return;
+  }
   // Build the payload BEFORE closing the composer (closeBulkEmail resets the form).
   const ccEmails = bulkEmail.cc.map((c) => c.email);
   const payload = {
@@ -1847,16 +2068,18 @@ async function sendBulkEmail() {
     if (result?.warning) {
       showGlobalNotice(result.warning, "error", 9000);
     } else {
-      const n = result?.ticket_count || result?.student_count || studentCount;
+      // The send now runs in a background worker (so a big batch can't time out
+      // the request), so the tickets are being CREATED, not done yet.
+      const n = result?.student_count || result?.ticket_count || studentCount;
       const noun = n === 1 ? "ticket" : "tickets";
-      let message =
-        result?.instant === false
-          ? `Bulk email queued — ${n} ${noun} created, sending shortly.`
-          : `Bulk email sent — ${n} ${noun} created.`;
+      let message = `Bulk email started — ${n} ${noun} are being created and will send shortly.`;
       if (result?.invalid_count) {
         message += ` ${result.invalid_count} invalid address(es) skipped.`;
       }
-      showGlobalNotice(message, "success", 6000);
+      showGlobalNotice(message, "success", 7000);
+      // The worker creates tickets after this response returns; refresh again a few
+      // seconds later so they show up without the user having to reload.
+      setTimeout(signalTicketsRefresh, 4000);
     }
   } catch (err) {
     showGlobalNotice(
@@ -1867,11 +2090,15 @@ async function sendBulkEmail() {
   }
 }
 
-// --- Bulk-composer test-mail step ---
+// --- Bulk-composer test-mail step (verifier chips) ---
+function focusBulkTestInput() {
+  bulkTestInputRef.value?.focus();
+}
+
 function onBulkTestEmailInput() {
   clearTimeout(bulkTestSuggestTimeout);
-  const query = lastEmailToken(bulkEmail.testEmail);
-  if (!query || query.length < 2) {
+  const query = (bulkTestQuery.value || "").trim();
+  if (query.length < 2) {
     bulkTestSuggestions.value = [];
     return;
   }
@@ -1885,11 +2112,49 @@ function onBulkTestEmailInput() {
 }
 
 function selectBulkTestUser(user) {
-  bulkEmail.testEmail = appendPickedEmail(
-    bulkEmail.testEmail,
-    user.email || user.name
+  _addTestRecipient(
+    bulkEmail.testRecipients,
+    user.email || user.name,
+    user.full_name || user.name
   );
+  bulkTestQuery.value = "";
   bulkTestSuggestions.value = [];
+  bulkTestInputRef.value?.focus();
+}
+
+function addBulkTestFromInput() {
+  if (!bulkTestQuery.value || !bulkTestQuery.value.trim()) return;
+  _addTestRecipientsFromText(bulkEmail.testRecipients, bulkTestQuery.value);
+  bulkTestQuery.value = "";
+  bulkTestSuggestions.value = [];
+}
+
+function onBulkTestKeydown(e) {
+  if (e.key === "," || e.key === ";") {
+    e.preventDefault();
+    addBulkTestFromInput();
+  } else if (
+    e.key === "Backspace" &&
+    !bulkTestQuery.value &&
+    bulkEmail.testRecipients.length
+  ) {
+    bulkEmail.testRecipients.pop();
+  }
+}
+
+function onBulkTestPaste(e) {
+  const text = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+  if (!/[\s,;]/.test(text)) return; // single token — let default paste + typeahead work
+  e.preventDefault();
+  _addTestRecipientsFromText(bulkEmail.testRecipients, text);
+  bulkTestQuery.value = "";
+  bulkTestSuggestions.value = [];
+}
+
+function removeBulkTestRecipient(email) {
+  bulkEmail.testRecipients = bulkEmail.testRecipients.filter(
+    (r) => r.email !== email
+  );
 }
 
 // Send ONE test copy of the bulk email, rendered with the FIRST recipient's real
@@ -1910,10 +2175,12 @@ async function sendBulkTestEmail() {
     bulkEmailError.value = "Message is required before sending a test.";
     return;
   }
-  const testEmails = splitTestEmails(bulkEmail.testEmail);
-  if (!testEmails.length || !testEmails.every((e) => EMAIL_REGEX.test(e))) {
+  // Fold in any half-typed address still in the input.
+  if (bulkTestQuery.value.trim()) addBulkTestFromInput();
+  const emails = bulkEmail.testRecipients.map((r) => r.email);
+  if (!emails.length) {
     bulkEmailError.value =
-      "Enter one or more valid email addresses (comma-separated) for the test copy.";
+      "Add at least one valid verifier email for the test copy.";
     return;
   }
   bulkTestSending.value = true;
@@ -1922,7 +2189,7 @@ async function sendBulkTestEmail() {
     await call("helpdesk.api.unity_helpdesk_ext.send_test_email", {
       subject: bulkEmail.subject,
       message: bulkEmail.message,
-      test_email: testEmails.join(", "),
+      test_email: emails.join(", "),
       ticket_type: bulkEmail.ticket_type,
       groups: JSON.stringify(groups),
       attachments: JSON.stringify(
@@ -1931,9 +2198,9 @@ async function sendBulkTestEmail() {
     });
     bulkEmail.testSent = true;
     showGlobalNotice(
-      `Test sent to ${testEmails.join(
-        ", "
-      )} — check the inbox, then Send to all.`,
+      `Test sent to ${bulkEmail.testRecipients
+        .map((r) => r.name)
+        .join(", ")} — check the inbox, then Send to all.`,
       "success",
       8000
     );
