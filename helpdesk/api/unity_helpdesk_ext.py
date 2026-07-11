@@ -911,6 +911,17 @@ def bulk_send_email(
     }
 
 
+def _is_deadlock(exc):
+    """True for a TRANSIENT MariaDB deadlock (1213) or lock-wait timeout (1205).
+    Both mean "try restarting transaction" — the same statement almost always
+    succeeds on a retry, so we must NOT drop the student on these."""
+    args = getattr(exc, "args", None) or ()
+    if args and args[0] in (1213, 1205):
+        return True
+    text = str(exc)
+    return "Deadlock found" in text or "Lock wait timeout" in text
+
+
 def _bulk_send_email_job(
     subject,
     message,
@@ -991,38 +1002,73 @@ def _bulk_send_email_job(
                     sorted(set(emails) | set(cc_list))
                 )
 
-            try:
-                doc = frappe.get_doc(payload).insert(ignore_permissions=True)
-            except Exception:
-                frappe.log_error(
-                    frappe.get_traceback(),
-                    "Unity bulk per-student ticket insert failed",
-                )
+            # Insert with retry-on-deadlock. Every ticket insert fires the
+            # edu_quality fetch_ticket_details hook (which creates a Communication)
+            # plus the async search-index jobs that UPDATE these same ticket rows in
+            # other workers — so under a big batch, individual inserts hit transient
+            # MariaDB deadlocks (error 1213). Those are safe to retry; without a retry
+            # the old code logged "insert failed" and dropped the student entirely
+            # (the root cause of the missing bulk tickets). Roll back the aborted
+            # transaction and retry with a small backoff before giving up.
+            doc = None
+            for _attempt in range(6):
+                try:
+                    doc = frappe.get_doc(payload).insert(ignore_permissions=True)
+                    break
+                except Exception as exc:
+                    frappe.db.rollback()
+                    if _is_deadlock(exc) and _attempt < 5:
+                        time.sleep(0.2 * (_attempt + 1))
+                        continue
+                    frappe.log_error(
+                        frappe.get_traceback(),
+                        "Unity bulk per-student ticket insert failed",
+                    )
+                    break
+            if doc is None:
                 continue
             tickets.append(doc.name)
             # Commit each ticket as it's created so it shows in the list immediately
             # and stops holding row locks during the (possibly slow) send.
             frappe.db.commit()
 
-            try:
-                frappe.sendmail(
-                    recipients=emails,
-                    cc=cc_list or None,
-                    subject=rendered_subject,
-                    message=rendered_message,
-                    attachments=sendmail_attachments,
-                    delayed=not now,
-                    reference_doctype=TICKET_DOCTYPE,
-                    reference_name=doc.name,
-                    expose_recipients="header",
-                )
-                sent_count += len(emails)
-            except Exception:
-                # A single bad group must never abort the rest of the batch.
-                frappe.log_error(
-                    frappe.get_traceback(),
-                    f"Unity bulk send failed for ticket {doc.name}",
-                )
+            # Queue/send the mail with the same retry-on-deadlock guard, so a
+            # transient lock during the Email Queue insert doesn't leave a ticket
+            # with no email record (the cause of the "ticket but no queue row" cases).
+            for _attempt in range(6):
+                try:
+                    frappe.sendmail(
+                        recipients=emails,
+                        cc=cc_list or None,
+                        subject=rendered_subject,
+                        message=rendered_message,
+                        attachments=sendmail_attachments,
+                        delayed=not now,
+                        reference_doctype=TICKET_DOCTYPE,
+                        reference_name=doc.name,
+                        expose_recipients="header",
+                    )
+                    sent_count += len(emails)
+                    break
+                except Exception as exc:
+                    if _is_deadlock(exc) and _attempt < 5:
+                        frappe.db.rollback()
+                        time.sleep(0.2 * (_attempt + 1))
+                        continue
+                    # A single bad group must never abort the rest of the batch.
+                    frappe.log_error(
+                        frappe.get_traceback(),
+                        f"Unity bulk send failed for ticket {doc.name}",
+                    )
+                    break
+
+            # Commit the queued mail NOW, before the next student's insert runs.
+            # Otherwise the Email Queue row stays uncommitted until the next commit,
+            # and if that next insert hits a deadlock our rollback would discard THIS
+            # student's email record (a ticket with no queue row). Committing per
+            # student makes each one fully durable and isolates the deadlock rollback
+            # to only the failed insert.
+            frappe.db.commit()
 
         frappe.db.commit()
         return {"tickets": tickets, "sent": sent_count, "student_count": student_count}
