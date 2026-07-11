@@ -1134,15 +1134,27 @@ textarea:focus {
   text-decoration: underline;
 }
 
-/* Subject cell rendered as a real link (native right/middle-click) but styled as
-   plain text; underline only on hover for affordance. */
-.subject-link {
-  display: block;
-  color: inherit;
-  text-decoration: none;
+/* Whole-row link: a transparent stretched <a> covering the row so native right-click
+   "Open in new tab/window" + middle-click work ANYWHERE on it. The <tr> is the
+   positioning context; interactive controls are raised above the overlay. */
+.ticket-table tbody tr {
+  position: relative;
 }
-.subject-link:hover .subject {
-  text-decoration: underline;
+.row-link {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  /* invisible click layer */
+  font-size: 0;
+}
+/* Keep every interactive control clickable above the row-link overlay. */
+.ticket-table td select,
+.ticket-table td .select-chip,
+.ticket-table td .assign-trigger,
+.ticket-table td .table-input,
+.ticket-table td.checkbox-cell input {
+  position: relative;
+  z-index: 2;
 }
 
 .scroll-x {
@@ -1291,11 +1303,6 @@ tbody tr.bulk-email-ticket:hover {
   flex-shrink: 0;
   font-size: 11px;
   opacity: 0.55;
-}
-.assign-popover-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 120;
 }
 .assign-popover {
   position: fixed;

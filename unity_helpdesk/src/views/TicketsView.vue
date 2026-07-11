@@ -644,6 +644,16 @@
                   :checked="isSelected(ticket.name)"
                   @click.stop="toggleRow(ticket.name)"
                 />
+                <!-- Stretched link covering the whole row: a real <a href> so native
+                     right-click "Open in new tab/window" + middle-click work ANYWHERE
+                     on the row. Interactive controls are raised above it via z-index. -->
+                <RouterLink
+                  class="row-link"
+                  :to="ticketTo(ticket.name)"
+                  :aria-label="`Open ticket ${ticket.name}`"
+                  @click.stop="rememberTicketNav"
+                  @auxclick.stop
+                />
               </td>
               <td
                 v-for="col in visibleColumns"
@@ -657,28 +667,14 @@
                 @click="onCellClick($event, col.key)"
               >
                 <template v-if="col.key === 'name'">
-                  <!-- Real <a href> (RouterLink) so native right-click "Open in new
-                       tab/window" + middle-click work. Plain click = SPA nav. -->
-                  <RouterLink
-                    class="link-btn"
-                    :to="ticketTo(ticket.name)"
-                    @click.stop="rememberTicketNav"
-                    @auxclick.stop
-                  >
-                    #{{ ticket.name }}
-                  </RouterLink>
+                  <!-- Styled text only; the whole row is a link via the .row-link
+                       overlay (native right-click / middle-click work anywhere). -->
+                  <span class="link-btn">#{{ ticket.name }}</span>
                 </template>
                 <template v-else-if="col.key === 'subject'">
-                  <RouterLink
-                    class="subject-link"
-                    :to="ticketTo(ticket.name)"
-                    @click.stop="rememberTicketNav"
-                    @auxclick.stop
-                  >
-                    <div class="subject">
-                      {{ ticket.subject || "No subject" }}
-                    </div>
-                  </RouterLink>
+                  <div class="subject">
+                    {{ ticket.subject || "No subject" }}
+                  </div>
                   <small class="muted">{{ ticket.raised_by }}</small>
                   <small
                     v-if="ticket.custom_search_student_names"
@@ -879,7 +875,6 @@
              overflow can never clip it. Only one is open at a time. -->
         <Teleport to="body">
           <template v-if="assignOpen">
-            <div class="assign-popover-backdrop" @click="closeAssign"></div>
             <div
               ref="assignPopoverRef"
               class="assign-popover"
@@ -2535,6 +2530,14 @@ function _onOutsideScroll(e) {
   if (pop && e.target instanceof Node && pop.contains(e.target)) return;
   closeAssign();
 }
+// Outside-CLICK close (bubble phase) — replaces the full-screen backdrop, which was
+// overlaying the page's scroll container and blocking the main scrollbar/wheel. The
+// trigger button is @click.stop, so its own click never reaches here.
+function _onAssignDocClick(e) {
+  const pop = assignPopoverRef.value;
+  if (pop && e.target instanceof Node && pop.contains(e.target)) return;
+  closeAssign();
+}
 
 const assignPopoverStyle = computed(() => ({
   top: `${assignPos.top}px`,
@@ -2554,6 +2557,11 @@ const assignMatches = computed(() => {
 });
 
 function openAssign(ticket, ev) {
+  // Clicking the trigger again closes it (toggle).
+  if (assignOpen.value === ticket.name) {
+    closeAssign();
+    return;
+  }
   _assignTicket = ticket;
   assignOpen.value = ticket.name;
   assignQuery.value = "";
@@ -2564,6 +2572,7 @@ function openAssign(ticket, ev) {
   assignPos.width = Math.round(Math.max(rect.width, 200));
   window.addEventListener("scroll", _onOutsideScroll, true);
   window.addEventListener("resize", closeAssign, true);
+  document.addEventListener("click", _onAssignDocClick);
   nextTick(() => assignSearchRef.value?.focus());
 }
 function closeAssign() {
@@ -2573,6 +2582,7 @@ function closeAssign() {
   assignQuery.value = "";
   window.removeEventListener("scroll", _onOutsideScroll, true);
   window.removeEventListener("resize", closeAssign, true);
+  document.removeEventListener("click", _onAssignDocClick);
 }
 function pickAssign(name) {
   const ticket = _assignTicket;
