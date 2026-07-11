@@ -1126,10 +1126,22 @@ textarea:focus {
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+  text-decoration: none; /* also used on <a>/RouterLink now — no default underline */
 }
 
 .link-btn:hover {
   color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+/* Subject cell rendered as a real link (native right/middle-click) but styled as
+   plain text; underline only on hover for affordance. */
+.subject-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+}
+.subject-link:hover .subject {
   text-decoration: underline;
 }
 
@@ -3013,14 +3025,18 @@ th:hover .col-remove-btn { display: inline; }
 .col-add-btn:hover { background: #eef2ff; border-color: var(--accent); }
 
 .col-add-dropdown {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  /* Teleported to <body> with fixed viewport coords so the table's scroll
+     container can't clip it. translateX(-100%) right-aligns it to the + button. */
+  position: fixed;
+  transform: translateX(-100%);
   background: white;
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
   min-width: 170px;
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   z-index: 200;
 }
@@ -3711,6 +3727,7 @@ body.col-resizing .ticket-table * {
   font-weight: 700;
   color: var(--accent, #4f46e5);
   font-size: 13px;
+  text-decoration: none;
 }
 .ticket-card-top .badge {
   margin-left: auto;

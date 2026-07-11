@@ -589,24 +589,37 @@
                     class="col-add-btn"
                     type="button"
                     title="Add column"
-                    @click.stop="toggleAddColumnMenu"
+                    @click.stop="toggleAddColumnMenu($event)"
                   >
                     +
                   </button>
-                  <div v-if="showAddCol" class="col-add-dropdown">
-                    <button
-                      v-for="c in hiddenColumns"
-                      :key="c.key"
-                      class="col-add-item"
-                      type="button"
-                      @click.stop="addColumn(c.key)"
+                  <!-- Teleported to body + fixed coords so the table's scroll
+                       container (.scroll-x, overflow) can't clip it. -->
+                  <Teleport to="body">
+                    <div
+                      v-if="showAddCol"
+                      ref="addColMenuRef"
+                      class="col-add-dropdown"
+                      :style="{
+                        top: addColPos.top + 'px',
+                        left: addColPos.left + 'px',
+                      }"
+                      @click.stop
                     >
-                      {{ c.label }}
-                    </button>
-                    <span v-if="!hiddenColumns.length" class="col-add-empty"
-                      >All columns shown</span
-                    >
-                  </div>
+                      <button
+                        v-for="c in hiddenColumns"
+                        :key="c.key"
+                        class="col-add-item"
+                        type="button"
+                        @click.stop="addColumn(c.key)"
+                      >
+                        {{ c.label }}
+                      </button>
+                      <span v-if="!hiddenColumns.length" class="col-add-empty"
+                        >All columns shown</span
+                      >
+                    </div>
+                  </Teleport>
                 </div>
               </th>
             </tr>
@@ -644,19 +657,28 @@
                 @click="onCellClick($event, col.key)"
               >
                 <template v-if="col.key === 'name'">
-                  <button
+                  <!-- Real <a href> (RouterLink) so native right-click "Open in new
+                       tab/window" + middle-click work. Plain click = SPA nav. -->
+                  <RouterLink
                     class="link-btn"
-                    type="button"
-                    @click.stop="openTicket(ticket.name, $event)"
-                    @auxclick.middle.stop="openTicket(ticket.name, $event)"
+                    :to="ticketTo(ticket.name)"
+                    @click.stop="rememberTicketNav"
+                    @auxclick.stop
                   >
                     #{{ ticket.name }}
-                  </button>
+                  </RouterLink>
                 </template>
                 <template v-else-if="col.key === 'subject'">
-                  <div class="subject">
-                    {{ ticket.subject || "No subject" }}
-                  </div>
+                  <RouterLink
+                    class="subject-link"
+                    :to="ticketTo(ticket.name)"
+                    @click.stop="rememberTicketNav"
+                    @auxclick.stop
+                  >
+                    <div class="subject">
+                      {{ ticket.subject || "No subject" }}
+                    </div>
+                  </RouterLink>
                   <small class="muted">{{ ticket.raised_by }}</small>
                   <small
                     v-if="ticket.custom_search_student_names"
@@ -914,7 +936,13 @@
                   @click.stop="toggleRow(ticket.name)"
                 />
               </label>
-              <span class="ticket-card-id">#{{ ticket.name }}</span>
+              <RouterLink
+                class="ticket-card-id"
+                :to="ticketTo(ticket.name)"
+                @click.stop="rememberTicketNav"
+                @auxclick.stop
+                >#{{ ticket.name }}</RouterLink
+              >
               <span class="badge" :class="ticket.status_indicator?.color">{{
                 ticket.status_indicator?.label || ticket.status
               }}</span>
@@ -1241,6 +1269,18 @@ async function persistColumnPrefs(prefs) {
 // Inline column management (header drag / remove / add)
 const colDragIdx = ref(null);
 const showAddCol = ref(false);
+// Fixed/viewport coords for the teleported add-column menu (anchored to the + btn).
+const addColPos = reactive({ top: 0, left: 0 });
+const addColMenuRef = ref(null);
+
+// Close on scroll/resize so the fixed menu can't detach from the button — but IGNORE
+// scrolls INSIDE the menu's own list (capture phase catches those), else scrolling
+// the column list would collapse it.
+function _onAddColScroll(e) {
+  const el = addColMenuRef.value;
+  if (el && e.target instanceof Node && el.contains(e.target)) return;
+  closeAddColMenu();
+}
 
 const hiddenColumns = computed(() => {
   const visible = new Set(
@@ -1249,8 +1289,24 @@ const hiddenColumns = computed(() => {
   return (availableColumns.value || []).filter((c) => !visible.has(c.key));
 });
 
-function toggleAddColumnMenu() {
-  showAddCol.value = !showAddCol.value;
+function toggleAddColumnMenu(ev) {
+  if (showAddCol.value) {
+    closeAddColMenu();
+    return;
+  }
+  const rect = ev.currentTarget.getBoundingClientRect();
+  // Right-align to the button (CSS translateX(-100%)), opening just below it.
+  addColPos.top = Math.round(rect.bottom + 6);
+  addColPos.left = Math.round(rect.right);
+  showAddCol.value = true;
+  window.addEventListener("scroll", _onAddColScroll, true);
+  window.addEventListener("resize", closeAddColMenu, true);
+}
+function closeAddColMenu() {
+  if (!showAddCol.value) return;
+  showAddCol.value = false;
+  window.removeEventListener("scroll", _onAddColScroll, true);
+  window.removeEventListener("resize", closeAddColMenu, true);
 }
 
 function onColDragStart(e, idx) {
@@ -1318,7 +1374,7 @@ async function addColumn(key) {
     ...(unitySession?.settings?.column_preferences || []),
     { key, width: def.width || 140 },
   ];
-  showAddCol.value = false;
+  closeAddColMenu();
   setColumnPrefsLocal(prefs); // column shows instantly using already-loaded data
   if (columnNeedsFetch(def)) {
     // Only the few extra-field columns (SLA dates, mail body) hit this.
@@ -1328,12 +1384,16 @@ async function addColumn(key) {
   }
 }
 
-// Close add-column dropdown on outside click
+// Close add-column dropdown on outside click (menu items + button are @click.stop,
+// so this only fires for genuine outside clicks).
 function onDocClick() {
-  showAddCol.value = false;
+  closeAddColMenu();
 }
 onMounted(() => document.addEventListener("click", onDocClick));
-onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocClick);
+  closeAddColMenu();
+});
 
 // Column widths are stored as pixel values but presented to the user on a
 // friendly 1-10 scale. Each scale step maps to a fixed pixel width below.
@@ -2403,14 +2463,32 @@ function formatHoldWindow(ticket) {
   return formatDate(ticket.custom_hold_from || ticket.custom_hold_to);
 }
 
-function openTicket(name, event) {
-  const target = {
+// Route target for a ticket, carrying the current list filters + which view.
+function ticketTo(name) {
+  return {
     path: `/tickets/${name}`,
     query: {
       ...routeQueryFromState(),
       list_view: props.view,
     },
   };
+}
+
+// Remember the current list order so the detail view's prev/next navigation works.
+function rememberTicketNav() {
+  sessionStorage.setItem(
+    "unity:ticket_nav",
+    JSON.stringify({
+      ids: tickets.value.map((t) => String(t.name)),
+      view: props.view,
+    })
+  );
+}
+
+// Used for clicks on non-link parts of a row. The ticket-id and subject are real
+// <RouterLink>s (so native right-click / middle-click work); this covers the rest.
+function openTicket(name, event) {
+  const target = ticketTo(name);
   // Ctrl / Cmd / middle-click (or Shift) → open in a new browser tab, like a real
   // link. `event.button === 1` covers middle-click via @auxclick.middle.
   if (
@@ -2420,14 +2498,7 @@ function openTicket(name, event) {
     window.open(router.resolve(target).href, "_blank", "noopener");
     return;
   }
-  // Plain click → same-tab SPA navigation. Store the current list for prev/next.
-  sessionStorage.setItem(
-    "unity:ticket_nav",
-    JSON.stringify({
-      ids: tickets.value.map((t) => String(t.name)),
-      view: props.view,
-    })
-  );
+  rememberTicketNav();
   router.push(target);
 }
 
