@@ -25,6 +25,7 @@ from helpdesk.api.unity_helpdesk import (
     _parse_json,
     _require_unity_access,
     _require_ticket_access,
+    _status_field_updates,
     _ticket_fields,
     get_student_context_for_ticket,
     update_ticket_message_search_index,
@@ -304,17 +305,13 @@ def update_ticket(
             clear_all_assignments(TICKET_DOCTYPE, name)
 
     if status:
-        if on_hold_selected:
-            if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
-                ticket.custom_is_on_hold = 1
-            if ticket.status in FINAL_STATUSES or not ticket.status:
-                ticket.status = "Open"
-        elif status not in STATUS_OPTIONS:
+        if not on_hold_selected and status not in STATUS_OPTIONS:
             frappe.throw(_("Invalid ticket status"))
-        else:
-            ticket.status = status
-            if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
-                ticket.custom_is_on_hold = 0
+        # Shared with bulk_update_tickets so inline + bulk agree on how a status
+        # (incl. the virtual "On Hold") maps to fields. Full save below still runs
+        # SLA/Activity/Version for the single-ticket path.
+        for _field, _val in _status_field_updates(status, ticket.status).items():
+            ticket.set(_field, _val)
 
     if priority:
         ticket.priority = priority

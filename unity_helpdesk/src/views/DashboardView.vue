@@ -72,36 +72,48 @@
       </div>
 
       <div class="dashboard-metrics dashboard-metrics-six">
-        <div class="metric metric-strong">
+        <RouterLink class="metric metric-strong" :to="listTo()">
           <small>Total</small>
           <b>{{ cards.total || 0 }}</b>
           <span>Tickets in selected window</span>
-        </div>
-        <div class="metric metric-accent">
+        </RouterLink>
+        <RouterLink class="metric metric-accent" :to="listTo()">
           <small>Created</small>
           <b>{{ cards.created || 0 }}</b>
           <span>New tickets added</span>
-        </div>
-        <div class="metric metric-warning">
+        </RouterLink>
+        <RouterLink
+          class="metric metric-warning"
+          :to="listTo({ status: 'Open' })"
+        >
           <small>Open / Pending</small>
           <b>{{ cards.pending || 0 }}</b>
           <span>Active workload</span>
-        </div>
-        <div class="metric metric-hold">
+        </RouterLink>
+        <RouterLink
+          class="metric metric-hold"
+          :to="listTo({ status: 'On Hold' })"
+        >
           <small>On Hold</small>
           <b>{{ cards.on_hold || 0 }}</b>
           <span>Waiting with blockers</span>
-        </div>
-        <div class="metric metric-success">
+        </RouterLink>
+        <RouterLink
+          class="metric metric-success"
+          :to="listTo({ status: 'Resolved' })"
+        >
           <small>Resolved</small>
           <b>{{ cards.resolved || 0 }}</b>
           <span>Marked resolved</span>
-        </div>
-        <div class="metric metric-muted">
+        </RouterLink>
+        <RouterLink
+          class="metric metric-muted"
+          :to="listTo({ status: 'Closed' })"
+        >
           <small>Closed</small>
           <b>{{ cards.closed || 0 }}</b>
           <span>Fully closed tickets</span>
-        </div>
+        </RouterLink>
       </div>
 
       <div class="dashboard-grid">
@@ -133,10 +145,11 @@
             </div>
 
             <div class="donut-legend">
-              <div
+              <RouterLink
                 v-for="segment in donutLegend"
                 :key="segment.name"
                 class="legend-row"
+                :to="listTo({ ticket_type: segment.name })"
               >
                 <span
                   class="legend-dot"
@@ -148,7 +161,7 @@
                     >{{ segment.value }} tickets · {{ segment.percent }}%</small
                   >
                 </div>
-              </div>
+              </RouterLink>
               <p v-if="!donutLegend.length" class="empty inline-empty">
                 No ticket type data for this range.
               </p>
@@ -236,6 +249,18 @@ const summary = ref({
   to_date: "",
   bucket: "day",
 });
+
+// Drill-down target for a KPI card / chart slice → the All-Tickets list, carrying
+// the dashboard's date window (so counts match) plus an optional status/type filter.
+// A RouterLink to this makes each card a real link (native right/middle-click →
+// open the filtered list in a new tab). TicketsView self-filters from these query
+// params (applyRouteState). "On Hold" is handled server-side as a virtual status.
+function listTo(extra = {}) {
+  const query = { ...extra };
+  if (summary.value.from_date) query.created_from = summary.value.from_date;
+  if (summary.value.to_date) query.created_to = summary.value.to_date;
+  return { path: "/tickets/all", query };
+}
 
 const presets = [
   { value: "today", label: "Today" },
