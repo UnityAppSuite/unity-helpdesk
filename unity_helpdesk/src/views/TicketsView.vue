@@ -589,24 +589,37 @@
                     class="col-add-btn"
                     type="button"
                     title="Add column"
-                    @click.stop="toggleAddColumnMenu"
+                    @click.stop="toggleAddColumnMenu($event)"
                   >
                     +
                   </button>
-                  <div v-if="showAddCol" class="col-add-dropdown">
-                    <button
-                      v-for="c in hiddenColumns"
-                      :key="c.key"
-                      class="col-add-item"
-                      type="button"
-                      @click.stop="addColumn(c.key)"
+                  <!-- Teleported to body + fixed coords so the table's scroll
+                       container (.scroll-x, overflow) can't clip it. -->
+                  <Teleport to="body">
+                    <div
+                      v-if="showAddCol"
+                      ref="addColMenuRef"
+                      class="col-add-dropdown"
+                      :style="{
+                        top: addColPos.top + 'px',
+                        left: addColPos.left + 'px',
+                      }"
+                      @click.stop
                     >
-                      {{ c.label }}
-                    </button>
-                    <span v-if="!hiddenColumns.length" class="col-add-empty"
-                      >All columns shown</span
-                    >
-                  </div>
+                      <button
+                        v-for="c in hiddenColumns"
+                        :key="c.key"
+                        class="col-add-item"
+                        type="button"
+                        @click.stop="addColumn(c.key)"
+                      >
+                        {{ c.label }}
+                      </button>
+                      <span v-if="!hiddenColumns.length" class="col-add-empty"
+                        >All columns shown</span
+                      >
+                    </div>
+                  </Teleport>
                 </div>
               </th>
             </tr>
@@ -631,6 +644,16 @@
                   :checked="isSelected(ticket.name)"
                   @click.stop="toggleRow(ticket.name)"
                 />
+                <!-- Stretched link covering the whole row: a real <a href> so native
+                     right-click "Open in new tab/window" + middle-click work ANYWHERE
+                     on the row. Interactive controls are raised above it via z-index. -->
+                <RouterLink
+                  class="row-link"
+                  :to="ticketTo(ticket.name)"
+                  :aria-label="`Open ticket ${ticket.name}`"
+                  @click.stop="rememberTicketNav"
+                  @auxclick.stop
+                />
               </td>
               <td
                 v-for="col in visibleColumns"
@@ -644,14 +667,9 @@
                 @click="onCellClick($event, col.key)"
               >
                 <template v-if="col.key === 'name'">
-                  <button
-                    class="link-btn"
-                    type="button"
-                    @click.stop="openTicket(ticket.name, $event)"
-                    @auxclick.middle.stop="openTicket(ticket.name, $event)"
-                  >
-                    #{{ ticket.name }}
-                  </button>
+                  <!-- Styled text only; the whole row is a link via the .row-link
+                       overlay (native right-click / middle-click work anywhere). -->
+                  <span class="link-btn">#{{ ticket.name }}</span>
                 </template>
                 <template v-else-if="col.key === 'subject'">
                   <div class="subject">
@@ -857,7 +875,6 @@
              overflow can never clip it. Only one is open at a time. -->
         <Teleport to="body">
           <template v-if="assignOpen">
-            <div class="assign-popover-backdrop" @click="closeAssign"></div>
             <div
               ref="assignPopoverRef"
               class="assign-popover"
@@ -914,7 +931,13 @@
                   @click.stop="toggleRow(ticket.name)"
                 />
               </label>
-              <span class="ticket-card-id">#{{ ticket.name }}</span>
+              <RouterLink
+                class="ticket-card-id"
+                :to="ticketTo(ticket.name)"
+                @click.stop="rememberTicketNav"
+                @auxclick.stop
+                >#{{ ticket.name }}</RouterLink
+              >
               <span class="badge" :class="ticket.status_indicator?.color">{{
                 ticket.status_indicator?.label || ticket.status
               }}</span>
@@ -1241,6 +1264,18 @@ async function persistColumnPrefs(prefs) {
 // Inline column management (header drag / remove / add)
 const colDragIdx = ref(null);
 const showAddCol = ref(false);
+// Fixed/viewport coords for the teleported add-column menu (anchored to the + btn).
+const addColPos = reactive({ top: 0, left: 0 });
+const addColMenuRef = ref(null);
+
+// Close on scroll/resize so the fixed menu can't detach from the button — but IGNORE
+// scrolls INSIDE the menu's own list (capture phase catches those), else scrolling
+// the column list would collapse it.
+function _onAddColScroll(e) {
+  const el = addColMenuRef.value;
+  if (el && e.target instanceof Node && el.contains(e.target)) return;
+  closeAddColMenu();
+}
 
 const hiddenColumns = computed(() => {
   const visible = new Set(
@@ -1249,8 +1284,24 @@ const hiddenColumns = computed(() => {
   return (availableColumns.value || []).filter((c) => !visible.has(c.key));
 });
 
-function toggleAddColumnMenu() {
-  showAddCol.value = !showAddCol.value;
+function toggleAddColumnMenu(ev) {
+  if (showAddCol.value) {
+    closeAddColMenu();
+    return;
+  }
+  const rect = ev.currentTarget.getBoundingClientRect();
+  // Right-align to the button (CSS translateX(-100%)), opening just below it.
+  addColPos.top = Math.round(rect.bottom + 6);
+  addColPos.left = Math.round(rect.right);
+  showAddCol.value = true;
+  window.addEventListener("scroll", _onAddColScroll, true);
+  window.addEventListener("resize", closeAddColMenu, true);
+}
+function closeAddColMenu() {
+  if (!showAddCol.value) return;
+  showAddCol.value = false;
+  window.removeEventListener("scroll", _onAddColScroll, true);
+  window.removeEventListener("resize", closeAddColMenu, true);
 }
 
 function onColDragStart(e, idx) {
@@ -1318,7 +1369,7 @@ async function addColumn(key) {
     ...(unitySession?.settings?.column_preferences || []),
     { key, width: def.width || 140 },
   ];
-  showAddCol.value = false;
+  closeAddColMenu();
   setColumnPrefsLocal(prefs); // column shows instantly using already-loaded data
   if (columnNeedsFetch(def)) {
     // Only the few extra-field columns (SLA dates, mail body) hit this.
@@ -1328,12 +1379,16 @@ async function addColumn(key) {
   }
 }
 
-// Close add-column dropdown on outside click
+// Close add-column dropdown on outside click (menu items + button are @click.stop,
+// so this only fires for genuine outside clicks).
 function onDocClick() {
-  showAddCol.value = false;
+  closeAddColMenu();
 }
 onMounted(() => document.addEventListener("click", onDocClick));
-onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocClick);
+  closeAddColMenu();
+});
 
 // Column widths are stored as pixel values but presented to the user on a
 // friendly 1-10 scale. Each scale step maps to a fixed pixel width below.
@@ -2403,14 +2458,32 @@ function formatHoldWindow(ticket) {
   return formatDate(ticket.custom_hold_from || ticket.custom_hold_to);
 }
 
-function openTicket(name, event) {
-  const target = {
+// Route target for a ticket, carrying the current list filters + which view.
+function ticketTo(name) {
+  return {
     path: `/tickets/${name}`,
     query: {
       ...routeQueryFromState(),
       list_view: props.view,
     },
   };
+}
+
+// Remember the current list order so the detail view's prev/next navigation works.
+function rememberTicketNav() {
+  sessionStorage.setItem(
+    "unity:ticket_nav",
+    JSON.stringify({
+      ids: tickets.value.map((t) => String(t.name)),
+      view: props.view,
+    })
+  );
+}
+
+// Used for clicks on non-link parts of a row. The ticket-id and subject are real
+// <RouterLink>s (so native right-click / middle-click work); this covers the rest.
+function openTicket(name, event) {
+  const target = ticketTo(name);
   // Ctrl / Cmd / middle-click (or Shift) → open in a new browser tab, like a real
   // link. `event.button === 1` covers middle-click via @auxclick.middle.
   if (
@@ -2420,14 +2493,7 @@ function openTicket(name, event) {
     window.open(router.resolve(target).href, "_blank", "noopener");
     return;
   }
-  // Plain click → same-tab SPA navigation. Store the current list for prev/next.
-  sessionStorage.setItem(
-    "unity:ticket_nav",
-    JSON.stringify({
-      ids: tickets.value.map((t) => String(t.name)),
-      view: props.view,
-    })
-  );
+  rememberTicketNav();
   router.push(target);
 }
 
@@ -2464,6 +2530,14 @@ function _onOutsideScroll(e) {
   if (pop && e.target instanceof Node && pop.contains(e.target)) return;
   closeAssign();
 }
+// Outside-CLICK close (bubble phase) — replaces the full-screen backdrop, which was
+// overlaying the page's scroll container and blocking the main scrollbar/wheel. The
+// trigger button is @click.stop, so its own click never reaches here.
+function _onAssignDocClick(e) {
+  const pop = assignPopoverRef.value;
+  if (pop && e.target instanceof Node && pop.contains(e.target)) return;
+  closeAssign();
+}
 
 const assignPopoverStyle = computed(() => ({
   top: `${assignPos.top}px`,
@@ -2483,6 +2557,11 @@ const assignMatches = computed(() => {
 });
 
 function openAssign(ticket, ev) {
+  // Clicking the trigger again closes it (toggle).
+  if (assignOpen.value === ticket.name) {
+    closeAssign();
+    return;
+  }
   _assignTicket = ticket;
   assignOpen.value = ticket.name;
   assignQuery.value = "";
@@ -2493,6 +2572,7 @@ function openAssign(ticket, ev) {
   assignPos.width = Math.round(Math.max(rect.width, 200));
   window.addEventListener("scroll", _onOutsideScroll, true);
   window.addEventListener("resize", closeAssign, true);
+  document.addEventListener("click", _onAssignDocClick);
   nextTick(() => assignSearchRef.value?.focus());
 }
 function closeAssign() {
@@ -2502,6 +2582,7 @@ function closeAssign() {
   assignQuery.value = "";
   window.removeEventListener("scroll", _onOutsideScroll, true);
   window.removeEventListener("resize", closeAssign, true);
+  document.removeEventListener("click", _onAssignDocClick);
 }
 function pickAssign(name) {
   const ticket = _assignTicket;

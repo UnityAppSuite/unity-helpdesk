@@ -1126,11 +1126,35 @@ textarea:focus {
   font-weight: 600;
   cursor: pointer;
   padding: 0;
+  text-decoration: none; /* also used on <a>/RouterLink now — no default underline */
 }
 
 .link-btn:hover {
   color: var(--accent-hover);
   text-decoration: underline;
+}
+
+/* Whole-row link: a transparent stretched <a> covering the row so native right-click
+   "Open in new tab/window" + middle-click work ANYWHERE on it. The <tr> is the
+   positioning context; interactive controls are raised above the overlay. */
+.ticket-table tbody tr {
+  position: relative;
+}
+.row-link {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  /* invisible click layer */
+  font-size: 0;
+}
+/* Keep every interactive control clickable above the row-link overlay. */
+.ticket-table td select,
+.ticket-table td .select-chip,
+.ticket-table td .assign-trigger,
+.ticket-table td .table-input,
+.ticket-table td.checkbox-cell input {
+  position: relative;
+  z-index: 2;
 }
 
 .scroll-x {
@@ -1279,11 +1303,6 @@ tbody tr.bulk-email-ticket:hover {
   flex-shrink: 0;
   font-size: 11px;
   opacity: 0.55;
-}
-.assign-popover-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 120;
 }
 .assign-popover {
   position: fixed;
@@ -3013,14 +3032,18 @@ th:hover .col-remove-btn { display: inline; }
 .col-add-btn:hover { background: #eef2ff; border-color: var(--accent); }
 
 .col-add-dropdown {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  /* Teleported to <body> with fixed viewport coords so the table's scroll
+     container can't clip it. translateX(-100%) right-aligns it to the + button. */
+  position: fixed;
+  transform: translateX(-100%);
   background: white;
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
   min-width: 170px;
+  max-height: 320px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   z-index: 200;
 }
@@ -3711,6 +3734,7 @@ body.col-resizing .ticket-table * {
   font-weight: 700;
   color: var(--accent, #4f46e5);
   font-size: 13px;
+  text-decoration: none;
 }
 .ticket-card-top .badge {
   margin-left: auto;
