@@ -149,7 +149,7 @@
           v-if="showSuggestions"
           class="suggestions"
           role="listbox"
-          @mousedown.prevent
+          @mousedown.left.prevent
         >
           <li
             v-for="(sugg, idx) in suggestions"
@@ -159,31 +159,39 @@
             role="option"
             :aria-selected="idx === suggestionsActiveIdx"
             @mouseenter="suggestionsActiveIdx = idx"
-            @click="selectSuggestion(idx)"
           >
-            <div class="suggestions__line">
-              <span class="suggestions__id">{{ sugg.name }}</span>
-              <span
-                class="suggestions__status badge"
-                :class="`status-${(sugg.status || '')
-                  .toLowerCase()
-                  .replace(/\\s+/g, '-')}`"
-                >{{ sugg.status }}</span
-              >
-            </div>
-            <div class="suggestions__subject">
-              <template
-                v-for="(seg, sIdx) in highlightTokens(
-                  sugg.subject,
-                  appliedSuggestionQuery
-                )"
-                :key="`${sugg.name}-s-${sIdx}`"
-              >
-                <mark v-if="seg.mark">{{ seg.text }}</mark>
-                <template v-else>{{ seg.text }}</template>
-              </template>
-            </div>
-            <div class="suggestions__meta muted">{{ sugg.raised_by }}</div>
+            <!-- Real RouterLink so native right/middle-click "open in new tab"
+                 works; plain click still SPA-navigates. Keyboard Enter uses
+                 selectSuggestion via the input keydown handler. -->
+            <RouterLink
+              class="suggestions__link"
+              :to="ticketTo(sugg.name)"
+              @click="rememberTicketNav"
+            >
+              <div class="suggestions__line">
+                <span class="suggestions__id">{{ sugg.name }}</span>
+                <span
+                  class="suggestions__status badge"
+                  :class="`status-${(sugg.status || '')
+                    .toLowerCase()
+                    .replace(/\\s+/g, '-')}`"
+                  >{{ sugg.status }}</span
+                >
+              </div>
+              <div class="suggestions__subject">
+                <template
+                  v-for="(seg, sIdx) in highlightTokens(
+                    sugg.subject,
+                    appliedSuggestionQuery
+                  )"
+                  :key="`${sugg.name}-s-${sIdx}`"
+                >
+                  <mark v-if="seg.mark">{{ seg.text }}</mark>
+                  <template v-else>{{ seg.text }}</template>
+                </template>
+              </div>
+              <div class="suggestions__meta muted">{{ sugg.raised_by }}</div>
+            </RouterLink>
           </li>
           <li
             v-if="!suggestions.length && !suggestionsLoading"
@@ -2028,12 +2036,37 @@ async function applyBulkUpdate() {
       const updatedNames = new Set(
         updated.map((u) => (u && u.name != null ? u.name : u))
       );
+      // For _assign, resolve the chosen agent to the row's assignee shape so the
+      // "Assigned To" cell reflects the change without a refetch.
+      const assignAgent =
+        bulkField.value === "_assign" && bulkValue.value
+          ? agents.value.find((a) => a.name === bulkValue.value) || {
+              name: bulkValue.value,
+            }
+          : null;
       const patched = [];
       for (const row of result.data) {
-        if (updatedNames.has(row.name)) {
+        if (!updatedNames.has(row.name)) continue;
+        if (bulkField.value === "status") {
+          if (bulkValue.value === "On Hold") {
+            row.custom_is_on_hold = 1;
+          } else {
+            row.status = bulkValue.value;
+            row.custom_is_on_hold = 0;
+          }
+        } else if (bulkField.value === "_assign") {
+          row.assignee = assignAgent
+            ? {
+                name: assignAgent.name,
+                full_name: assignAgent.full_name || assignAgent.name,
+                user_image: assignAgent.user_image,
+                email: assignAgent.email,
+              }
+            : null;
+        } else {
           row[bulkField.value] = bulkValue.value;
-          patched.push(row);
         }
+        patched.push(row);
       }
       if (patched.length) syncEditState(patched);
     }
@@ -2041,9 +2074,9 @@ async function applyBulkUpdate() {
       closeBulkModal();
       clearSelection();
     }
-    // Fresh refresh (bypass stale cache) so the just-updated rows don't flash back
-    // to their old state (the original "close shows Open then closes later" bug).
-    await reload({ fresh: true });
+    // Rows are patched locally; only the KPI counts need refreshing, so skip the
+    // full-list refetch (which flashed/churned the whole table).
+    refreshSummary();
   } finally {
     bulkSaving.value = false;
   }
@@ -2052,6 +2085,29 @@ async function applyBulkUpdate() {
 async function reload(opts = {}) {
   result.start = 0;
   await load({ append: false, ...opts });
+}
+
+// Refresh ONLY the KPI cards / total_count — not the whole page. Used after an
+// inline or bulk edit, where the affected rows are already patched + reconciled
+// locally, so a full get_tickets_page refetch would just churn the table.
+async function refreshSummary() {
+  try {
+    const summaryData = await callWithRetry(
+      "helpdesk.api.unity_helpdesk.get_tickets_summary",
+      {
+        view: props.view,
+        filters: cleanFilters(),
+        search: appliedSearch.value,
+      },
+      { idempotent: true }
+    );
+    if (summaryData) {
+      result.total_count = summaryData.total_count || 0;
+      result.cards = summaryData.cards || {};
+    }
+  } catch {
+    // Non-fatal: keep the current cards rather than blanking them.
+  }
 }
 
 function routeQueryFromState() {
@@ -2374,7 +2430,9 @@ async function quickUpdate(ticket, field, value) {
       result.data[index] = updated;
       syncEditState([updated]);
     }
-    await reload({ fresh: true });
+    // Row is already reconciled from the server response — only the KPI counts
+    // need refreshing, so skip the full-list refetch (avoids a whole-table churn).
+    refreshSummary();
   } catch (err) {
     error.value = err.message;
     await load({ fresh: true });

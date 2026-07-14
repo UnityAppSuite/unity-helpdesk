@@ -7,7 +7,7 @@ from collections import defaultdict
 
 import frappe
 from frappe import _
-from frappe.desk.form.assign_to import clear as clear_all_assignments
+from frappe.desk.form.assign_to import add as assign_to_add, clear as clear_all_assignments
 from frappe.query_builder import Case, Order
 from frappe.query_builder.functions import Count, Sum
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
@@ -4274,6 +4274,27 @@ BULK_FAST_PATH_FIELDS = {"priority", "ticket_type", "agent_group"}
 BULK_UPDATE_MAX = 500
 
 
+def _status_field_updates(value, current_status):
+	"""The core field writes for a status change — shared by the inline
+	`update_ticket` save path (helpdesk.api.unity_helpdesk_ext) and the bulk
+	fast-path below, so the two always agree.
+
+	"On Hold" is a VIRTUAL status: the real `status` stays Open and the
+	`custom_is_on_hold` flag carries it. Returns a {field: value} dict suitable for
+	either `doc.set(...)` or `frappe.db.set_value(dt, dn, dict)`."""
+	updates = {}
+	if value == "On Hold":
+		if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+			updates["custom_is_on_hold"] = 1
+		if current_status in FINAL_STATUSES or not current_status:
+			updates["status"] = "Open"
+	else:
+		updates["status"] = value
+		if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
+			updates["custom_is_on_hold"] = 0
+	return updates
+
+
 @frappe.whitelist()
 def bulk_update_tickets(names, field, value=None):
 	"""Apply a single-field update to many HD Tickets in one request.
@@ -4314,22 +4335,33 @@ def bulk_update_tickets(names, field, value=None):
 			if not frappe.db.exists(TICKET_DOCTYPE, name):
 				raise frappe.DoesNotExistError(_("Ticket not found"))
 			if field_name == "_assign":
+				# Lighter than assign_ticket_to_agent: manage the ToDo directly with
+				# notifications OFF (a bulk reassign must not fire N notifications) and
+				# skip loading the full HD Ticket doc. Keeps ToDo/`_assign` correct.
+				clear_all_assignments(TICKET_DOCTYPE, name)
 				if clean_value:
-					assign_ticket_to_agent(name, clean_value)
-				else:
-					clear_all_assignments(TICKET_DOCTYPE, name)
+					assign_to_add(
+						{
+							"doctype": TICKET_DOCTYPE,
+							"name": name,
+							"assign_to": [clean_value],
+							"notify": 0,
+						}
+					)
 			elif field_name == "status":
-				ticket = frappe.get_doc(TICKET_DOCTYPE, name)
-				if clean_value == "On Hold":
-					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
-						ticket.custom_is_on_hold = 1
-					if ticket.status in FINAL_STATUSES or not ticket.status:
-						ticket.status = "Open"
-				else:
-					ticket.status = clean_value
-					if _has_field(TICKET_DOCTYPE, "custom_is_on_hold"):
-						ticket.custom_is_on_hold = 0
-				ticket.save()
+				# Fast path: write the same status fields the inline update_ticket
+				# save would, but via a raw db.set_value — skipping the full doc
+				# lifecycle (SLA recompute / Activity / Version / search-index /
+				# realtime). The accepted bulk trade-off. Fetch only the current
+				# status for the On-Hold decision.
+				current_status = frappe.db.get_value(TICKET_DOCTYPE, name, "status")
+				updates = _status_field_updates(clean_value, current_status)
+				# The controller would normally stamp a resolution date on
+				# Resolved/Closed; we skip it, so set it here when missing.
+				if clean_value in FINAL_STATUSES and _has_field(TICKET_DOCTYPE, "resolution_date"):
+					if not frappe.db.get_value(TICKET_DOCTYPE, name, "resolution_date"):
+						updates["resolution_date"] = frappe.utils.now_datetime()
+				frappe.db.set_value(TICKET_DOCTYPE, name, updates)
 			elif field_name in BULK_FAST_PATH_FIELDS:
 				# Raw column update — bypasses `on_update` which rebuilds the
 				# search index on every save. None of these fields participate

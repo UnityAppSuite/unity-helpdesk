@@ -1,25 +1,25 @@
 <template>
   <section class="page">
     <div class="toolbar">
-      <button class="btn secondary" @click="goBackToList">
+      <RouterLink class="btn secondary" :to="backToListTo">
         Back to Tickets
-      </button>
-      <button
-        v-if="prevTicketId"
+      </RouterLink>
+      <RouterLink
+        v-if="prevTicketTo"
         class="btn secondary nav-btn"
         title="Previous ticket"
-        @click="goToPrevTicket"
+        :to="prevTicketTo"
       >
         ← Prev
-      </button>
-      <button
-        v-if="nextTicketId"
+      </RouterLink>
+      <RouterLink
+        v-if="nextTicketTo"
         class="btn secondary nav-btn"
         title="Next ticket"
-        @click="goToNextTicket"
+        :to="nextTicketTo"
       >
         Next →
-      </button>
+      </RouterLink>
       <strong v-if="ticket.name">#{{ ticket.name }}</strong>
       <span
         v-if="ticket.status_indicator"
@@ -72,13 +72,12 @@
           <span class="reply-origin-banner__label"
             >Reply to previous ticket</span
           >
-          <button
-            type="button"
+          <RouterLink
             class="link-btn"
-            @click="openSpaTicket(ticket.custom_replied_to_ticket)"
+            :to="spaTicketTo(ticket.custom_replied_to_ticket)"
           >
             #{{ ticket.custom_replied_to_ticket }}
-          </button>
+          </RouterLink>
           <span v-if="repliedToSummary" class="reply-origin-banner__meta">
             · {{ repliedToSummary }}
           </span>
@@ -348,13 +347,15 @@
                       :class="previousTicketRowClass(row)"
                     >
                       <td>
-                        <button
-                          class="link-btn"
-                          type="button"
-                          @click="openSpaTicket(row.name)"
-                        >
-                          {{ row.name }}
-                        </button>
+                        <!-- Stretched link: makes the WHOLE row a real <a> so native
+                             right/middle-click "open in new tab" works anywhere on it,
+                             not just the ticket number. -->
+                        <RouterLink
+                          class="prev-row-link"
+                          :to="spaTicketTo(row.name)"
+                          :aria-label="`Open ticket ${row.name}`"
+                        />
+                        <span class="link-btn">{{ row.name }}</span>
                         <span
                           v-if="isOutgoingTicket(row)"
                           class="ticket-origin-tag ticket-origin-tag--outgoing"
@@ -671,14 +672,15 @@
         <section class="detail-section">
           <div class="detail-section-heading">
             <h3>Assignment History</h3>
-            <button
-              type="button"
+            <a
               class="link-btn"
               title="Open HD Ticket in Desk"
-              @click="openDeskTicket(ticket.name)"
+              :href="`/app/hd-ticket/${ticket.name}`"
+              target="_blank"
+              rel="noopener noreferrer"
             >
               Open in Desk ↗
-            </button>
+            </a>
           </div>
           <div class="detail-body history">
             <p v-if="!assignmentHistory.length" class="muted">
@@ -1158,6 +1160,23 @@ function goToNextTicket() {
   if (nextTicketId.value)
     router.push({ path: `/tickets/${nextTicketId.value}`, query: route.query });
 }
+
+// RouterLink targets — real <a href> so native right/middle-click "open in new tab"
+// works on Prev/Next/Back and the previous-ticket / reply-to links. Plain click
+// still SPA-navigates.
+function spaTicketTo(name) {
+  return { path: `/tickets/${name}`, query: route.query };
+}
+const backToListTo = computed(() => ({
+  path: `/tickets/${route.query.list_view === "all" ? "all" : "my"}`,
+  query: { ...route.query, list_view: undefined },
+}));
+const prevTicketTo = computed(() =>
+  prevTicketId.value ? spaTicketTo(prevTicketId.value) : null
+);
+const nextTicketTo = computed(() =>
+  nextTicketId.value ? spaTicketTo(nextTicketId.value) : null
+);
 
 function clearAdditionalFilters() {
   additionalFilters.from = "";
