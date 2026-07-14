@@ -1607,7 +1607,10 @@ async function fetchSuggestions(query) {
     if (requestId !== suggestionsRequestId) return;
     suggestions.value = Array.isArray(data?.data) ? data.data : [];
     appliedSuggestionQuery.value = query;
-    suggestionsActiveIdx.value = suggestions.value.length ? 0 : -1;
+    // Do NOT pre-highlight the first suggestion: pressing Enter should run the
+    // search on the typed text (like the Search button), not open ticket #0. Arrow
+    // keys still move into the list, and Enter then opens the highlighted suggestion.
+    suggestionsActiveIdx.value = -1;
   } catch (err) {
     if (requestId !== suggestionsRequestId) return;
     // Aborted / timed-out keystrokes are not user-visible errors.
