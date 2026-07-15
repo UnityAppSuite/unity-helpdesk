@@ -3325,8 +3325,13 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	capabilities = _require_unity_access()
 	search = cstr(search or message_body or "").strip()
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
+	# Always scope the base filters by the effective view — including during search.
+	# The My-Tickets view must stay assigned-to-me whether or not a query is present;
+	# widening to "all" while searching leaked every matching ticket into My Tickets
+	# for admins (who have no assigned_agent fallback). Non-admins were already scoped
+	# via assigned_agent, but admins on the My tab were not — hence the leak.
 	list_filters = _build_filters(
-		"all" if search else effective_view,
+		effective_view,
 		filters,
 		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
 	)
