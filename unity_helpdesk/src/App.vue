@@ -995,6 +995,23 @@ function dismissGlobalNotice() {
   globalNotice.value = null;
 }
 
+// The composer modals are tall (recipients, CSV, attachments, test-copy step),
+// so a validation/blocked-action error shown only in the top-of-body banner is
+// invisible when the user is down at the Send / Send Test buttons — they click
+// and nothing seems to happen. These helpers surface the SAME message both in
+// the existing inline banner AND as the fixed top-center popup (showGlobalNotice,
+// z-index above the modal), so it's directly visible without scrolling. Every
+// blocking error/condition in the create-ticket and bulk-email composers routes
+// through here.
+function composerFail(msg) {
+  composerError.value = msg;
+  showGlobalNotice(msg, "error", 6000);
+}
+function bulkFail(msg) {
+  bulkEmailError.value = msg;
+  showGlobalNotice(msg, "error", 6000);
+}
+
 const capabilities = computed(() => session.capabilities || {});
 const canViewMyTickets = computed(
   () => !!capabilities.value.can_view_my_tickets
@@ -1319,19 +1336,22 @@ function removeCreateTestRecipient(email) {
 async function sendCreateTestEmail() {
   composerError.value = "";
   if (!composer.subject || !composer.subject.trim()) {
-    composerError.value = "Subject is required before sending a test.";
+    composerFail("Subject is required before sending a test.");
+    return;
+  }
+  if (!composer.ticket_type) {
+    composerFail("Ticket Type is required before sending a test.");
     return;
   }
   if (!composer.message || !composer.message.trim()) {
-    composerError.value = "Message is required before sending a test.";
+    composerFail("Message is required before sending a test.");
     return;
   }
   // Fold in any half-typed address still in the input.
   if (composerTestQuery.value.trim()) addCreateTestFromInput();
   const emails = composer.testRecipients.map((r) => r.email);
   if (!emails.length) {
-    composerError.value =
-      "Add at least one valid verifier email for the test copy.";
+    composerFail("Add at least one valid verifier email for the test copy.");
     return;
   }
   composerTestSending.value = true;
@@ -1356,7 +1376,7 @@ async function sendCreateTestEmail() {
       8000
     );
   } catch (err) {
-    composerError.value = "Test send failed: " + (err?.message || err);
+    composerFail("Test send failed: " + (err?.message || err));
   } finally {
     composerTestSending.value = false;
   }
@@ -1373,7 +1393,7 @@ async function handleComposerAttachments(event) {
       composer.attachments.push(uploaded);
     }
   } catch (err) {
-    composerError.value = err.message;
+    composerFail(err.message);
   } finally {
     composerUploading.value = false;
     if (composerAttachmentInput.value) {
@@ -1392,18 +1412,19 @@ async function createTicket() {
   composerError.value = "";
   composerWarning.value = "";
   if (!composer.subject || !composer.subject.trim()) {
-    composerError.value = "Subject is required.";
+    composerFail("Subject is required.");
     return;
   }
   if (!composer.ticket_type) {
-    composerError.value = "Ticket Type is required.";
+    composerFail("Ticket Type is required.");
     return;
   }
   // Verification gate: if "Send a test copy first" is on, a test must be sent before
   // the real send. Explain rather than silently doing nothing.
   if (composer.testEnabled && !composer.testSent) {
-    composerError.value =
-      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly.";
+    composerFail(
+      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly."
+    );
     return;
   }
   // Snapshot the payload BEFORE closing (closeComposer resets the form). Then close
@@ -1827,7 +1848,7 @@ async function resolveStudents() {
   } catch (err) {
     if (err instanceof AuthRedirectError || err?.code === "AUTH_REDIRECT")
       return;
-    bulkEmailError.value = err?.message || "Couldn't resolve students.";
+    bulkFail(err?.message || "Couldn't resolve students.");
   } finally {
     bulkResolving.value = false;
   }
@@ -1903,8 +1924,9 @@ async function handleBulkEmailCsv(event) {
     );
     const rows = result?.rows || [];
     if (!rows.length) {
-      bulkEmailError.value =
-        "No students resolved from the CSV. Include an 'id' (student) column — the email, details and guardians are looked up from it.";
+      bulkFail(
+        "No students resolved from the CSV. Include an 'id' (student) column — the email, details and guardians are looked up from it."
+      );
       return;
     }
     // Reconstruct one entry per student: the student row (name) + its guardian
@@ -1962,7 +1984,7 @@ async function handleBulkEmailCsv(event) {
       note += ` Only the first ${rows.length} recipients were kept — split the CSV to send the rest.`;
     bulkEmailWarning.value = note;
   } catch (err) {
-    bulkEmailError.value = err.message || "CSV import failed.";
+    bulkFail(err.message || "CSV import failed.");
   } finally {
     bulkEmailUploading.value = false;
     if (bulkEmailCsvInput.value) bulkEmailCsvInput.value.value = "";
@@ -1980,7 +2002,7 @@ async function handleBulkEmailAttachments(event) {
       bulkEmail.attachments.push(uploaded);
     }
   } catch (err) {
-    bulkEmailError.value = err.message;
+    bulkFail(err.message);
   } finally {
     bulkEmailUploading.value = false;
     if (bulkEmailAttachmentInput.value) {
@@ -2004,37 +2026,41 @@ async function sendBulkEmail() {
   if (!groups.length) {
     const hasStudents = bulkEmail.students.some((s) => s.status !== "notfound");
     if (hasStudents && excludeStudent.value && !includeGuardians.value) {
-      bulkEmailError.value =
-        "Recipient options exclude everyone — enable “Include guardian emails” or uncheck “Exclude student email”.";
+      bulkFail(
+        "Recipient options exclude everyone — enable “Include guardian emails” or uncheck “Exclude student email”."
+      );
     } else if (hasStudents) {
-      bulkEmailError.value =
-        "No deliverable email for the selected recipients — check Include guardians / Exclude student.";
+      bulkFail(
+        "No deliverable email for the selected recipients — check Include guardians / Exclude student."
+      );
     } else {
-      bulkEmailError.value =
+      bulkFail(
         bulkEmail.mode === "csv"
           ? "Import a CSV with at least one student that has an email."
-          : "Add at least one student (reference number) or recipient before sending.";
+          : "Add at least one student (reference number) or recipient before sending."
+      );
     }
     return;
   }
   if (!bulkEmail.subject.trim()) {
-    bulkEmailError.value = "Subject is required.";
+    bulkFail("Subject is required.");
     return;
   }
   if (!bulkEmail.ticket_type) {
-    bulkEmailError.value = "Ticket Type is required.";
+    bulkFail("Ticket Type is required.");
     return;
   }
   if (!bulkEmail.message.trim()) {
-    bulkEmailError.value = "Message is required.";
+    bulkFail("Message is required.");
     return;
   }
   // Verification gate: if "Send a test copy first" is on, a test must be sent (and
   // eyeballed) before the real send. Tell the user exactly what to do rather than
   // silently doing nothing.
   if (bulkEmail.testEnabled && !bulkEmail.testSent) {
-    bulkEmailError.value =
-      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly.";
+    bulkFail(
+      "You enabled “Send a test copy first”. Click “Send Test”, verify it in the inbox — or untick that option to send directly."
+    );
     return;
   }
   // Build the payload BEFORE closing the composer (closeBulkEmail resets the form).
@@ -2164,23 +2190,26 @@ async function sendBulkTestEmail() {
   bulkEmailError.value = "";
   const groups = bulkEmailGroups.value;
   if (!groups.length) {
-    bulkEmailError.value = "Add at least one recipient before sending a test.";
+    bulkFail("Add at least one recipient before sending a test.");
     return;
   }
   if (!bulkEmail.subject.trim()) {
-    bulkEmailError.value = "Subject is required before sending a test.";
+    bulkFail("Subject is required before sending a test.");
+    return;
+  }
+  if (!bulkEmail.ticket_type) {
+    bulkFail("Ticket Type is required before sending a test.");
     return;
   }
   if (!bulkEmail.message.trim()) {
-    bulkEmailError.value = "Message is required before sending a test.";
+    bulkFail("Message is required before sending a test.");
     return;
   }
   // Fold in any half-typed address still in the input.
   if (bulkTestQuery.value.trim()) addBulkTestFromInput();
   const emails = bulkEmail.testRecipients.map((r) => r.email);
   if (!emails.length) {
-    bulkEmailError.value =
-      "Add at least one valid verifier email for the test copy.";
+    bulkFail("Add at least one valid verifier email for the test copy.");
     return;
   }
   bulkTestSending.value = true;
@@ -2205,7 +2234,7 @@ async function sendBulkTestEmail() {
       8000
     );
   } catch (err) {
-    bulkEmailError.value = "Test send failed: " + (err?.message || err);
+    bulkFail("Test send failed: " + (err?.message || err));
   } finally {
     bulkTestSending.value = false;
   }

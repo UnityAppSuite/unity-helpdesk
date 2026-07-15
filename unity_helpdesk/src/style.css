@@ -3637,7 +3637,7 @@ body.col-resizing .ticket-table * {
 /* Global non-blocking notice (toast) shown above everything while a send runs. */
 .global-notice {
   position: fixed;
-  top: 16px;
+  top: 72px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 1000;
