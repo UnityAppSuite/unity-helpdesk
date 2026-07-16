@@ -911,6 +911,10 @@ const assigneeOpen = ref(false);
 // --- Bulk email state ---
 const openBulkEmail = ref(false);
 const bulkEmailSending = ref(false);
+// In-flight guard for the actual send (distinct from bulkEmailSending, which is
+// tied to the composer UI and reset by closeBulkEmail). Prevents the same submission
+// from firing twice; server-side the job is also idempotent per batch_id.
+const bulkSubmitting = ref(false);
 const bulkEmailUploading = ref(false);
 const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
@@ -2018,6 +2022,8 @@ function removeBulkEmailAttachment(name) {
 }
 
 async function sendBulkEmail() {
+  // Guard: never let one submission fire twice (double-click / rapid re-invoke).
+  if (bulkSubmitting.value) return;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
   // One group per student (or free email): the student and/or their guardians,
@@ -2080,6 +2086,7 @@ async function sendBulkEmail() {
   // Non-blocking: close the composer immediately and report progress out-of-band so
   // the UI never hangs on a slow send. The per-student tickets appear in the list
   // as they are created (each is committed early server-side).
+  bulkSubmitting.value = true;
   closeBulkEmail();
   showGlobalNotice(
     "Sending email… your tickets will appear in the list shortly.",
@@ -2108,11 +2115,17 @@ async function sendBulkEmail() {
       setTimeout(signalTicketsRefresh, 4000);
     }
   } catch (err) {
+    // This send is fire-and-forget: the request only enqueues a background job, so an
+    // error here does NOT mean nothing happened — the job may well have started. And
+    // resending starts a FRESH batch (new batch_id → new tickets), so we must NOT
+    // tell the user to "try again". Ask them to check the list before doing anything.
     showGlobalNotice(
-      "Bulk email failed: " + (err?.message || err),
+      "Couldn't confirm the bulk send started. Do NOT resend — check the tickets list in a minute; if the tickets aren't there, contact support.",
       "error",
-      10000
+      12000
     );
+  } finally {
+    bulkSubmitting.value = false;
   }
 }
 

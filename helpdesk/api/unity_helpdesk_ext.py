@@ -877,6 +877,11 @@ def bulk_send_email(
     # is this agent. Respect the SAME HD Settings "instantly_send_email" flag (ON ->
     # the worker sends now; OFF -> it just queues the mails for the email flush).
     instant = bool(int(frappe.db.get_single_value("HD Settings", "instantly_send_email") or 0))
+    # One id per submission, stamped on every ticket the job creates. It makes the
+    # job idempotent: if the worker re-runs it (deadlock-retry, restart) or the user
+    # resends, each student already ticketed under this batch_id is skipped instead
+    # of duplicated.
+    batch_id = frappe.generate_hash(length=12)
     frappe.enqueue(
         "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
         queue="long",
@@ -889,6 +894,7 @@ def bulk_send_email(
         file_names=file_names,
         ticket_type=ticket_type,
         now=instant,
+        batch_id=batch_id,
     )
 
     return {
@@ -919,6 +925,29 @@ def _is_deadlock(exc):
     return "Deadlock found" in text or "Lock wait timeout" in text
 
 
+def _commit_with_retry(attempts=6):
+    """Commit, retrying on a transient deadlock/lock-wait (1213/1205) instead of
+    letting it escape the job.
+
+    Why this matters: an UNGUARDED commit that deadlocks bubbles out of
+    ``_bulk_send_email_job``; because that job runs via ``frappe.enqueue``, the
+    raised ``InternalError`` reaches frappe's worker wrapper ``execute_job``
+    (frappe/utils/background_jobs.py), which on a deadlock RE-RUNS THE ENTIRE job up
+    to 5x — and since the job was not idempotent, each re-run re-created all the
+    tickets. That silent whole-job retry is what turned a 40-student send into ~159
+    tickets. Absorbing the transient failure here keeps it local to this student."""
+    for attempt in range(attempts):
+        try:
+            frappe.db.commit()
+            return
+        except Exception as exc:
+            if _is_deadlock(exc) and attempt < attempts - 1:
+                frappe.db.rollback()
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise
+
+
 def _bulk_send_email_job(
     subject,
     message,
@@ -928,9 +957,11 @@ def _bulk_send_email_job(
     file_names=None,
     ticket_type=None,
     now=False,
+    batch_id=None,
 ):
-    """Send a PER-STUDENT bulk email — runs IN-REQUEST (now=True) so it never
-    depends on a background worker, exactly like a single-ticket reply.
+    """Send a PER-STUDENT bulk email. Always runs in a background worker (enqueued by
+    ``bulk_send_email``); ``now`` only controls whether each mail is sent immediately
+    (delayed=False) or queued for the email flush.
 
     For each group (one student + their guardians, or one free-typed address) it:
       * renders the subject + message against that student's record + carried merge
@@ -942,9 +973,18 @@ def _bulk_send_email_job(
       * sends ONE email to that group's recipients, VISIBLE (expose_recipients
         ="header"), with the optional CC.
     No school / default BCC (admins/hods/teachers are intentionally NOT mailed).
-    One bad group/address is logged, never aborts the rest. Never raises unless
-    `now` (a synchronous failure must surface to the SPA).
+
+    Idempotent: every ticket is stamped with ``batch_id``; a student already ticketed
+    under this batch is skipped, so a re-run (worker deadlock-retry, restart, resend)
+    cannot duplicate. It NEVER re-raises — a raised error would let frappe's
+    execute_job wrapper re-run the whole batch (the 40 -> ~159 duplication cause).
+    One bad group/address is logged and skipped, never aborts the rest.
     """
+    # Defined before the try so the outer except can always return partial progress.
+    tickets = []
+    sent_count = 0
+    student_count = 0
+    has_batch_field = bool(batch_id) and _has_field(TICKET_DOCTYPE, "custom_bulk_batch_id")
     try:
         groups = groups or []
         cc_list = cc_list or []
@@ -958,9 +998,6 @@ def _bulk_send_email_job(
         student_ids = [g["student"] for g in groups if g.get("student")]
         students_by_name = _students_by_name(student_ids) if student_ids else {}
 
-        tickets = []
-        sent_count = 0
-        student_count = 0
         for group in groups:
             emails = group.get("emails") or []
             if not emails:
@@ -978,6 +1015,22 @@ def _bulk_send_email_job(
             # student-context panel populates and the ticket groups under them),
             # else the first recipient, else the agent.
             raised_by = _student_primary_email(student) or emails[0] or sender
+
+            # IDEMPOTENCY: if this batch already created a ticket for this student,
+            # skip re-creating it. The job can re-run for reasons outside our control
+            # (worker deadlock-retry, worker restart, an accidental resend), and
+            # without this each re-run re-created all 40 tickets — the duplicate
+            # blowup. Keyed on (batch_id, raised_by); needs the custom_bulk_batch_id
+            # field (added by patch) — falls back to non-idempotent if absent.
+            if has_batch_field:
+                existing = frappe.db.get_value(
+                    TICKET_DOCTYPE,
+                    {"custom_bulk_batch_id": batch_id, "raised_by": raised_by},
+                    "name",
+                )
+                if existing:
+                    tickets.append(existing)
+                    continue
 
             payload = {
                 "doctype": TICKET_DOCTYPE,
@@ -998,6 +1051,9 @@ def _bulk_send_email_job(
                 payload["custom_bulk_email_recipients"] = ", ".join(
                     sorted(set(emails) | set(cc_list))
                 )
+            # Stamp the batch id so a re-run of this job skips this student (above).
+            if has_batch_field:
+                payload["custom_bulk_batch_id"] = batch_id
 
             # Insert with retry-on-deadlock. Every ticket insert fires the
             # edu_quality fetch_ticket_details hook (which creates a Communication)
@@ -1026,8 +1082,10 @@ def _bulk_send_email_job(
                 continue
             tickets.append(doc.name)
             # Commit each ticket as it's created so it shows in the list immediately
-            # and stops holding row locks during the (possibly slow) send.
-            frappe.db.commit()
+            # and stops holding row locks during the (possibly slow) send. Guarded so
+            # a transient commit deadlock is retried locally, not escalated to the
+            # worker (which would re-run the whole job).
+            _commit_with_retry()
 
             # Queue/send the mail with the same retry-on-deadlock guard, so a
             # transient lock during the Email Queue insert doesn't leave a ticket
@@ -1065,19 +1123,30 @@ def _bulk_send_email_job(
             # student's email record (a ticket with no queue row). Committing per
             # student makes each one fully durable and isolates the deadlock rollback
             # to only the failed insert.
-            frappe.db.commit()
+            _commit_with_retry()
 
-        frappe.db.commit()
+        _commit_with_retry()
         return {"tickets": tickets, "sent": sent_count, "student_count": student_count}
     except Exception:
+        # Roll back the aborted transaction FIRST (so the log_error write can persist),
+        # then log — but DO NOT re-raise. This job always runs via frappe.enqueue, so
+        # a raised InternalError (e.g. a deadlock) would reach frappe's execute_job
+        # wrapper, which re-runs the ENTIRE job up to 5x. Because the job was not
+        # idempotent, that silent whole-job retry re-created every ticket — the root
+        # cause of the 40 -> ~159 blowup. Progress is committed per student and the
+        # batch_id makes any genuine re-run idempotent, so swallowing here is safe.
+        # `now` no longer changes this: the job is never truly in-request.
+        frappe.db.rollback()
         frappe.log_error(
             frappe.get_traceback(),
             "Unity Helpdesk _bulk_send_email_job",
         )
-        # A synchronous (in-request) send must surface a hard failure to the user
-        # so the SPA shows an error instead of a false "sent".
-        if now:
-            raise
+        return {
+            "tickets": tickets,
+            "sent": sent_count,
+            "student_count": student_count,
+            "error": True,
+        }
 
 
 @frappe.whitelist()
