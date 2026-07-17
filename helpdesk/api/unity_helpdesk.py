@@ -1242,6 +1242,36 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 	return result
 
 
+def _search_column_limit(column, default=140):
+	"""Character capacity of an HD Ticket search column, read from the DB itself.
+
+	These fields were declared as Frappe `Data` with no explicit `length`, so the
+	column is VARCHAR(140) — NOT the 255 this writer used to assume. Overflowing it
+	raised MySQL 1406, and because every search field is written in ONE set_value,
+	that one oversized value failed the whole update: the ticket kept NULL search
+	fields and became invisible to search (~97K tickets on UAT). Truncating to the
+	column's real width makes the write impossible to overflow on any schema — so
+	this stays correct whether or not the widening patch has run on a given site.
+	"""
+	cache = _request_cache().setdefault("_search_column_limit", {})
+	if column not in cache:
+		limit = default
+		try:
+			rows = frappe.db.sql(
+				"""SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS
+				   WHERE TABLE_SCHEMA = DATABASE()
+				     AND TABLE_NAME = %s AND COLUMN_NAME = %s""",
+				(f"tab{TICKET_DOCTYPE}", column),
+			)
+			if rows and rows[0][0]:
+				limit = int(rows[0][0])
+		except Exception:
+			# Never let a schema probe break indexing — fall back to the safe minimum.
+			pass
+		cache[column] = limit
+	return cache[column]
+
+
 def populate_ticket_student_search_fields(ticket):
 	# `ticket` may be an HD Ticket doc, or a name passed as a str OR an int. HD
 	# Ticket names are numeric, so `frappe.get_all(...).name` comes back as an int
@@ -1275,8 +1305,9 @@ def populate_ticket_student_search_fields(ticket):
 
 	context = get_student_context_for_ticket(ticket_doc.name, ticket_doc.raised_by)
 	search_update = {}
-	# These three fields are Data type (VARCHAR 255) — truncate to stay within limit.
-	_DATA_FIELD_MAX = 255
+	# Truncate every value to the column's ACTUAL width (see _search_column_limit).
+	# Hardcoding 255 here while the columns were VARCHAR(140) is what raised MySQL
+	# 1406 and left tickets unindexed.
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_student_names"):
 		search_update["custom_search_student_names"] = ", ".join(
 			sorted(
@@ -1286,7 +1317,7 @@ def populate_ticket_student_search_fields(ticket):
 					if cstr(student.get("student_name")).strip()
 				}
 			)
-		)[:_DATA_FIELD_MAX]
+		)[: _search_column_limit("custom_search_student_names")]
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_student_refs"):
 		search_update["custom_search_student_refs"] = ", ".join(
 			sorted(
@@ -1296,7 +1327,7 @@ def populate_ticket_student_search_fields(ticket):
 					if cstr(student.get("reference_number")).strip()
 				}
 			)
-		)[:_DATA_FIELD_MAX]
+		)[: _search_column_limit("custom_search_student_refs")]
 	if frappe.db.has_column(TICKET_DOCTYPE, "custom_search_guardian_emails"):
 		emails = {
 			cstr(ticket_doc.get("raised_by")).strip().lower()
@@ -1308,7 +1339,9 @@ def populate_ticket_student_search_fields(ticket):
 				email_text = cstr(email_value).strip().lower()
 				if email_text:
 					emails.add(email_text)
-		search_update["custom_search_guardian_emails"] = ", ".join(sorted(emails))[:_DATA_FIELD_MAX]
+		search_update["custom_search_guardian_emails"] = ", ".join(sorted(emails))[
+			: _search_column_limit("custom_search_guardian_emails")
+		]
 	search_update.update(_build_ticket_message_search_field_update(ticket_doc.name, ticket_doc=ticket_doc))
 	if search_update:
 		frappe.db.set_value(TICKET_DOCTYPE, ticket_doc.name, search_update, update_modified=False)

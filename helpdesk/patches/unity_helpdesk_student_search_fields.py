@@ -57,10 +57,15 @@ def _create_fields():
 	create_custom_fields(
 		{
 			"HD Ticket": [
-				# --- Student identity search fields (Data / VARCHAR 255, B-tree indexed) ---
+				# --- Student identity search fields ---
+			# `length` is REQUIRED on Data: without it Frappe creates VARCHAR(140), not
+			# the 255 this file used to claim, and a longer value raised MySQL 1406 —
+			# which failed the whole set_value and left the ticket unindexed. Keep these
+			# in step with unity_search_field_widths, which widens existing sites.
 				{
 					"fieldname": "custom_search_student_names",
 					"fieldtype": "Data",
+					"length": 255,
 					"label": "Search: Student Names",
 					"read_only": 1,
 					"hidden": 1,
@@ -71,6 +76,7 @@ def _create_fields():
 				{
 					"fieldname": "custom_search_student_refs",
 					"fieldtype": "Data",
+					"length": 255,
 					"label": "Search: Student Reference Numbers",
 					"read_only": 1,
 					"hidden": 1,
@@ -80,7 +86,10 @@ def _create_fields():
 				},
 				{
 					"fieldname": "custom_search_guardian_emails",
-					"fieldtype": "Data",
+					# Small Text (TEXT), NOT Data: a guardian list is raised_by + every
+					# guardian of every sibling, which overflows even 255. Same shape as
+					# custom_search_recipient_emails, which already works as text+FULLTEXT.
+					"fieldtype": "Small Text",
 					"label": "Search: Guardian Emails",
 					"read_only": 1,
 					"hidden": 1,
@@ -158,6 +167,30 @@ def _ensure_raised_by_index():
 			title="unity_helpdesk_student_search_fields: raised_by index",
 			message=frappe.get_traceback(),
 		)
+
+
+def _mark_processed(ticket_name):
+	"""Stamp the "processed, nothing to index" sentinel on a ticket whose populate
+	raised, so it drops out of the IS NULL pending head.
+
+	Mirrors the sentinel populate_ticket_student_search_fields already writes for a
+	ticket with no raised_by. Best-effort and never raises — if even this write fails,
+	the stall guard in the sweep is still there as a backstop.
+	"""
+	try:
+		blank = {
+			field: ""
+			for field in (
+				"custom_search_student_names",
+				"custom_search_student_refs",
+				"custom_search_guardian_emails",
+			)
+			if frappe.db.has_column("HD Ticket", field)
+		}
+		if blank:
+			frappe.db.set_value("HD Ticket", ticket_name, blank, update_modified=False)
+	except Exception:
+		pass
 
 
 def _backfill_is_complete():
@@ -241,6 +274,12 @@ def run_student_search_backfill(limit=None):
 					frappe.get_traceback(),
 					"unity_helpdesk_student_search_fields backfill",
 				)
+				# A row that raised stays IS NULL, so the next batch re-queries the
+				# SAME head, trips the stall guard, and aborts the WHOLE sweep — which
+				# is how ~97K tickets were left unindexed on UAT while only 2.7K got
+				# processed. Stamp the processed sentinel so a poison row drops out of
+				# the pending head and the sweep keeps draining the rest.
+				_mark_processed(t.name)
 		frappe.db.commit()
 		if remaining is not None:
 			remaining -= len(batch)
