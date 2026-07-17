@@ -42,3 +42,4 @@ helpdesk.patches.unity_ticket_recipient_search_backfill
 helpdesk.patches.unity_guardian_search_index
 helpdesk.patches.unity_ticket_raised_by_modified_index
 helpdesk.patches.unity_bulk_email_batch_id_field
+helpdesk.patches.unity_search_field_widths
