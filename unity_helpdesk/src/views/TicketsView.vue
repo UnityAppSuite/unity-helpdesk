@@ -2,7 +2,7 @@
   <section class="page">
     <div class="toolbar">
       <div class="filter-group" :class="{ open: filtersOpen }">
-        <select v-model="filters.status" @change="applyFiltersAndReload">
+        <select v-model="filterDraft.status">
           <option value="">Status: All</option>
           <option>Open</option>
           <option>Replied</option>
@@ -10,13 +10,13 @@
           <option>Resolved</option>
           <option>Closed</option>
         </select>
-        <select v-model="filters.priority" @change="applyFiltersAndReload">
+        <select v-model="filterDraft.priority">
           <option value="">Priority: All</option>
           <option>High</option>
           <option>Medium</option>
           <option>Low</option>
         </select>
-        <select v-model="filters.ticket_type" @change="applyFiltersAndReload">
+        <select v-model="filterDraft.ticket_type">
           <option value="">Ticket Type: All</option>
           <option
             v-for="type in ticketTypes"
@@ -27,11 +27,7 @@
           </option>
         </select>
         <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
-        <select
-          v-if="props.view === 'all'"
-          v-model="filters.assigned_to"
-          @change="applyFiltersAndReload"
-        >
+        <select v-if="props.view === 'all'" v-model="filterDraft.assigned_to">
           <option value="">Assigned: All</option>
           <option value="Unassigned">Unassigned</option>
           <option v-for="agent in agents" :key="agent.name" :value="agent.name">
@@ -43,7 +39,9 @@
           <button
             type="button"
             class="date-range-btn"
-            :class="{ 'has-value': filters.created_from || filters.created_to }"
+            :class="{
+              'has-value': filterDraft.created_from || filterDraft.created_to,
+            }"
             :title="dateRangeLabel"
             @click="toggleDateRange"
           >
@@ -153,6 +151,25 @@
           Filters<span v-if="activeFilterCount" class="filters-toggle-badge">{{
             activeFilterCount
           }}</span>
+        </button>
+        <button
+          type="button"
+          class="btn apply-filters"
+          :disabled="!filtersDirty"
+          title="Apply filters and search"
+          @click="applyAll"
+        >
+          Apply<span v-if="filtersDirty" class="apply-dot" aria-hidden="true"
+            >•</span
+          >
+        </button>
+        <button
+          type="button"
+          class="btn secondary toolbar-clear"
+          title="Clear all filters and search"
+          @click="clearAll"
+        >
+          Clear
         </button>
         <button
           class="btn secondary toolbar-search"
@@ -1064,17 +1081,44 @@ const filters = reactive({
   created_from: "",
   created_to: "",
 });
+// Draft mirror of `filters`. The UI binds to this; nothing fetches until the user
+// clicks Apply, which copies the draft into `filters` (the committed snapshot read
+// by cleanFilters/routeQueryFromState/refreshSummary) and reloads once.
+const filterDraft = reactive({
+  status: "",
+  priority: "",
+  ticket_type: "",
+  assigned_to: "",
+  created_from: "",
+  created_to: "",
+});
+const FILTER_KEYS = [
+  "status",
+  "priority",
+  "ticket_type",
+  "assigned_to",
+  "created_from",
+  "created_to",
+];
+// True when the draft filters or the typed search differ from what's applied, so
+// the Apply button can enable/highlight only when there's something to commit.
+const filtersDirty = computed(
+  () =>
+    FILTER_KEYS.some((k) => filterDraft[k] !== filters[k]) ||
+    draftSearch.value.trim() !== appliedSearch.value
+);
 // Mobile: the filter row collapses behind a "Filters" toggle. On desktop the
 // filter group is always shown via CSS (display:contents), so this only gates mobile.
 const filtersOpen = ref(false);
+// Preview the count from the DRAFT so the badge reflects what's about to apply.
 const activeFilterCount = computed(
   () =>
     [
-      filters.status,
-      filters.priority,
-      filters.ticket_type,
-      filters.assigned_to,
-      filters.created_from || filters.created_to,
+      filterDraft.status,
+      filterDraft.priority,
+      filterDraft.ticket_type,
+      filterDraft.assigned_to,
+      filterDraft.created_from || filterDraft.created_to,
     ].filter(Boolean).length
 );
 let activeController = null;
@@ -1449,8 +1493,6 @@ function endColumnResize() {
 // --- Search UX helpers ---
 const RECENT_SEARCH_KEY = "unity-helpdesk:recent-searches";
 const RECENT_SEARCH_LIMIT = 8;
-const SUGGESTION_DEBOUNCE_MS = 250;
-const SUGGESTION_MIN_LENGTH = 2;
 const isMac =
   typeof navigator !== "undefined" &&
   /Mac|iPhone|iPad/.test(navigator.platform);
@@ -1459,7 +1501,6 @@ const shortcutLabel = isMac ? "⌘K" : "Ctrl+K";
 const searchInput = ref(null);
 const searchFocused = ref(false);
 const recentSearches = ref([]);
-let searchDebounceTimer = null;
 
 function loadRecentSearches() {
   try {
@@ -1506,46 +1547,12 @@ function useRecentSearch(term) {
   submitSearch();
 }
 
-// --- Live search: results render directly in the main table as you type ---
+// --- Search: only commits on Search button / Enter (never as-you-type) ---
 
-// Cancel any pending debounced live search (called on commit/clear/blur/esc).
+// Close the recent-searches dropdown. (Kept for the commit/clear/blur/esc paths.)
 function closeSuggestions() {
-  if (searchDebounceTimer) {
-    clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = null;
-  }
+  searchFocused.value = false;
 }
-
-// As the user types, run the REAL search and render results straight into the
-// table (debounced). We set `appliedSearch` and `reload()` DIRECTLY — never via the
-// URL — because `applyRouteState()` overwrites `draftSearch` from the URL and would
-// clobber the input mid-type. Only Search/Enter commits the query to the URL (see
-// `submitSearch`). `reload()` → `load()` already gives us the SWR cache (keyed by
-// `appliedSearch`), request abort, and the request-id guard, so only the latest
-// keystroke's response renders and the table never blanks (see `load()`).
-watch(draftSearch, (next) => {
-  const q = (next || "").trim();
-  if (searchDebounceTimer) {
-    clearTimeout(searchDebounceTimer);
-    searchDebounceTimer = null;
-  }
-  searchDebounceTimer = setTimeout(() => {
-    searchDebounceTimer = null;
-    if (q === "") {
-      // Box cleared → restore the base (unfiltered) list.
-      if (appliedSearch.value !== "") {
-        appliedSearch.value = "";
-        reload();
-      }
-    } else if (q.length >= SUGGESTION_MIN_LENGTH) {
-      if (appliedSearch.value !== q) {
-        appliedSearch.value = q;
-        reload();
-      }
-    }
-    // 1 char (non-empty): wait for more input; keep the current results.
-  }, SUGGESTION_DEBOUNCE_MS);
-});
 
 function onSearchEnter() {
   submitSearch();
@@ -1659,6 +1666,11 @@ function applyRouteState() {
   filters.assigned_to = String(route.query.assigned_to || "");
   filters.created_from = String(route.query.created_from || "");
   filters.created_to = String(route.query.created_to || "");
+  // Mirror the applied snapshot into the draft so the dropdowns/date label reflect
+  // the URL state on first load, shared links, and back/forward nav.
+  FILTER_KEYS.forEach((k) => {
+    filterDraft[k] = filters[k];
+  });
 }
 
 function syncEditState(rows) {
@@ -1748,8 +1760,8 @@ function formatShortDate(value) {
   return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
 }
 const dateRangeLabel = computed(() => {
-  const from = filters.created_from;
-  const to = filters.created_to;
+  const from = filterDraft.created_from;
+  const to = filterDraft.created_to;
   if (!from && !to) return "Ticket created";
   if (from && to)
     return `Created: ${formatShortDate(from)} → ${formatShortDate(to)}`;
@@ -1761,8 +1773,8 @@ function toggleDateRange() {
     closeDateRange();
     return;
   }
-  dateRangeDraft.from = filters.created_from || "";
-  dateRangeDraft.to = filters.created_to || "";
+  dateRangeDraft.from = filterDraft.created_from || "";
+  dateRangeDraft.to = filterDraft.created_to || "";
   dateRangeOpen.value = true;
   // Defer the listener attach so the click that opened the popover doesn't
   // immediately match the outside-click handler and close it.
@@ -1780,19 +1792,18 @@ function onDateRangeOutsideClick(event) {
     closeDateRange();
   }
 }
-async function applyDateRange() {
-  filters.created_from = dateRangeDraft.from || "";
-  filters.created_to = dateRangeDraft.to || "";
+// The popover only updates the DRAFT + closes; the toolbar Apply does the fetch.
+function applyDateRange() {
+  filterDraft.created_from = dateRangeDraft.from || "";
+  filterDraft.created_to = dateRangeDraft.to || "";
   closeDateRange();
-  await applyFiltersAndReload();
 }
-async function clearDateRange() {
+function clearDateRange() {
   dateRangeDraft.from = "";
   dateRangeDraft.to = "";
-  filters.created_from = "";
-  filters.created_to = "";
+  filterDraft.created_from = "";
+  filterDraft.created_to = "";
   closeDateRange();
-  await applyFiltersAndReload();
 }
 
 // --- Bulk edit helpers ---
@@ -1998,7 +2009,31 @@ async function replaceRouteOrReload() {
   await router.replace({ query: nextQuery });
 }
 
-async function applyFiltersAndReload() {
+// Commit the draft filters AND any typed-but-unsubmitted search in one fetch.
+async function applyAll() {
+  Object.assign(filters, filterDraft);
+  const q = draftSearch.value.trim();
+  if (q !== appliedSearch.value) {
+    appliedSearch.value = q;
+    rememberSearch(q);
+  }
+  searchFocused.value = false;
+  closeSuggestions();
+  await replaceRouteOrReload();
+}
+
+// Wipe every filter + the search, then reload the base list.
+async function clearAll() {
+  FILTER_KEYS.forEach((k) => {
+    filterDraft[k] = "";
+    filters[k] = "";
+  });
+  dateRangeDraft.from = "";
+  dateRangeDraft.to = "";
+  draftSearch.value = "";
+  appliedSearch.value = "";
+  searchFocused.value = false;
+  closeSuggestions();
   await replaceRouteOrReload();
 }
 

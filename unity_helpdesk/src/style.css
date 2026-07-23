@@ -3738,6 +3738,23 @@ body.col-resizing .ticket-table * {
   font-weight: 700;
 }
 
+/* Common Apply button: gate filter + search changes behind one fetch. */
+.apply-filters {
+  position: relative;
+}
+.btn:disabled,
+.apply-filters:disabled {
+  opacity: 0.5;
+  cursor: default;
+  background: var(--accent, #4f46e5);
+}
+.apply-dot {
+  margin-left: 5px;
+  font-size: 15px;
+  line-height: 1;
+  vertical-align: middle;
+}
+
 /* Mobile summary cards — hidden on desktop, shown ≤640px (table hidden then). */
 .ticket-cards {
   display: none;
