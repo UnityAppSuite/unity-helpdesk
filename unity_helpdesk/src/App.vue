@@ -1124,6 +1124,10 @@ const bccInputRef = ref(null);
 const bccSearchQuery = ref("");
 const bccResults = ref([]);
 let _bccSearchTimer = null;
+// Monotonic sequence for resolveStudents() so an out-of-order (slower, older) response
+// can't overwrite bulkEmail.students with a stale, smaller snapshot — the race that made
+// freshly-added recipient chips vanish.
+let _resolveSeq = 0;
 
 provide("unitySession", session);
 provide("refreshUnitySession", loadSession);
@@ -1855,7 +1859,10 @@ function addStudentTokens(list) {
 }
 
 function selectStudent(r) {
-  addStudentToken(r.email || r.name || "");
+  // Add by STUDENT ID / reference when the hit is a student, so it resolves to exactly
+  // that student. Pushing the email instead lets a guardian email shared by two siblings
+  // collapse onto the first sibling (the "clicking a name removes a selected student" bug).
+  addStudentToken(r.student || r.reference || r.email || r.name || "");
   bccSearchQuery.value = "";
   bccResults.value = [];
   bccInputRef.value?.focus();
@@ -1929,11 +1936,14 @@ function onBccSearch() {
 // guardians + merge data) via the backend. Rebuilds bulkEmail.students from the
 // raw token list so add/remove stays in sync.
 async function resolveStudents() {
+  // Claim the latest sequence up front; any in-flight older call becomes stale.
+  const seq = ++_resolveSeq;
   const tokens = bulkEmail.tokens.slice();
   if (!tokens.length) {
     bulkEmail.students = [];
     bulkEmail.mergeFields = [];
     bulkEmailWarning.value = "";
+    bulkResolving.value = false;
     return;
   }
   bulkResolving.value = true;
@@ -1942,6 +1952,9 @@ async function resolveStudents() {
       "helpdesk.api.unity_helpdesk.resolve_bulk_email_students",
       { refs: JSON.stringify(tokens) }
     );
+    // A newer resolveStudents() started while we awaited — drop this stale response so it
+    // can't overwrite the list with an older, smaller snapshot (vanishing-chips race).
+    if (seq !== _resolveSeq) return;
     const students = result?.students || [];
     const out = [];
     const seenStudents = new Set();
@@ -2015,9 +2028,12 @@ async function resolveStudents() {
   } catch (err) {
     if (err instanceof AuthRedirectError || err?.code === "AUTH_REDIRECT")
       return;
+    if (seq !== _resolveSeq) return; // superseded — let the newer call own the state
     bulkFail(err?.message || "Couldn't resolve students.");
   } finally {
-    bulkResolving.value = false;
+    // Only the latest call clears the spinner; a stale one finishing must not un-dim
+    // while a newer resolve is still in flight.
+    if (seq === _resolveSeq) bulkResolving.value = false;
   }
 }
 
@@ -2148,7 +2164,9 @@ async function handleBulkEmailCsv(event) {
     if (result.duplicate_count)
       note += ` ${result.duplicate_count} duplicate(s) skipped.`;
     if (result.truncated)
-      note += ` Only the first ${rows.length} recipients were kept — split the CSV to send the rest.`;
+      note += ` This CSV is over the per-send limit — the first ${
+        result.student_count || 0
+      } students (and their guardians) were kept. Split the CSV to send the rest.`;
     bulkEmailWarning.value = note;
   } catch (err) {
     bulkFail(err.message || "CSV import failed.");
@@ -2295,6 +2313,17 @@ async function submitBulkSend(payload) {
     }
     bulkDuplicate.value = null;
     if (result?.batch_id) {
+      // Auto-resume of a previous unfinished send (BUG-6): same batch, already-done
+      // students are skipped. Tell the user so the smaller "remaining" count isn't
+      // mistaken for a failure.
+      if (result.resumed) {
+        showGlobalNotice(
+          result.message ||
+            "Resuming your previous send that didn't finish — already-sent students are skipped.",
+          "info",
+          9000
+        );
+      }
       startBulkProgress(
         result.batch_id,
         payload.subject,

@@ -4607,11 +4607,20 @@ def search_contacts(query):
 	results = []
 	seen = set()
 
-	def _add(email, name):
+	def _add(email, name, student=None, reference=None):
 		e = cstr(email or "").strip().lower()
 		if e and _email_re.match(e) and e not in seen:
 			seen.add(e)
-			results.append({"email": e, "name": name or e})
+			row = {"email": e, "name": name or e}
+			# Student hits carry their identity so the composer can add the recipient by
+			# STUDENT ID (not by email). A guardian email shared by two siblings resolves
+			# ambiguously by email — keying the picked token on the student id keeps each
+			# sibling distinct (the "clicking a name removes a selected student" bug).
+			if student:
+				row["student"] = student
+			if reference:
+				row["reference"] = reference
+			results.append(row)
 
 	# Search Student by id / reference number / name / email — return the student's
 	# OWN email (the `user` login email) so the BCC picker resolves students by
@@ -4634,7 +4643,12 @@ def search_contacts(query):
 				display = " ".join(
 					p for p in (cstr(s.get("first_name")), cstr(s.get("last_name"))) if p.strip()
 				).strip() or cstr(s.get("student_name") or "").strip() or cstr(s.get("name"))
-				_add(s.get("user"), display)
+				_add(
+					s.get("user"),
+					display,
+					student=cstr(s.get("name") or "").strip() or None,
+					reference=cstr(s.get("reference_number") or "").strip() or None,
+				)
 		except Exception:
 			pass
 

@@ -21,6 +21,8 @@ from helpdesk.api import unity_helpdesk_ext as ext
 from helpdesk.api.unity_helpdesk import get_student_guardian_emails
 from helpdesk.api.unity_helpdesk_ext import (
 	RECIPIENT_HARD_CAP,
+	STUDENT_HARD_CAP,
+	TOTAL_ADDRESS_HARD_CAP,
 	_bulk_fingerprint,
 	_group_key,
 	_split_email_list,
@@ -280,11 +282,39 @@ class TestBulkSendJob(_JobTestBase):
 		self.assertEqual(int(tickets[0]["custom_via_unity_portal"] or 0), 1)
 		self.assertEqual(int(tickets[0]["custom_is_bulk_email"] or 0), 1)
 
-	def test_recipient_cap_exceeded_throws(self):
-		groups = json.dumps([{"emails": [f"u{i}@x.com" for i in range(RECIPIENT_HARD_CAP + 1)]}])
+	def test_student_cap_exceeded_throws(self):
+		# The cap is now on DISTINCT STUDENTS (one group each), not the flat address list.
+		groups = json.dumps(
+			[{"student": f"S{i}", "emails": [f"u{i}@x.com"]} for i in range(STUDENT_HARD_CAP + 1)]
+		)
 		with _outgoing_patch():
 			with self.assertRaises(frappe.exceptions.ValidationError):
 				bulk_send_email(subject="x", message="<p>hi</p>", groups=groups, ticket_type=self._ticket_type)
+
+	def test_total_address_cap_exceeded_throws(self):
+		# A few students but a pathological number of guardian addresses trips the second,
+		# higher ceiling on total addresses.
+		big = [f"g{i}@x.com" for i in range(TOTAL_ADDRESS_HARD_CAP + 1)]
+		groups = json.dumps([{"student": "S1", "emails": big}])
+		with _outgoing_patch():
+			with self.assertRaises(frappe.exceptions.ValidationError):
+				bulk_send_email(subject="x", message="<p>hi</p>", groups=groups, ticket_type=self._ticket_type)
+
+	def test_within_student_cap_does_not_throw_over_old_1000_flat(self):
+		# 400 students each with a guardian = 800 addresses: over the OLD 1000-address wall
+		# only when guardians pile up, but well within the student cap. Must NOT throw at
+		# validation (the 500-students-shown-as-359 regression). Enqueue is stubbed so no job runs.
+		groups = json.dumps(
+			[{"student": f"S{i}", "emails": [f"u{i}@x.com", f"g{i}@x.com"]} for i in range(400)]
+		)
+		with _outgoing_patch(), patch.object(ext.frappe, "enqueue"):
+			res = bulk_send_email(
+				subject="x", message="<p>hi</p>", groups=groups, ticket_type=self._ticket_type
+			)
+		if res.get("batch_id"):
+			self._batches.append(res["batch_id"])  # register for tearDown row delete
+		self.assertTrue(res.get("ok"))
+		self.assertEqual(res.get("student_count"), 400)
 
 
 class TestBulkEmailRegressions(_JobTestBase):
@@ -438,6 +468,29 @@ class TestBulkDedup(FrappeTestCase):
 		self.assertTrue(again.get("ok"))
 		self.assertNotIn("duplicate", again or {})
 
+	def test_resend_after_failed_resumes_same_batch(self):
+		# BUG-6: a resend matching a FAILED batch must RESUME it (same batch_id), not mint a
+		# fresh batch with empty processed_keys — that empty batch re-creates every ticket
+		# the dead run already made (the 360 -> 720 duplication).
+		first = self._submit()
+		bid = first["batch_id"]
+		fp = frappe.db.get_value("Unity Bulk Email Batch", bid, "fingerprint")
+		# Simulate the worker dying mid-run: partial progress, marked Failed.
+		frappe.db.set_value(
+			"Unity Bulk Email Batch",
+			bid,
+			{"status": "Failed", "processed_count": 1, "total_count": 1},
+		)
+		frappe.db.commit()
+		again = self._submit()
+		self.assertTrue(again.get("resumed"), "resend after Failed did not resume")
+		self.assertEqual(again.get("batch_id"), bid, "resend minted a NEW batch instead of resuming")
+		self.assertEqual(
+			frappe.db.count("Unity Bulk Email Batch", {"fingerprint": fp}),
+			1,
+			"a duplicate batch row was created on resend-after-failure",
+		)
+
 
 def _delete_if_exists(doctype, name):
 	if frappe.db.exists(doctype, name):
@@ -544,6 +597,20 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 		self.assertIn(shared, result["mapping"][self._student_a_email])
 		self.assertIn(shared, result["mapping"][self._student_b_email])
 
+	def test_search_contacts_returns_student_id(self):
+		# BUG-2: a student search hit must carry the STUDENT ID so the composer adds the
+		# recipient by id (not by a shared guardian email, which collapses two siblings
+		# onto the first — "clicking a name removes a selected student").
+		from helpdesk.api.unity_helpdesk import search_contacts
+
+		hits = search_contacts(self._PREFIX)  # matches first_name "{PREFIX}-sX"
+		student_hits = [h for h in hits if h.get("student")]
+		self.assertTrue(student_hits, "no student-typed hit carried a student id")
+		by_id = {h["student"]: h for h in student_hits}
+		self.assertIn(self._student_a_name, by_id, "student A not returned with its id")
+		# The hit's email is the student's OWN login email, not a guardian's.
+		self.assertEqual(by_id[self._student_a_name]["email"], self._student_a_email)
+
 	def test_guardian_without_email_skipped(self):
 		result = get_student_guardian_emails(json.dumps([self._student_c_email]))
 		self.assertNotIn(self._student_c_email, result["mapping"])
@@ -556,3 +623,47 @@ class TestGetStudentGuardianEmails(FrappeTestCase):
 				get_student_guardian_emails(json.dumps([self._student_a_email]))
 		finally:
 			frappe.set_user(original)
+
+
+class TestParseBulkEmailCsvCap(FrappeTestCase):
+	"""#3: the CSV parser caps on DISTINCT STUDENTS, not the mixed student+guardian
+	address list — so a 500-student CSV keeps all 500 (was truncated to ~359 because
+	guardians ate the flat 1000-address budget)."""
+
+	def _parse(self, n_students, guardians_per=1):
+		content = "\n".join(["id"] + [f"STU{i:04d}" for i in range(n_students)])
+		students = {
+			f"stu{i:04d}": {
+				"name": f"STU{i:04d}",
+				"user": f"s{i}@x.com",
+				"school": "",
+				"first_name": f"F{i}",
+			}
+			for i in range(n_students)
+		}
+		guardians = {
+			f"STU{i:04d}": [f"g{i}_{j}@x.com" for j in range(guardians_per)]
+			for i in range(n_students)
+		}
+		with (
+			patch.object(ext, "_students_by_name", lambda ids: students),
+			patch.object(ext, "_guardian_emails_for_students", lambda ids: guardians),
+			patch.object(ext, "_require_unity_access", return_value={"can_view_all_tickets": True}),
+		):
+			return ext.parse_bulk_email_csv(content)
+
+	def test_500_students_all_kept(self):
+		# Each of 500 students also has a guardian => 1000 addresses, over the OLD flat
+		# 1000-address wall that truncated students. All 500 must survive now.
+		res = self._parse(500, guardians_per=1)
+		self.assertEqual(res["student_count"], 500, "students dropped at parse (the 500->359 bug)")
+		self.assertEqual(res["group_count"], 500)
+		self.assertEqual(res["guardian_count"], 500)
+		self.assertFalse(res["truncated"])
+
+	def test_over_student_cap_truncates_on_students(self):
+		# With a tiny cap, only the first N distinct students are kept and truncated is set.
+		with patch.object(ext, "STUDENT_HARD_CAP", 10):
+			res = self._parse(15, guardians_per=1)
+		self.assertEqual(res["student_count"], 10, "distinct-student cap not enforced")
+		self.assertTrue(res["truncated"])

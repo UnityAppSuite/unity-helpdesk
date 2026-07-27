@@ -536,8 +536,17 @@ from io import StringIO
 from frappe.utils import validate_email_address
 
 
-RECIPIENT_HARD_CAP = 1000
-TOTAL_ADDRESS_HARD_CAP = 1500
+# Volume caps. Historically a single flat RECIPIENT_HARD_CAP counted students AND
+# guardians together, so a 500-student CSV (each with ~1-2 guardians) hit the wall at
+# ~360 students and silently dropped the rest at parse time. Bulk sends are now bounded
+# on DISTINCT STUDENTS (one ticket + one mail per student), with a separate ceiling on
+# the total address volume (students + guardians + cc). Walsh Admin (edu_quality) has no
+# recipient cap at all; these values comfortably cover a real single-school broadcast and
+# stay inside one serial job's timeout — PR#2's parallel chunking removes the ceiling.
+STUDENT_HARD_CAP = 1000
+TOTAL_ADDRESS_HARD_CAP = 3000
+# Deprecated flat cap — kept as an alias so any external caller still importing it works.
+RECIPIENT_HARD_CAP = STUDENT_HARD_CAP
 
 
 def _safe_render(text, context):
@@ -788,6 +797,13 @@ import hashlib
 
 # A second identical submission within this window is treated as an accidental resend.
 BULK_DUP_WINDOW_MINUTES = 5
+# How far back an identical submission can RESUME a prior failed/stalled batch instead of
+# minting a fresh one (which would re-create the tickets the dead batch already made).
+BULK_RESUME_WINDOW_MINUTES = 60
+# A Sending/Queued batch whose record hasn't been touched in this long has no live worker
+# (the job writes progress after every student), so it is safe to resume. Matches the job
+# timeout so an actively-running long send is never mistaken for a dead one.
+BULK_STALE_MINUTES = 25
 
 
 def _bulk_fingerprint(sender, subject, message, ticket_type, groups):
@@ -839,6 +855,44 @@ def _find_recent_duplicate_batch(fingerprint):
         limit=1,
     )
     return rows[0] if rows else None
+
+
+def _find_resumable_batch(fingerprint):
+    """A prior batch with the SAME fingerprint that has no live worker — either it was
+    marked ``Failed``, or it is a ``Sending``/``Queued`` record whose progress hasn't
+    advanced in ``BULK_STALE_MINUTES`` (the job writes after every student, so a stale
+    record means the worker died, e.g. a SIGKILL on timeout that skipped the Failed
+    handler). Resuming THIS batch — re-enqueuing the job with the same batch_name/batch_id
+    — is the BUG-6 fix: the job reloads ``processed_keys`` and skips the students it
+    already handled, so a resend-after-failure never re-creates the tickets the dead run
+    already made (the 360 -> 720 duplication). Resume is always idempotent, so it needs no
+    confirmation. Returns the batch row (incl. ``batch_id``) or None."""
+    if not fingerprint:
+        return None
+    from frappe.utils import add_to_date, get_datetime, now_datetime
+
+    now = now_datetime()
+    window_cutoff = add_to_date(now, minutes=-BULK_RESUME_WINDOW_MINUTES)
+    stale_cutoff = get_datetime(add_to_date(now, minutes=-BULK_STALE_MINUTES))
+    rows = frappe.get_all(
+        "Unity Bulk Email Batch",
+        filters={
+            "fingerprint": fingerprint,
+            "creation": [">=", window_cutoff],
+            "status": ["in", ["Failed", "Sending", "Queued"]],
+        },
+        fields=["name", "batch_id", "status", "processed_count", "total_count", "modified", "creation"],
+        order_by="modified desc",
+        limit=5,
+    )
+    for row in rows:
+        if row.status == "Failed":
+            return row
+        # A Sending/Queued batch is resumable only once its worker is clearly gone —
+        # otherwise we'd race a still-running job on the same record.
+        if get_datetime(row.modified) < stale_cutoff:
+            return row
+    return None
 
 
 @frappe.whitelist()
@@ -904,13 +958,23 @@ def bulk_send_email(
     if not normalized_groups:
         frappe.throw(_("Add at least one recipient (student) before sending"))
 
-    # Hard caps bound the total send volume; over the limit we throw (rather than
-    # silently send a partial batch) so the user knowingly splits it.
-    if total_recipients > RECIPIENT_HARD_CAP:
-        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
+    # Hard caps bound the send volume; over the limit we throw (rather than silently
+    # send a partial batch) so the user knowingly splits it. The primary cap is on
+    # DISTINCT STUDENTS (one ticket + one mail each); a second, higher ceiling bounds the
+    # total address volume so guardians never blow past a sane maximum. (PR#2 replaces
+    # both with auto-split parallel chunks.)
+    student_count = len(normalized_groups)
+    if student_count > STUDENT_HARD_CAP:
+        frappe.throw(
+            _("This send has {0} students, over the {1}-student limit for one send. Split it into smaller batches.").format(
+                student_count, STUDENT_HARD_CAP
+            )
+        )
     if total_recipients + len(cc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
-            _("Total addresses (recipients + cc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
+            _("This send has {0} total addresses (students + guardians + cc), over the {1} limit. Reduce the recipients or turn off guardians.").format(
+                total_recipients + len(cc_list), TOTAL_ADDRESS_HARD_CAP
+            )
         )
 
     # Resolve attachment File names cheaply in-request (single IN(...) query).
@@ -955,6 +1019,58 @@ def bulk_send_email(
     # timeout (BUG-3); `instant` only asks the job to flush THIS batch's queued mail at
     # the end so delivery still feels immediate.
     instant = bool(int(frappe.db.get_single_value("HD Settings", "instantly_send_email") or 0))
+
+    # AUTO-RESUME (BUG-6). If an identical prior send has no live worker — it Failed, or
+    # stalled — RESUME that batch rather than minting a new one. Minting a new batch would
+    # give it an empty processed_keys and re-create every ticket the dead run already made
+    # (the 360 -> 720 duplication). Re-enqueuing the SAME batch_name/batch_id lets the job
+    # skip already-handled students. Idempotent, so no prompt (runs even without confirm).
+    resumable = _find_resumable_batch(fingerprint)
+    if resumable:
+        resume_batch_id = cstr(resumable.get("batch_id") or "") or resumable["name"]
+        frappe.db.set_value(
+            "Unity Bulk Email Batch",
+            resumable["name"],
+            {"status": "Queued", "error": None},
+            update_modified=True,
+        )
+        frappe.db.commit()
+        frappe.enqueue(
+            "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
+            queue="long",
+            timeout=1500,
+            subject=subject,
+            message=message,
+            groups=normalized_groups,
+            cc_list=cc_list,
+            sender=frappe.session.user,
+            file_names=file_names,
+            ticket_type=ticket_type,
+            now=instant,
+            batch_id=resume_batch_id,
+            batch_name=resumable["name"],
+        )
+        already_done = int(resumable.get("processed_count") or 0)
+        total = int(resumable.get("total_count") or len(normalized_groups))
+        return {
+            "ok": True,
+            "queued": True,
+            "resumed": True,
+            "instant": instant,
+            "batch_id": resume_batch_id,
+            "already_done": already_done,
+            "tickets": [],
+            "ticket": None,
+            "ticket_count": 0,
+            "student_count": len(normalized_groups),
+            "recipient_count": total_recipients,
+            "count": total_recipients,
+            "invalid_count": invalid_count,
+            "invalid_cc_count": invalid_cc_count,
+            "message": _(
+                "Resuming your previous send that didn't finish — {0} of {1} students were already done."
+            ).format(already_done, total),
+        }
 
     # Durable per-send record (BUG-2). The job updates it live, so the SPA can poll a
     # real progress bar and show an honest "X sent / K failed" result + an exportable
@@ -1623,7 +1739,9 @@ def parse_bulk_email_csv(content):
         sid = cstr(row.get(id_col) or "").strip()
         if sid:
             parsed.append((sid, row))
-        if len(parsed) >= RECIPIENT_HARD_CAP * 2:
+        # Read a generous buffer of raw rows (some may be duplicate students); the
+        # distinct-student budget is enforced below on the resolved students.
+        if len(parsed) >= STUDENT_HARD_CAP * 2:
             break
     if not parsed:
         frappe.throw(_("No student IDs found in the CSV"))
@@ -1656,6 +1774,7 @@ def parse_bulk_email_csv(content):
     duplicates = 0
     guardian_added = 0
     student_added = 0
+    truncated = False  # set if we stop early on a cap (distinct students OR total addresses)
     for sid, row in parsed:
         student = students.get(sid.lower())
         if not student:
@@ -1671,6 +1790,12 @@ def parse_bulk_email_csv(content):
         if canonical_id.lower() in processed_students:
             duplicates += 1
             continue
+        # DISTINCT-STUDENT budget (the 500->359 fix): stop taking NEW students once the
+        # cap is reached — the cap counts students, not the mixed student+guardian address
+        # list, so guardians never evict students at parse time.
+        if len(processed_students) >= STUDENT_HARD_CAP:
+            truncated = True
+            break
         processed_students.add(canonical_id.lower())
         # Carried context shared by the student AND their guardians.
         ctx = {**row, "_student": canonical_id}
@@ -1696,7 +1821,10 @@ def parse_bulk_email_csv(content):
                 rows.append({"email": ge, "name": f"{display} (guardian)", "data": ctx})
                 guardian_added += 1
 
-        if len(rows) >= RECIPIENT_HARD_CAP:
+        # Absolute address ceiling (students + guardians). Far above the student cap, so
+        # it only trips on pathological guardian counts — bounds the payload either way.
+        if len(rows) >= TOTAL_ADDRESS_HARD_CAP:
+            truncated = True
             break
 
     school_bcc = _school_bcc_emails(csv_school) if csv_school else []
@@ -1736,9 +1864,9 @@ def parse_bulk_email_csv(content):
             grp["emails"].append(r["email"])
     groups = [groups_by_student[k] for k in group_order]
 
-    # `truncated` => the CSV had more recipients than the per-send cap; the UI warns
-    # so the agent knows to split the batch rather than silently under-sending.
-    truncated = len(rows) >= RECIPIENT_HARD_CAP
+    # `truncated` (set in the loop above) => we stopped early on the distinct-student cap
+    # or the total-address ceiling, so the CSV had more than one send can carry. The UI
+    # warns the agent to split the batch rather than silently under-sending.
 
     return {
         "headers": headers,
