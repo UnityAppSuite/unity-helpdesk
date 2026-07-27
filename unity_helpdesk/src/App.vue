@@ -830,11 +830,154 @@
         </div>
       </section>
     </div>
+
+    <!-- Bulk send: live progress + honest result + failed-CSV export (BUG-2 / BUG-3) -->
+    <div
+      v-if="bulkProgressOpen"
+      class="modal-backdrop"
+      @click.self="maybeCloseBulkProgress"
+    >
+      <section class="modal-card bulk-progress-card">
+        <div class="modal-header">
+          <h2>
+            {{
+              bulkProgress.done ? "Bulk email finished" : "Sending bulk email…"
+            }}
+          </h2>
+          <button
+            v-if="bulkProgress.done"
+            class="icon-btn"
+            aria-label="Close"
+            @click="closeBulkProgress"
+          >
+            ×
+          </button>
+        </div>
+        <div class="modal-body stack">
+          <p v-if="bulkProgress.subject" class="muted bulk-progress-subject">
+            {{ bulkProgress.subject }}
+          </p>
+          <div class="bulk-progress-bar" role="progressbar">
+            <div
+              class="bulk-progress-fill"
+              :class="{
+                'has-errors': bulkProgress.failed > 0,
+                done: bulkProgress.done,
+                preparing: !bulkProgress.batchId && !bulkProgress.done,
+              }"
+              :style="{
+                width:
+                  (!bulkProgress.batchId && !bulkProgress.done
+                    ? 100
+                    : bulkProgress.progress) + '%',
+              }"
+            ></div>
+          </div>
+          <div class="bulk-progress-stats">
+            <span v-if="!bulkProgress.batchId && !bulkProgress.done"
+              >Preparing to send…</span
+            >
+            <span v-else>
+              {{ bulkProgress.done ? "Processed" : "Sending" }}
+              {{ bulkProgress.processed + bulkProgress.skipped }} of
+              {{ bulkProgress.total }}
+            </span>
+            <span class="stat-ok">Sent {{ bulkProgress.sent }}</span>
+            <span v-if="bulkProgress.failed" class="stat-err">
+              Failed {{ bulkProgress.failed }}
+            </span>
+            <span v-if="bulkProgress.skipped" class="muted">
+              Skipped {{ bulkProgress.skipped }}
+            </span>
+          </div>
+
+          <div
+            v-if="bulkProgress.done && bulkProgress.failed_rows.length"
+            class="bulk-failed"
+          >
+            <div class="bulk-failed-head">
+              <strong
+                >{{ bulkProgress.failed_rows.length }} recipient(s)
+                failed</strong
+              >
+              <button class="btn secondary small" @click="exportFailedCsv">
+                Export failed as CSV
+              </button>
+            </div>
+            <div class="bulk-failed-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Student</th>
+                    <th>Email</th>
+                    <th>Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="(r, i) in bulkProgress.failed_rows" :key="i">
+                    <td>{{ r.student || "—" }}</td>
+                    <td>{{ r.email || "—" }}</td>
+                    <td>{{ r.reason }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <p
+            v-else-if="bulkProgress.done && !bulkProgress.failed"
+            class="bulk-all-ok"
+          >
+            All {{ bulkProgress.sent }} email(s) queued for delivery.
+          </p>
+          <p v-else-if="!bulkProgress.done" class="muted">
+            You can keep working — this window updates live and the tickets
+            appear in the list as they’re created.
+          </p>
+        </div>
+        <div v-if="bulkProgress.done" class="modal-footer">
+          <button class="btn" @click="closeBulkProgress">Close</button>
+        </div>
+      </section>
+    </div>
+
+    <!-- Duplicate-submission guard: confirm before resending an identical send (BUG-4) -->
+    <div
+      v-if="bulkDuplicate"
+      class="modal-backdrop"
+      @click.self="bulkDuplicate = null"
+    >
+      <section class="modal-card bulk-dup-card">
+        <div class="modal-header"><h2>Looks like a duplicate</h2></div>
+        <div class="modal-body stack">
+          <p>{{ bulkDuplicate.message }}</p>
+          <p class="muted">
+            This usually means a double-click or a second tab. Only resend if
+            you are sure it did not go out.
+          </p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn secondary" @click="bulkDuplicate = null">
+            Don’t resend
+          </button>
+          <button class="btn danger" @click="confirmResendBulk">
+            Resend anyway
+          </button>
+        </div>
+      </section>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { computed, onMounted, provide, reactive, ref, watch } from "vue";
+import {
+  computed,
+  onBeforeUnmount,
+  onMounted,
+  provide,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 import {
@@ -915,6 +1058,26 @@ const bulkEmailSending = ref(false);
 // tied to the composer UI and reset by closeBulkEmail). Prevents the same submission
 // from firing twice; server-side the job is also idempotent per batch_id.
 const bulkSubmitting = ref(false);
+// Live send progress + result (polled from the Unity Bulk Email Batch record). Drives
+// the progress bar, the honest "X sent / K failed" panel, and the failed-CSV export.
+const bulkProgressOpen = ref(false);
+const bulkProgress = reactive({
+  batchId: "",
+  subject: "",
+  status: "",
+  total: 0,
+  processed: 0,
+  sent: 0,
+  failed: 0,
+  skipped: 0,
+  progress: 0,
+  done: false,
+  failed_rows: [],
+});
+let bulkPollTimer = null;
+// Duplicate-submission prompt: { message, payload }. Set when the server refuses an
+// identical send within the guard window; "Resend anyway" re-submits with confirm_resend.
+const bulkDuplicate = ref(null);
 const bulkEmailUploading = ref(false);
 const bulkEmailError = ref("");
 const bulkEmailWarning = ref("");
@@ -2026,6 +2189,9 @@ async function sendBulkEmail() {
   if (bulkSubmitting.value) return;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
+  // Fold in a CC address that was typed but not yet committed with a comma/Enter, so it
+  // isn't silently dropped on Send (same as the test-recipient box does).
+  if (ccInputQuery.value.trim()) addCcFromInput();
   // One group per student (or free email): the student and/or their guardians,
   // per the recipient toggles.
   const groups = bulkEmailGroups.value;
@@ -2075,59 +2241,204 @@ async function sendBulkEmail() {
     subject: bulkEmail.subject,
     message: bulkEmail.message,
     ticket_type: bulkEmail.ticket_type,
+    mode: bulkEmail.mode,
     groups: JSON.stringify(groups),
     cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
     attachments: JSON.stringify(
       bulkEmail.attachments.map((attachment) => attachment.name)
     ),
   };
-  const studentCount = groups.length;
 
-  // Non-blocking: close the composer immediately and report progress out-of-band so
-  // the UI never hangs on a slow send. The per-student tickets appear in the list
-  // as they are created (each is committed early server-side).
-  bulkSubmitting.value = true;
+  // Close the composer and hand off to the live progress modal.
   closeBulkEmail();
-  showGlobalNotice(
-    "Sending email… your tickets will appear in the list shortly.",
-    "info"
-  );
+  await submitBulkSend(payload);
+}
+
+// Send (or resend) a bulk-email payload, then either open the live progress modal or,
+// if the server flags an accidental duplicate, ask the agent to confirm a resend.
+async function submitBulkSend(payload) {
+  if (bulkSubmitting.value) return;
+  bulkSubmitting.value = true;
+  // IMMEDIATE feedback — open the progress modal in a "Preparing…" state the instant Send is
+  // clicked, BEFORE the request, so the user never sees a blank moment ("nothing happened").
+  // startBulkProgress() swaps in the real batch + live polling once the request returns.
+  stopBulkPolling();
+  Object.assign(bulkProgress, {
+    batchId: "",
+    subject: payload?.subject || "",
+    status: "Preparing",
+    total: 0,
+    processed: 0,
+    sent: 0,
+    failed: 0,
+    skipped: 0,
+    progress: 0,
+    done: false,
+    failed_rows: [],
+  });
+  bulkProgressOpen.value = true;
   try {
     const result = await call(
       "helpdesk.api.unity_helpdesk_ext.bulk_send_email",
       payload
     );
-    signalTicketsRefresh();
-    if (result?.warning) {
+    if (result?.duplicate) {
+      // Accidental double-send (second tab, refresh, two agents). Ask before resending.
+      bulkProgressOpen.value = false;
+      bulkDuplicate.value = {
+        message:
+          result.message ||
+          "You already sent this exact email a moment ago and it is still being processed.",
+        payload,
+      };
+      return;
+    }
+    bulkDuplicate.value = null;
+    if (result?.batch_id) {
+      startBulkProgress(
+        result.batch_id,
+        payload.subject,
+        result.student_count || 0,
+        result.invalid_count || 0
+      );
+    } else if (result?.warning) {
+      bulkProgressOpen.value = false;
       showGlobalNotice(result.warning, "error", 9000);
     } else {
-      // The send now runs in a background worker (so a big batch can't time out
-      // the request), so the tickets are being CREATED, not done yet.
-      const n = result?.student_count || result?.ticket_count || studentCount;
-      const noun = n === 1 ? "ticket" : "tickets";
-      let message = `Bulk email started — ${n} ${noun} are being created and will send shortly.`;
-      if (result?.invalid_count) {
-        message += ` ${result.invalid_count} invalid address(es) skipped.`;
-      }
-      showGlobalNotice(message, "success", 7000);
-      // The worker creates tickets after this response returns; refresh again a few
-      // seconds later so they show up without the user having to reload.
-      setTimeout(signalTicketsRefresh, 4000);
+      bulkProgressOpen.value = false;
+      showGlobalNotice("Bulk email started.", "success", 6000);
+      signalTicketsRefresh();
     }
   } catch (err) {
-    // This send is fire-and-forget: the request only enqueues a background job, so an
-    // error here does NOT mean nothing happened — the job may well have started. And
-    // resending starts a FRESH batch (new batch_id → new tickets), so we must NOT
-    // tell the user to "try again". Ask them to check the list before doing anything.
-    showGlobalNotice(
-      "Couldn't confirm the bulk send started. Do NOT resend — check the tickets list in a minute; if the tickets aren't there, contact support.",
-      "error",
-      12000
-    );
+    // Surface the REAL server message for a validation error (e.g. a recipient-limit throw) so
+    // the user knows exactly why. Keep the vague "don't resend" only for network/timeout/5xx,
+    // where the job may actually have started.
+    bulkProgressOpen.value = false;
+    const msg = err?.message;
+    const transient =
+      err?.code === "REQUEST_TIMEOUT" ||
+      err?.code === "NETWORK_ERROR" ||
+      (typeof err?.status === "number" && err.status >= 500);
+    if (msg && !transient) {
+      showGlobalNotice(msg, "error", 10000);
+    } else {
+      showGlobalNotice(
+        "Couldn't confirm the bulk send started. Do NOT resend — check the tickets list in a minute; if the tickets aren't there, contact support.",
+        "error",
+        12000
+      );
+    }
   } finally {
     bulkSubmitting.value = false;
   }
 }
+
+// Resend after the duplicate prompt — same payload, with confirm_resend so the server
+// skips the guard.
+async function confirmResendBulk() {
+  const dup = bulkDuplicate.value;
+  bulkDuplicate.value = null;
+  if (!dup) return;
+  await submitBulkSend({ ...dup.payload, confirm_resend: "1" });
+}
+
+// Open the progress modal and begin polling the batch record every 1.5s.
+function startBulkProgress(batchId, subject, total, invalidCount) {
+  stopBulkPolling();
+  Object.assign(bulkProgress, {
+    batchId,
+    subject: subject || "",
+    status: "Queued",
+    total: total || 0,
+    processed: 0,
+    sent: 0,
+    failed: 0,
+    skipped: 0,
+    progress: 0,
+    done: false,
+    failed_rows: [],
+  });
+  bulkProgressOpen.value = true;
+  if (invalidCount) {
+    showGlobalNotice(
+      `${invalidCount} invalid address(es) were skipped before sending.`,
+      "info",
+      6000
+    );
+  }
+  pollBulkProgressOnce();
+  bulkPollTimer = setInterval(pollBulkProgressOnce, 1500);
+}
+
+async function pollBulkProgressOnce() {
+  if (!bulkProgress.batchId) return;
+  try {
+    const s = await call(
+      "helpdesk.api.unity_helpdesk_ext.get_bulk_email_batch_status",
+      { batch_id: bulkProgress.batchId }
+    );
+    if (!s || !s.found) return;
+    Object.assign(bulkProgress, {
+      status: s.status,
+      total: s.total,
+      processed: s.processed,
+      sent: s.sent,
+      failed: s.failed,
+      skipped: s.skipped,
+      progress: s.progress,
+      done: s.done,
+      failed_rows: s.failed_rows || [],
+    });
+    // Reflect newly-created tickets in the list as they land.
+    signalTicketsRefresh();
+    if (s.done) stopBulkPolling();
+  } catch (err) {
+    // Transient — keep polling; a later tick will succeed.
+  }
+}
+
+function stopBulkPolling() {
+  if (bulkPollTimer) {
+    clearInterval(bulkPollTimer);
+    bulkPollTimer = null;
+  }
+}
+
+function closeBulkProgress() {
+  stopBulkPolling();
+  bulkProgressOpen.value = false;
+  signalTicketsRefresh();
+}
+
+// Click-away only closes once the send is finished (never mid-send).
+function maybeCloseBulkProgress() {
+  if (bulkProgress.done) closeBulkProgress();
+}
+
+// Download the failed recipients (student, email, reason) as CSV so the agent can fix
+// and re-send only the ones that failed.
+function exportFailedCsv() {
+  const rows = bulkProgress.failed_rows || [];
+  if (!rows.length) return;
+  const esc = (v) => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+  const lines = ["student,email,reason"];
+  for (const r of rows) {
+    lines.push([esc(r.student), esc(r.email), esc(r.reason)].join(","));
+  }
+  const blob = new Blob([lines.join("\n")], {
+    type: "text/csv;charset=utf-8;",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `bulk-email-failed-${bulkProgress.batchId || "batch"}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+onBeforeUnmount(stopBulkPolling);
 
 // --- Bulk-composer test-mail step (verifier chips) ---
 function focusBulkTestInput() {

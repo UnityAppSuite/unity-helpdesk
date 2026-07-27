@@ -3869,3 +3869,104 @@ body.col-resizing .ticket-table * {
     overflow-x: visible;
   }
 }
+
+/* --- Bulk email: live progress + result + failed list (BUG-2 / BUG-3 / BUG-4) --- */
+.bulk-progress-card {
+  max-width: min(640px, 94vw);
+}
+.bulk-progress-subject {
+  margin: 0;
+  font-size: 13px;
+}
+.bulk-progress-bar {
+  width: 100%;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(79, 70, 229, 0.12);
+  overflow: hidden;
+}
+.bulk-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #4f46e5;
+  transition: width 320ms ease;
+}
+.bulk-progress-fill.done {
+  background: #16a34a;
+}
+.bulk-progress-fill.has-errors {
+  background: #d97706;
+}
+/* Indeterminate pulse shown the instant Send is clicked, before the batch id arrives. */
+.bulk-progress-fill.preparing {
+  animation: bulk-progress-pulse 1.1s ease-in-out infinite;
+}
+@keyframes bulk-progress-pulse {
+  0%,
+  100% {
+    opacity: 0.4;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+.bulk-progress-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.bulk-progress-stats .stat-ok {
+  color: #166534;
+}
+.bulk-progress-stats .stat-err {
+  color: #991b1b;
+}
+.bulk-failed {
+  border: 1px solid rgba(220, 38, 38, 0.24);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.bulk-failed-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  background: rgba(239, 68, 68, 0.08);
+  color: #991b1b;
+}
+.bulk-failed-table {
+  max-height: 260px;
+  overflow: auto;
+}
+.bulk-failed-table table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.bulk-failed-table th,
+.bulk-failed-table td {
+  text-align: left;
+  padding: 8px 12px;
+  border-top: 1px solid rgba(15, 23, 42, 0.08);
+  vertical-align: top;
+  word-break: break-word;
+}
+.bulk-failed-table thead th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  border-top: none;
+  font-weight: 600;
+}
+.btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+.bulk-all-ok {
+  margin: 0;
+  color: #166534;
+  font-weight: 600;
+}
