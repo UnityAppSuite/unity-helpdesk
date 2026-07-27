@@ -23,12 +23,14 @@ from helpdesk.api.unity_helpdesk_ext import (
 	RECIPIENT_HARD_CAP,
 	STUDENT_HARD_CAP,
 	TOTAL_ADDRESS_HARD_CAP,
+	_bulk_delivery_counts,
 	_bulk_fingerprint,
 	_group_key,
 	_split_email_list,
 	_split_email_list_with_counts,
 	_student_primary_email,
 	bulk_send_email,
+	get_bulk_email_batch_status,
 )
 
 
@@ -261,6 +263,43 @@ class TestBulkSendJob(_JobTestBase):
 		self.assertFalse(kwargs.get("bcc"))
 		self.assertFalse(kwargs.get("cc"))
 		self.assertEqual(kwargs.get("expose_recipients"), "header")
+
+	def test_delivery_counts_split_queued_vs_delivered(self):
+		# Two bulk tickets; simulate the Email Queue having delivered one ('Sent') and still
+		# holding the other ('Not Sent'). _bulk_delivery_counts must split delivered/in_queue,
+		# and get_bulk_email_batch_status must surface them for the two-phase progress UI.
+		bid, _row, tickets, _sc, _cc = self._run_job(
+			[{"student": None, "emails": ["a@x.com"]}, {"student": None, "emails": ["b@x.com"]}]
+		)
+		self.assertEqual(len(tickets), 2)
+		eq_names = []
+		try:
+			for tk, status in zip(tickets, ("Sent", "Not Sent")):
+				eq = frappe.get_doc(
+					{
+						"doctype": "Email Queue",
+						"status": status,
+						"reference_doctype": "HD Ticket",
+						"reference_name": tk["name"],
+						"priority": 1,
+						"message": "x",
+					}
+				).insert(ignore_permissions=True)
+				eq_names.append(eq.name)
+			frappe.db.commit()
+
+			delivered, in_queue = _bulk_delivery_counts(bid)
+			self.assertEqual(delivered, 1)
+			self.assertEqual(in_queue, 1)
+
+			status = get_bulk_email_batch_status(bid)
+			self.assertEqual(status["delivered"], 1)
+			self.assertEqual(status["in_queue"], 1)
+			self.assertEqual(status["queued"], 2)  # both were queued (sendmail delayed ok)
+		finally:
+			for name in eq_names:
+				frappe.db.delete("Email Queue", {"name": name})
+			frappe.db.commit()
 
 	def test_description_is_message_only(self):
 		_bid, _row, tickets, _sc, _cc = self._run_job([{"student": None, "emails": ["a@x.com"]}])

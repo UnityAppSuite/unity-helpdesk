@@ -1447,6 +1447,45 @@ def _bulk_send_email_job(
         return {"tickets": tickets, **counts, "error": True, "batch": batch_name}
 
 
+def _bulk_delivery_counts(batch_id):
+    """Actual DELIVERY progress for a batch: how many of its queued mails the Email Queue
+    has really sent. The job sends ``delayed=True`` — that only QUEUES each mail (status
+    'Not Sent'); the scheduler/queue flush later flips it to 'Sent'. Each queued mail is
+    linked to its bulk ticket (reference_doctype='HD Ticket', reference_name=ticket), and
+    those tickets carry ``custom_bulk_batch_id``. Both join columns are indexed
+    (custom_bulk_batch_id_unity_idx + Email Queue.reference_name), and a batch is <=1000
+    tickets, so this is cheap per poll. Returns (delivered, in_queue) or (None, None) on
+    any error so the caller can just hide the delivery bar.
+
+    NOTE: on a site with the scheduler OFF (e.g. this local bench) nothing flushes the
+    queue, so delivered stays 0 until a flush; on prod it advances on its own."""
+    try:
+        rows = frappe.db.sql(
+            """
+            SELECT eq.status AS status, COUNT(*) AS c
+            FROM `tabHD Ticket` t
+            JOIN `tabEmail Queue` eq
+              ON eq.reference_doctype = 'HD Ticket' AND eq.reference_name = t.name
+            WHERE t.custom_bulk_batch_id = %(bid)s
+            GROUP BY eq.status
+            """,
+            {"bid": batch_id},
+            as_dict=True,
+        )
+        delivered = 0
+        in_queue = 0
+        for r in rows:
+            n = int(r.get("c") or 0)
+            if r.get("status") == "Sent":
+                delivered += n
+            elif r.get("status") in ("Not Sent", "Sending"):
+                in_queue += n
+        return delivered, in_queue
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Unity bulk delivery counts failed")
+        return None, None
+
+
 @frappe.whitelist()
 def get_bulk_email_batch_status(batch_id):
     """Live status of a bulk send (BUG-2), polled by the SPA to drive the progress bar
@@ -1483,7 +1522,12 @@ def get_bulk_email_batch_status(batch_id):
     total = int(row.get("total_count") or 0)
     processed = int(row.get("processed_count") or 0)
     skipped = int(row.get("skipped_count") or 0)
+    queued = int(row.get("sent_count") or 0)  # sendmail(delayed=True) succeeded => queued
     done = row.get("status") in ("Completed", "Completed with Errors", "Failed")
+
+    # Actual delivery from the Email Queue (queued -> Sent). None => hide the delivery bar.
+    delivered, in_queue = _bulk_delivery_counts(row.get("batch_id"))
+
     return {
         "found": True,
         "batch_id": row.get("batch_id"),
@@ -1491,12 +1535,18 @@ def get_bulk_email_batch_status(batch_id):
         "subject": row.get("subject"),
         "total": total,
         "processed": processed,
-        "sent": int(row.get("sent_count") or 0),
+        # `sent` kept for back-compat; it means "queued into the Email Queue" (delayed send).
+        "sent": queued,
+        "queued": queued,
+        "delivered": delivered,
+        "in_queue": in_queue,
         "failed": int(row.get("failed_count") or 0),
         "skipped": skipped,
         # Progress counts both processed students and skipped (already-done) ones so the
         # bar reaches 100% even when a re-run skipped some.
         "progress": min(100, round(((processed + skipped) / total) * 100)) if total else (100 if done else 0),
+        # Delivery progress against the whole batch (0 on a scheduler-off site until flushed).
+        "delivered_progress": (min(100, round((delivered / total) * 100)) if (total and delivered is not None) else 0),
         "done": done,
         "failed_rows": failed,
         "started_at": str(row.get("started_at")) if row.get("started_at") else None,

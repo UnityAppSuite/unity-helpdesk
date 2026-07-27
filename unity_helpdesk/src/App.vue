@@ -831,58 +831,128 @@
       </section>
     </div>
 
-    <!-- Bulk send: live progress + honest result + failed-CSV export (BUG-2 / BUG-3) -->
+    <!-- Bulk send: FLOATING, non-blocking live-progress panel. No backdrop, so the page
+         stays fully interactive — the user can keep working while it sends. Minimizable to
+         a compact bar. Two phases: Queued (in the Email Queue) and Delivered (actually sent). -->
     <div
       v-if="bulkProgressOpen"
-      class="modal-backdrop"
-      @click.self="maybeCloseBulkProgress"
+      class="bulk-send-progress"
+      :class="{ minimized: bulkProgressMinimized }"
     >
-      <section class="modal-card bulk-progress-card">
-        <div class="modal-header">
+      <!-- Minimized: a compact clickable bar tucked in the corner -->
+      <button
+        v-if="bulkProgressMinimized"
+        class="bulk-send-progress-chip"
+        :title="bulkProgress.subject"
+        @click="bulkProgressMinimized = false"
+      >
+        <span
+          class="bsp-dot"
+          :class="{ done: bulkProgress.done, err: bulkProgress.failed > 0 }"
+        ></span>
+        <span class="bsp-chip-text">
+          {{ bulkProgress.done ? "Bulk email finished" : "Sending bulk email" }}
+          ·
+          {{ bulkProgress.processed + bulkProgress.skipped }}/{{
+            bulkProgress.total || "…"
+          }}
+        </span>
+        <span class="bsp-chip-expand" aria-hidden="true">⤢</span>
+      </button>
+
+      <!-- Expanded card -->
+      <section v-else class="bulk-send-progress-card">
+        <div class="bulk-send-progress-header">
           <h2>
             {{
               bulkProgress.done ? "Bulk email finished" : "Sending bulk email…"
             }}
           </h2>
-          <button
-            v-if="bulkProgress.done"
-            class="icon-btn"
-            aria-label="Close"
-            @click="closeBulkProgress"
-          >
-            ×
-          </button>
-        </div>
-        <div class="modal-body stack">
-          <p v-if="bulkProgress.subject" class="muted bulk-progress-subject">
-            {{ bulkProgress.subject }}
-          </p>
-          <div class="bulk-progress-bar" role="progressbar">
-            <div
-              class="bulk-progress-fill"
-              :class="{
-                'has-errors': bulkProgress.failed > 0,
-                done: bulkProgress.done,
-                preparing: !bulkProgress.batchId && !bulkProgress.done,
-              }"
-              :style="{
-                width:
-                  (!bulkProgress.batchId && !bulkProgress.done
-                    ? 100
-                    : bulkProgress.progress) + '%',
-              }"
-            ></div>
-          </div>
-          <div class="bulk-progress-stats">
-            <span v-if="!bulkProgress.batchId && !bulkProgress.done"
-              >Preparing to send…</span
+          <div class="bsp-header-actions">
+            <button
+              class="icon-btn"
+              aria-label="Minimize"
+              title="Minimize — keep working"
+              @click="bulkProgressMinimized = true"
             >
-            <span v-else>
-              {{ bulkProgress.done ? "Processed" : "Sending" }}
-              {{ bulkProgress.processed + bulkProgress.skipped }} of
-              {{ bulkProgress.total }}
-            </span>
-            <span class="stat-ok">Sent {{ bulkProgress.sent }}</span>
+              –
+            </button>
+            <button
+              v-if="bulkProgress.done"
+              class="icon-btn"
+              aria-label="Close"
+              @click="closeBulkProgress"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+        <div class="bulk-send-progress-body stack">
+          <p
+            v-if="bulkProgress.subject"
+            class="muted bulk-send-progress-subject"
+          >
+            Subject: {{ bulkProgress.subject }}
+          </p>
+
+          <!-- Phase 1: created & queued into the Email Queue -->
+          <div class="bsp-phase">
+            <div class="bsp-phase-label">
+              <span>{{
+                !bulkProgress.batchId && !bulkProgress.done
+                  ? "Preparing to send…"
+                  : bulkProgress.done
+                  ? "Created & queued"
+                  : "Creating tickets & queueing"
+              }}</span>
+              <span class="bsp-count"
+                >{{ bulkProgress.processed + bulkProgress.skipped }} /
+                {{ bulkProgress.total || "…" }}</span
+              >
+            </div>
+            <div class="bulk-send-progress-bar" role="progressbar">
+              <div
+                class="bulk-send-progress-fill"
+                :class="{
+                  'has-errors': bulkProgress.failed > 0,
+                  done: bulkProgress.done,
+                  preparing: !bulkProgress.batchId && !bulkProgress.done,
+                }"
+                :style="{
+                  width:
+                    (!bulkProgress.batchId && !bulkProgress.done
+                      ? 100
+                      : bulkProgress.progress) + '%',
+                }"
+              ></div>
+            </div>
+          </div>
+
+          <!-- Phase 2: actually delivered from the Email Queue (hidden if uncomputable) -->
+          <div
+            v-if="bulkProgress.delivered !== null && bulkProgress.batchId"
+            class="bsp-phase"
+          >
+            <div class="bsp-phase-label">
+              <span>Delivered</span>
+              <span class="bsp-count"
+                >{{ bulkProgress.delivered }} /
+                {{ bulkProgress.total || "…" }}</span
+              >
+            </div>
+            <div class="bulk-send-progress-bar" role="progressbar">
+              <div
+                class="bulk-send-progress-fill delivered"
+                :style="{ width: bulkProgress.delivered_progress + '%' }"
+              ></div>
+            </div>
+          </div>
+
+          <div class="bulk-send-progress-stats">
+            <span class="stat-ok">Queued {{ bulkProgress.queued }}</span>
+            <span v-if="bulkProgress.delivered !== null" class="muted"
+              >Delivered {{ bulkProgress.delivered }}</span
+            >
             <span v-if="bulkProgress.failed" class="stat-err">
               Failed {{ bulkProgress.failed }}
             </span>
@@ -893,9 +963,9 @@
 
           <div
             v-if="bulkProgress.done && bulkProgress.failed_rows.length"
-            class="bulk-failed"
+            class="bulk-send-failed"
           >
-            <div class="bulk-failed-head">
+            <div class="bulk-send-failed-head">
               <strong
                 >{{ bulkProgress.failed_rows.length }} recipient(s)
                 failed</strong
@@ -904,7 +974,7 @@
                 Export failed as CSV
               </button>
             </div>
-            <div class="bulk-failed-table">
+            <div class="bulk-send-failed-table">
               <table>
                 <thead>
                   <tr>
@@ -925,16 +995,25 @@
           </div>
           <p
             v-else-if="bulkProgress.done && !bulkProgress.failed"
-            class="bulk-all-ok"
+            class="bulk-send-all-ok"
           >
-            All {{ bulkProgress.sent }} email(s) queued for delivery.
+            All {{ bulkProgress.queued }} email(s) queued for delivery.
+            <span
+              v-if="
+                bulkProgress.delivered !== null &&
+                bulkProgress.delivered < bulkProgress.queued
+              "
+              class="muted"
+            >
+              Delivery runs in the background.
+            </span>
           </p>
           <p v-else-if="!bulkProgress.done" class="muted">
-            You can keep working — this window updates live and the tickets
-            appear in the list as they’re created.
+            You can keep working — minimize this and the tickets appear in the
+            list as they’re created.
           </p>
         </div>
-        <div v-if="bulkProgress.done" class="modal-footer">
+        <div v-if="bulkProgress.done" class="bulk-send-progress-footer">
           <button class="btn" @click="closeBulkProgress">Close</button>
         </div>
       </section>
@@ -1067,14 +1146,25 @@ const bulkProgress = reactive({
   status: "",
   total: 0,
   processed: 0,
-  sent: 0,
+  sent: 0, // == queued (delayed send puts each mail in the Email Queue)
+  queued: 0,
+  delivered: null, // null => hide the delivery bar; number => Email Queue "Sent" count
+  in_queue: 0,
   failed: 0,
   skipped: 0,
   progress: 0,
+  delivered_progress: 0,
   done: false,
   failed_rows: [],
 });
+// The floating progress panel can be minimized to a compact bar so the user keeps working.
+const bulkProgressMinimized = ref(false);
 let bulkPollTimer = null;
+// Throttle the (expensive) ticket-list refresh so it can't starve the status poll — the
+// list re-runs the 90K-row KPI aggregate, which on a single-threaded dev server would
+// otherwise queue ahead of the lightweight status poll and freeze the live counts.
+let _lastListRefresh = 0;
+const BULK_LIST_REFRESH_MS = 15000;
 // Duplicate-submission prompt: { message, payload }. Set when the server refuses an
 // identical send within the guard window; "Resend anyway" re-submits with confirm_resend.
 const bulkDuplicate = ref(null);
@@ -2288,12 +2378,17 @@ async function submitBulkSend(payload) {
     total: 0,
     processed: 0,
     sent: 0,
+    queued: 0,
+    delivered: null,
+    in_queue: 0,
     failed: 0,
     skipped: 0,
     progress: 0,
+    delivered_progress: 0,
     done: false,
     failed_rows: [],
   });
+  bulkProgressMinimized.value = false;
   bulkProgressOpen.value = true;
   try {
     const result = await call(
@@ -2381,12 +2476,18 @@ function startBulkProgress(batchId, subject, total, invalidCount) {
     total: total || 0,
     processed: 0,
     sent: 0,
+    queued: 0,
+    delivered: null,
+    in_queue: 0,
     failed: 0,
     skipped: 0,
     progress: 0,
+    delivered_progress: 0,
     done: false,
     failed_rows: [],
   });
+  bulkProgressMinimized.value = false;
+  _lastListRefresh = Date.now(); // don't refresh the list immediately on open
   bulkProgressOpen.value = true;
   if (invalidCount) {
     showGlobalNotice(
@@ -2396,7 +2497,7 @@ function startBulkProgress(batchId, subject, total, invalidCount) {
     );
   }
   pollBulkProgressOnce();
-  bulkPollTimer = setInterval(pollBulkProgressOnce, 1500);
+  bulkPollTimer = setInterval(pollBulkProgressOnce, 2000);
 }
 
 async function pollBulkProgressOnce() {
@@ -2412,14 +2513,25 @@ async function pollBulkProgressOnce() {
       total: s.total,
       processed: s.processed,
       sent: s.sent,
+      queued: s.queued != null ? s.queued : s.sent,
+      delivered: s.delivered, // may be null -> delivery bar hidden
+      in_queue: s.in_queue || 0,
       failed: s.failed,
       skipped: s.skipped,
       progress: s.progress,
+      delivered_progress: s.delivered_progress || 0,
       done: s.done,
       failed_rows: s.failed_rows || [],
     });
-    // Reflect newly-created tickets in the list as they land.
-    signalTicketsRefresh();
+    // Reflect newly-created tickets in the list — but THROTTLED. Refreshing the list
+    // re-runs the 90K-row KPI aggregate; doing it every tick starved this status poll
+    // (the live counts froze). Refresh at most every ~15s during the send, and once at the
+    // end, so the counts climb smoothly while the list still updates periodically.
+    const now = Date.now();
+    if (s.done || now - _lastListRefresh > BULK_LIST_REFRESH_MS) {
+      _lastListRefresh = now;
+      signalTicketsRefresh();
+    }
     if (s.done) stopBulkPolling();
   } catch (err) {
     // Transient — keep polling; a later tick will succeed.
@@ -2437,11 +2549,6 @@ function closeBulkProgress() {
   stopBulkPolling();
   bulkProgressOpen.value = false;
   signalTicketsRefresh();
-}
-
-// Click-away only closes once the send is finished (never mid-send).
-function maybeCloseBulkProgress() {
-  if (bulkProgress.done) closeBulkProgress();
 }
 
 // Download the failed recipients (student, email, reason) as CSV so the agent can fix
