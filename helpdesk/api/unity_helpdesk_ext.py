@@ -536,8 +536,17 @@ from io import StringIO
 from frappe.utils import validate_email_address
 
 
-RECIPIENT_HARD_CAP = 1000
-TOTAL_ADDRESS_HARD_CAP = 1500
+# Volume caps. Historically a single flat RECIPIENT_HARD_CAP counted students AND
+# guardians together, so a 500-student CSV (each with ~1-2 guardians) hit the wall at
+# ~360 students and silently dropped the rest at parse time. Bulk sends are now bounded
+# on DISTINCT STUDENTS (one ticket + one mail per student), with a separate ceiling on
+# the total address volume (students + guardians + cc). Walsh Admin (edu_quality) has no
+# recipient cap at all; these values comfortably cover a real single-school broadcast and
+# stay inside one serial job's timeout — PR#2's parallel chunking removes the ceiling.
+STUDENT_HARD_CAP = 1000
+TOTAL_ADDRESS_HARD_CAP = 3000
+# Deprecated flat cap — kept as an alias so any external caller still importing it works.
+RECIPIENT_HARD_CAP = STUDENT_HARD_CAP
 
 
 def _safe_render(text, context):
@@ -783,6 +792,109 @@ def _normalize_bulk_email_groups(groups, recipients=None, bcc=None, merge_data=N
     return out, invalid_count, total
 
 
+import hashlib
+
+
+# A second identical submission within this window is treated as an accidental resend.
+BULK_DUP_WINDOW_MINUTES = 5
+# How far back an identical submission can RESUME a prior failed/stalled batch instead of
+# minting a fresh one (which would re-create the tickets the dead batch already made).
+BULK_RESUME_WINDOW_MINUTES = 60
+# A Sending/Queued batch whose record hasn't been touched in this long has no live worker
+# (the job writes progress after every student), so it is safe to resume. Matches the job
+# timeout so an actively-running long send is never mistaken for a dead one.
+BULK_STALE_MINUTES = 25
+
+
+def _bulk_fingerprint(sender, subject, message, ticket_type, groups):
+    """Stable hash of a submission's identity — sender + content + the EXACT set of
+    recipient addresses. Two submissions with the same fingerprint a few minutes apart
+    are an accidental duplicate (BUG-4 guard) unless the agent confirms a resend."""
+    emails = sorted({e for g in (groups or []) for e in (g.get("emails") or [])})
+    basis = "".join(
+        [
+            cstr(sender or ""),
+            cstr(subject or ""),
+            cstr(message or ""),
+            cstr(ticket_type or ""),
+            ",".join(emails),
+        ]
+    )
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+
+
+def _group_key(group):
+    """Idempotency key for ONE send group — keyed on the STUDENT, never on raised_by.
+    This is the BUG-1 fix: two emailless siblings who share a guardian resolve to the
+    SAME recipient address (and so the same raised_by), but they are different students,
+    so keying on the student id keeps them distinct and neither is dropped. Free-typed
+    groups (no student) fall back to their sorted email set."""
+    sid = cstr((group or {}).get("student") or "").strip().lower()
+    if sid:
+        return "s:" + sid
+    return "e:" + "|".join(sorted((group or {}).get("emails") or []))
+
+
+def _find_recent_duplicate_batch(fingerprint):
+    """A non-failed batch with the same fingerprint in the last few minutes = an
+    accidental resend (second tab, refresh-and-click, two agents). Returns it or None."""
+    if not fingerprint:
+        return None
+    from frappe.utils import add_to_date, now_datetime
+
+    cutoff = add_to_date(now_datetime(), minutes=-BULK_DUP_WINDOW_MINUTES)
+    rows = frappe.get_all(
+        "Unity Bulk Email Batch",
+        filters={
+            "fingerprint": fingerprint,
+            "creation": [">=", cutoff],
+            "status": ["!=", "Failed"],
+        },
+        fields=["name", "status", "sent_count", "total_count", "creation"],
+        order_by="creation desc",
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
+def _find_resumable_batch(fingerprint):
+    """A prior batch with the SAME fingerprint that has no live worker — either it was
+    marked ``Failed``, or it is a ``Sending``/``Queued`` record whose progress hasn't
+    advanced in ``BULK_STALE_MINUTES`` (the job writes after every student, so a stale
+    record means the worker died, e.g. a SIGKILL on timeout that skipped the Failed
+    handler). Resuming THIS batch — re-enqueuing the job with the same batch_name/batch_id
+    — is the BUG-6 fix: the job reloads ``processed_keys`` and skips the students it
+    already handled, so a resend-after-failure never re-creates the tickets the dead run
+    already made (the 360 -> 720 duplication). Resume is always idempotent, so it needs no
+    confirmation. Returns the batch row (incl. ``batch_id``) or None."""
+    if not fingerprint:
+        return None
+    from frappe.utils import add_to_date, get_datetime, now_datetime
+
+    now = now_datetime()
+    window_cutoff = add_to_date(now, minutes=-BULK_RESUME_WINDOW_MINUTES)
+    stale_cutoff = get_datetime(add_to_date(now, minutes=-BULK_STALE_MINUTES))
+    rows = frappe.get_all(
+        "Unity Bulk Email Batch",
+        filters={
+            "fingerprint": fingerprint,
+            "creation": [">=", window_cutoff],
+            "status": ["in", ["Failed", "Sending", "Queued"]],
+        },
+        fields=["name", "batch_id", "status", "processed_count", "total_count", "modified", "creation"],
+        order_by="modified desc",
+        limit=5,
+    )
+    for row in rows:
+        if row.status == "Failed":
+            return row
+        # A Sending/Queued batch is resumable only once its worker is clearly gone —
+        # otherwise we'd race a still-running job on the same record.
+        if get_datetime(row.modified) < stale_cutoff:
+            return row
+    return None
+
+
 @frappe.whitelist()
 def bulk_send_email(
     subject,
@@ -791,6 +903,8 @@ def bulk_send_email(
     cc=None,
     ticket_type=None,
     attachments=None,
+    mode=None,
+    confirm_resend=None,
     # Legacy flat-recipient params (deprecated) — converted to per-email groups
     # by _normalize_bulk_email_groups so older callers keep working.
     recipients=None,
@@ -832,7 +946,9 @@ def bulk_send_email(
             frappe.OutgoingEmailError,
         )
 
-    # One optional, VISIBLE CC list applied to every per-student mail.
+    # One optional CC/BCC list. It is NO LONGER attached to every per-student mail
+    # (that flooded the CC address with one copy per student and exposed it to every
+    # family — BUG-6). The job sends the CC list ONE hidden copy of the broadcast.
     cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
 
     # Per-student (and per-free-email) groups: one ticket + one email each.
@@ -842,13 +958,23 @@ def bulk_send_email(
     if not normalized_groups:
         frappe.throw(_("Add at least one recipient (student) before sending"))
 
-    # Hard caps bound the total send volume; over the limit we throw (rather than
-    # silently send a partial batch) so the user knowingly splits it.
-    if total_recipients > RECIPIENT_HARD_CAP:
-        frappe.throw(_("Bulk email recipients exceed the {0} address limit").format(RECIPIENT_HARD_CAP))
+    # Hard caps bound the send volume; over the limit we throw (rather than silently
+    # send a partial batch) so the user knowingly splits it. The primary cap is on
+    # DISTINCT STUDENTS (one ticket + one mail each); a second, higher ceiling bounds the
+    # total address volume so guardians never blow past a sane maximum. (PR#2 replaces
+    # both with auto-split parallel chunks.)
+    student_count = len(normalized_groups)
+    if student_count > STUDENT_HARD_CAP:
+        frappe.throw(
+            _("This send has {0} students, over the {1}-student limit for one send. Split it into smaller batches.").format(
+                student_count, STUDENT_HARD_CAP
+            )
+        )
     if total_recipients + len(cc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
-            _("Total addresses (recipients + cc) exceed the {0} limit").format(TOTAL_ADDRESS_HARD_CAP)
+            _("This send has {0} total addresses (students + guardians + cc), over the {1} limit. Reduce the recipients or turn off guardians.").format(
+                total_recipients + len(cc_list), TOTAL_ADDRESS_HARD_CAP
+            )
         )
 
     # Resolve attachment File names cheaply in-request (single IN(...) query).
@@ -865,23 +991,114 @@ def bulk_send_email(
     else:
         file_names = []
 
-    # SEND OFF THE REQUEST (background job). Creating one ticket + one email PER
-    # student inline (insert + per-row commit + sendmail, looped) blows past the
-    # gunicorn/proxy timeout on a large batch — the browser then shows "Failed to
-    # fetch" (connection killed mid-request) or a 500 ("Something went wrong").
-    # Enqueue the whole per-student job on the LONG queue instead: the request
-    # returns instantly and the tickets/emails materialise as the worker processes
-    # them (the SPA already treats bulk send as fire-and-forget — it closes the
-    # composer and refreshes the list out-of-band). frappe.enqueue captures the
-    # current session user, so the worker runs as THIS agent and each ticket's owner
-    # is this agent. Respect the SAME HD Settings "instantly_send_email" flag (ON ->
-    # the worker sends now; OFF -> it just queues the mails for the email flush).
+    # DUPLICATE-SUBMISSION GUARD (BUG-4). The per-batch id alone only stops a re-run of
+    # the SAME enqueued job; a second submission (second tab, refresh-and-click, two
+    # agents) mints a new id and would duplicate everyone. Fingerprint the submission
+    # (sender + content + exact recipient set) and refuse an identical one sent in the
+    # last few minutes — unless the agent explicitly confirms a resend.
+    fingerprint = _bulk_fingerprint(
+        frappe.session.user, subject, message, ticket_type, normalized_groups
+    )
+    resend_confirmed = cstr(confirm_resend or "").strip().lower() in ("1", "true", "yes")
+    if not resend_confirmed:
+        dup = _find_recent_duplicate_batch(fingerprint)
+        if dup:
+            return {
+                "ok": False,
+                "duplicate": True,
+                "existing_batch": dup["name"],
+                "student_count": len(normalized_groups),
+                "message": _(
+                    "You already sent this exact email {0} and it is still being processed. "
+                    "Resend only if you are sure it did not go out."
+                ).format(frappe.utils.pretty_date(dup["creation"])),
+            }
+
+    # Respect HD Settings "instantly_send_email". The job now always QUEUES each mail
+    # (delayed) so a large batch can't block on synchronous SMTP and blow the worker
+    # timeout (BUG-3); `instant` only asks the job to flush THIS batch's queued mail at
+    # the end so delivery still feels immediate.
     instant = bool(int(frappe.db.get_single_value("HD Settings", "instantly_send_email") or 0))
-    # One id per submission, stamped on every ticket the job creates. It makes the
-    # job idempotent: if the worker re-runs it (deadlock-retry, restart) or the user
-    # resends, each student already ticketed under this batch_id is skipped instead
-    # of duplicated.
+
+    # AUTO-RESUME (BUG-6). If an identical prior send has no live worker — it Failed, or
+    # stalled — RESUME that batch rather than minting a new one. Minting a new batch would
+    # give it an empty processed_keys and re-create every ticket the dead run already made
+    # (the 360 -> 720 duplication). Re-enqueuing the SAME batch_name/batch_id lets the job
+    # skip already-handled students. Idempotent, so no prompt (runs even without confirm).
+    resumable = _find_resumable_batch(fingerprint)
+    if resumable:
+        resume_batch_id = cstr(resumable.get("batch_id") or "") or resumable["name"]
+        frappe.db.set_value(
+            "Unity Bulk Email Batch",
+            resumable["name"],
+            {"status": "Queued", "error": None},
+            update_modified=True,
+        )
+        frappe.db.commit()
+        frappe.enqueue(
+            "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
+            queue="long",
+            timeout=1500,
+            subject=subject,
+            message=message,
+            groups=normalized_groups,
+            cc_list=cc_list,
+            sender=frappe.session.user,
+            file_names=file_names,
+            ticket_type=ticket_type,
+            now=instant,
+            batch_id=resume_batch_id,
+            batch_name=resumable["name"],
+        )
+        already_done = int(resumable.get("processed_count") or 0)
+        total = int(resumable.get("total_count") or len(normalized_groups))
+        return {
+            "ok": True,
+            "queued": True,
+            "resumed": True,
+            "instant": instant,
+            "batch_id": resume_batch_id,
+            "already_done": already_done,
+            "tickets": [],
+            "ticket": None,
+            "ticket_count": 0,
+            "student_count": len(normalized_groups),
+            "recipient_count": total_recipients,
+            "count": total_recipients,
+            "invalid_count": invalid_count,
+            "invalid_cc_count": invalid_cc_count,
+            "message": _(
+                "Resuming your previous send that didn't finish — {0} of {1} students were already done."
+            ).format(already_done, total),
+        }
+
+    # Durable per-send record (BUG-2). The job updates it live, so the SPA can poll a
+    # real progress bar and show an honest "X sent / K failed" result + an exportable
+    # failed list, instead of a fire-and-forget "Done". It also carries the per-student
+    # idempotency keys (processed_keys) so a re-run never duplicates or drops.
     batch_id = frappe.generate_hash(length=12)
+    batch = frappe.get_doc(
+        {
+            "doctype": "Unity Bulk Email Batch",
+            "batch_id": batch_id,
+            "status": "Queued",
+            "sender": frappe.session.user,
+            "subject": subject,
+            "ticket_type": ticket_type,
+            "mode": cstr(mode or "").strip() or None,
+            "fingerprint": fingerprint,
+            "cc_recipients": ", ".join(cc_list) if cc_list else None,
+            "total_count": len(normalized_groups),
+            "processed_count": 0,
+            "sent_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "failed_rows": "[]",
+            "processed_keys": "[]",
+        }
+    ).insert(ignore_permissions=True)
+    frappe.db.commit()
+
     frappe.enqueue(
         "helpdesk.api.unity_helpdesk_ext._bulk_send_email_job",
         queue="long",
@@ -895,14 +1112,17 @@ def bulk_send_email(
         ticket_type=ticket_type,
         now=instant,
         batch_id=batch_id,
+        batch_name=batch.name,
     )
 
     return {
         "ok": True,
         "queued": True,
         "instant": instant,
-        # Tickets are created asynchronously in the worker — we don't have their
-        # names yet. student_count lets the SPA say "N tickets are being created".
+        "batch_id": batch_id,
+        # Tickets are created asynchronously in the worker — poll
+        # get_bulk_email_batch_status(batch_id) for live progress. student_count is the
+        # target ticket count.
         "tickets": [],
         "ticket": None,
         "ticket_count": 0,
@@ -958,85 +1178,132 @@ def _bulk_send_email_job(
     ticket_type=None,
     now=False,
     batch_id=None,
+    batch_name=None,
 ):
     """Send a PER-STUDENT bulk email. Always runs in a background worker (enqueued by
-    ``bulk_send_email``); ``now`` only controls whether each mail is sent immediately
-    (delayed=False) or queued for the email flush.
+    ``bulk_send_email``).
 
     For each group (one student + their guardians, or one free-typed address) it:
       * renders the subject + message against that student's record + carried merge
         data (``{**student, **data}``) — so {{first_name}} etc. fill per student,
-      * creates ONE HD Ticket whose description is the RENDERED MESSAGE ONLY (no
-        recipient / CC / BCC preamble — the recipient set lives in
-        custom_bulk_email_recipients), raised_by the student's own email when
-        resolvable so the ticket groups under the student,
-      * sends ONE email to that group's recipients, VISIBLE (expose_recipients
-        ="header"), with the optional CC.
-    No school / default BCC (admins/hods/teachers are intentionally NOT mailed).
+      * SANITISES the rendered subject + body (BUG-7: merge values are cleaned AFTER
+        the merge, so markup carried in a Student field never reaches the mail),
+      * creates ONE HD Ticket (description = rendered message only), raised_by the
+        student's own ``user`` email when resolvable (never ``student_email_id``),
+      * QUEUES ONE email (``delayed=True`` — BUG-3: never a synchronous SMTP send in
+        the loop, so a large batch can't blow the worker timeout), recipients visible.
+    The optional CC/BCC list is sent ONE hidden copy at the end, not per student (BUG-6).
 
-    Idempotent: every ticket is stamped with ``batch_id``; a student already ticketed
-    under this batch is skipped, so a re-run (worker deadlock-retry, restart, resend)
-    cannot duplicate. It NEVER re-raises — a raised error would let frappe's
-    execute_job wrapper re-run the whole batch (the 40 -> ~159 duplication cause).
-    One bad group/address is logged and skipped, never aborts the rest.
+    Idempotency is keyed on the STUDENT (``processed_keys`` on the batch record), NOT on
+    raised_by — so two emailless siblings sharing a guardian stay distinct (BUG-1) and a
+    re-run (worker restart, resend) never duplicates or drops. Live counts + the failed
+    list are written to the Unity Bulk Email Batch record so the SPA shows real progress
+    and an honest result (BUG-2). It NEVER re-raises — a raised error would let frappe's
+    execute_job wrapper re-run the whole batch.
     """
-    # Defined before the try so the outer except can always return partial progress.
-    tickets = []
-    sent_count = 0
-    student_count = 0
-    has_batch_field = bool(batch_id) and _has_field(TICKET_DOCTYPE, "custom_bulk_batch_id")
-    try:
-        groups = groups or []
-        cc_list = cc_list or []
-        file_names = file_names or []
+    from frappe.utils import now_datetime, sanitize_html
 
-        # Attach by File docname via "fid" (File.get_content reads from disk, so
-        # private orphan files attach fine).
+    groups = groups or []
+    cc_list = cc_list or []
+    file_names = file_names or []
+
+    # Load prior progress from the batch record so a resumed run continues, not restarts.
+    batch = None
+    processed_keys = set()
+    failed_rows = []
+    counts = {"processed": 0, "sent": 0, "failed": 0, "skipped": 0}
+    if batch_name and frappe.db.exists("Unity Bulk Email Batch", batch_name):
+        batch = frappe.get_doc("Unity Bulk Email Batch", batch_name)
+        processed_keys = set(_parse_json(batch.processed_keys, []) or [])
+        failed_rows = _parse_json(batch.failed_rows, []) or []
+        counts = {
+            "processed": int(batch.processed_count or 0),
+            "sent": int(batch.sent_count or 0),
+            "failed": int(batch.failed_count or 0),
+            "skipped": int(batch.skipped_count or 0),
+        }
+
+    def _save_batch(status=None, finished=False):
+        """Persist counters + processed_keys + failed_rows to the batch record. Uses a
+        single-row set_value (cheap) and is committed by the surrounding _commit_with_retry."""
+        if not batch_name:
+            return
+        fields = {
+            "processed_count": counts["processed"],
+            "sent_count": counts["sent"],
+            "failed_count": counts["failed"],
+            "skipped_count": counts["skipped"],
+            "processed_keys": frappe.as_json(sorted(processed_keys)),
+            "failed_rows": frappe.as_json(failed_rows),
+        }
+        if status:
+            fields["status"] = status
+        if finished:
+            fields["finished_at"] = now_datetime()
+        try:
+            frappe.db.set_value("Unity Bulk Email Batch", batch_name, fields, update_modified=True)
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "Unity bulk batch update failed")
+
+    tickets = []
+    try:
         sendmail_attachments = [{"fid": name} for name in file_names]
 
         # Resolve every student record in ONE query for the merge context.
         student_ids = [g["student"] for g in groups if g.get("student")]
         students_by_name = _students_by_name(student_ids) if student_ids else {}
 
+        if batch_name:
+            frappe.db.set_value(
+                "Unity Bulk Email Batch",
+                batch_name,
+                {"status": "Sending", "started_at": now_datetime()},
+                update_modified=True,
+            )
+            _commit_with_retry()
+
         for group in groups:
-            emails = group.get("emails") or []
-            if not emails:
+            key = _group_key(group)
+            # BUG-1 / re-run safety: skip a student ALREADY handled (this run or a prior
+            # one), keyed on the student — NOT on raised_by (which collides for emailless
+            # siblings who share a guardian).
+            if key in processed_keys:
+                counts["skipped"] += 1
+                _save_batch()
+                _commit_with_retry()
                 continue
+
+            emails = group.get("emails") or []
             sid = cstr(group.get("student") or "").strip()
             student = students_by_name.get(sid.lower()) if sid else None
-            if student:
-                student_count += 1
+            recipient_hint = (emails[0] if emails else "") or (sid or "")
+
+            if not emails:
+                failed_rows.append(
+                    {"student": sid, "email": "", "reason": "No deliverable email"}
+                )
+                counts["failed"] += 1
+                processed_keys.add(key)
+                counts["processed"] += 1
+                _save_batch()
+                _commit_with_retry()
+                continue
 
             context = {**(student or {}), **(group.get("data") or {})}
-            rendered_subject = _safe_render(subject, context) or subject
-            rendered_message = _safe_render(message, context)
+            # Render, then SANITISE the rendered result (BUG-7) so a merge value carrying
+            # markup can't reach the stored ticket OR the outgoing mail.
+            rendered_subject = sanitize_html(_safe_render(subject, context) or subject)
+            rendered_message = sanitize_html(_safe_render(message, context))
 
-            # raised_by: the student's own email when resolvable (so the
-            # student-context panel populates and the ticket groups under them),
-            # else the first recipient, else the agent.
+            # raised_by: the student's own `user` email when resolvable (never
+            # student_email_id), else the first recipient, else the agent. Only used to
+            # group the ticket under the student — NOT for idempotency anymore.
             raised_by = _student_primary_email(student) or emails[0] or sender
-
-            # IDEMPOTENCY: if this batch already created a ticket for this student,
-            # skip re-creating it. The job can re-run for reasons outside our control
-            # (worker deadlock-retry, worker restart, an accidental resend), and
-            # without this each re-run re-created all 40 tickets — the duplicate
-            # blowup. Keyed on (batch_id, raised_by); needs the custom_bulk_batch_id
-            # field (added by patch) — falls back to non-idempotent if absent.
-            if has_batch_field:
-                existing = frappe.db.get_value(
-                    TICKET_DOCTYPE,
-                    {"custom_bulk_batch_id": batch_id, "raised_by": raised_by},
-                    "name",
-                )
-                if existing:
-                    tickets.append(existing)
-                    continue
 
             payload = {
                 "doctype": TICKET_DOCTYPE,
                 "subject": rendered_subject,
                 "raised_by": raised_by,
-                # Message ONLY — no recipient preamble (fixes the "Mail Body" column).
                 "description": rendered_message,
                 "status": "Open",
                 "ticket_type": ticket_type,
@@ -1045,25 +1312,16 @@ def _bulk_send_email_job(
                 payload["custom_via_unity_portal"] = 1
             if _has_field(TICKET_DOCTYPE, "custom_is_bulk_email"):
                 payload["custom_is_bulk_email"] = 1
-            # Denormalised recipient set (student + guardians [+ cc]) for the
-            # "Previous Tickets" / "received by" history lookup.
             if _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
-                payload["custom_bulk_email_recipients"] = ", ".join(
-                    sorted(set(emails) | set(cc_list))
-                )
-            # Stamp the batch id so a re-run of this job skips this student (above).
-            if has_batch_field:
+                payload["custom_bulk_email_recipients"] = ", ".join(sorted(set(emails)))
+            if batch_id and _has_field(TICKET_DOCTYPE, "custom_bulk_batch_id"):
                 payload["custom_bulk_batch_id"] = batch_id
 
-            # Insert with retry-on-deadlock. Every ticket insert fires the
-            # edu_quality fetch_ticket_details hook (which creates a Communication)
-            # plus the async search-index jobs that UPDATE these same ticket rows in
-            # other workers — so under a big batch, individual inserts hit transient
-            # MariaDB deadlocks (error 1213). Those are safe to retry; without a retry
-            # the old code logged "insert failed" and dropped the student entirely
-            # (the root cause of the missing bulk tickets). Roll back the aborted
-            # transaction and retry with a small backoff before giving up.
+            # Insert with retry-on-deadlock (transient 1213/1205 during the concurrent
+            # search-index updates). A genuine failure records the student as failed
+            # (with a reason for the exportable list) and moves on — never aborts.
             doc = None
+            insert_error = ""
             for _attempt in range(6):
                 try:
                     doc = frappe.get_doc(payload).insert(ignore_permissions=True)
@@ -1073,80 +1331,227 @@ def _bulk_send_email_job(
                     if _is_deadlock(exc) and _attempt < 5:
                         time.sleep(0.2 * (_attempt + 1))
                         continue
+                    insert_error = cstr(exc)[:180] or "Ticket create failed"
                     frappe.log_error(
                         frappe.get_traceback(),
                         "Unity bulk per-student ticket insert failed",
                     )
                     break
+
+            processed_keys.add(key)
+            counts["processed"] += 1
+
             if doc is None:
+                failed_rows.append(
+                    {"student": sid, "email": recipient_hint, "reason": insert_error or "Ticket create failed"}
+                )
+                counts["failed"] += 1
+                _save_batch()
+                _commit_with_retry()
                 continue
+
             tickets.append(doc.name)
-            # Commit each ticket as it's created so it shows in the list immediately
-            # and stops holding row locks during the (possibly slow) send. Guarded so
-            # a transient commit deadlock is retried locally, not escalated to the
-            # worker (which would re-run the whole job).
             _commit_with_retry()
 
-            # Queue/send the mail with the same retry-on-deadlock guard, so a
-            # transient lock during the Email Queue insert doesn't leave a ticket
-            # with no email record (the cause of the "ticket but no queue row" cases).
+            # QUEUE the mail (delayed=True ALWAYS — BUG-3). No per-student CC (BUG-6).
+            send_error = ""
+            sent_ok = False
             for _attempt in range(6):
                 try:
                     frappe.sendmail(
                         recipients=emails,
-                        cc=cc_list or None,
                         subject=rendered_subject,
                         message=rendered_message,
                         attachments=sendmail_attachments,
-                        delayed=not now,
+                        delayed=True,
                         reference_doctype=TICKET_DOCTYPE,
                         reference_name=doc.name,
                         expose_recipients="header",
                     )
-                    sent_count += len(emails)
+                    sent_ok = True
                     break
                 except Exception as exc:
                     if _is_deadlock(exc) and _attempt < 5:
                         frappe.db.rollback()
                         time.sleep(0.2 * (_attempt + 1))
                         continue
-                    # A single bad group must never abort the rest of the batch.
+                    send_error = cstr(exc)[:180] or "Email queue failed"
                     frappe.log_error(
                         frappe.get_traceback(),
                         f"Unity bulk send failed for ticket {doc.name}",
                     )
                     break
 
-            # Commit the queued mail NOW, before the next student's insert runs.
-            # Otherwise the Email Queue row stays uncommitted until the next commit,
-            # and if that next insert hits a deadlock our rollback would discard THIS
-            # student's email record (a ticket with no queue row). Committing per
-            # student makes each one fully durable and isolates the deadlock rollback
-            # to only the failed insert.
+            if sent_ok:
+                counts["sent"] += 1
+            else:
+                # Ticket exists but the mail couldn't be queued — record it so the agent
+                # can see (and re-send) exactly who missed out.
+                failed_rows.append(
+                    {"student": sid, "email": recipient_hint, "reason": send_error or "Email queue failed"}
+                )
+                counts["failed"] += 1
+
+            _save_batch()
             _commit_with_retry()
 
+        # ONE hidden copy of the broadcast to the CC/BCC list — sent once, never per
+        # student, and never exposed to the families (BUG-6).
+        if cc_list:
+            try:
+                note = (
+                    f"<p style='color:#888;font-size:12px'>Copy of a bulk message sent to "
+                    f"{counts['sent']} recipient(s).</p>"
+                )
+                frappe.sendmail(
+                    recipients=cc_list,
+                    subject="[Broadcast copy] " + sanitize_html(cstr(subject or "")),
+                    message=note + sanitize_html(cstr(message or "")),
+                    attachments=sendmail_attachments,
+                    delayed=True,
+                )
+                _commit_with_retry()
+            except Exception:
+                frappe.log_error(frappe.get_traceback(), "Unity bulk CC copy failed")
+
+        final_status = "Completed" if counts["failed"] == 0 else "Completed with Errors"
+        _save_batch(status=final_status, finished=True)
         _commit_with_retry()
-        return {"tickets": tickets, "sent": sent_count, "student_count": student_count}
+        return {"tickets": tickets, **counts, "batch": batch_name}
     except Exception:
-        # Roll back the aborted transaction FIRST (so the log_error write can persist),
-        # then log — but DO NOT re-raise. This job always runs via frappe.enqueue, so
-        # a raised InternalError (e.g. a deadlock) would reach frappe's execute_job
-        # wrapper, which re-runs the ENTIRE job up to 5x. Because the job was not
-        # idempotent, that silent whole-job retry re-created every ticket — the root
-        # cause of the 40 -> ~159 blowup. Progress is committed per student and the
-        # batch_id makes any genuine re-run idempotent, so swallowing here is safe.
-        # `now` no longer changes this: the job is never truly in-request.
+        # Roll back, record the job-level failure on the batch, log — but DO NOT re-raise
+        # (a raised error would let execute_job re-run the whole batch).
         frappe.db.rollback()
-        frappe.log_error(
-            frappe.get_traceback(),
-            "Unity Helpdesk _bulk_send_email_job",
+        if batch_name:
+            try:
+                frappe.db.set_value(
+                    "Unity Bulk Email Batch",
+                    batch_name,
+                    {
+                        "status": "Failed",
+                        "error": (frappe.get_traceback() or "")[-900:],
+                        "finished_at": now_datetime(),
+                        "processed_count": counts["processed"],
+                        "sent_count": counts["sent"],
+                        "failed_count": counts["failed"],
+                        "skipped_count": counts["skipped"],
+                        "failed_rows": frappe.as_json(failed_rows),
+                        "processed_keys": frappe.as_json(sorted(processed_keys)),
+                    },
+                    update_modified=True,
+                )
+                frappe.db.commit()
+            except Exception:
+                frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "Unity Helpdesk _bulk_send_email_job")
+        return {"tickets": tickets, **counts, "error": True, "batch": batch_name}
+
+
+def _bulk_delivery_counts(batch_id):
+    """Actual DELIVERY progress for a batch: how many of its queued mails the Email Queue
+    has really sent. The job sends ``delayed=True`` — that only QUEUES each mail (status
+    'Not Sent'); the scheduler/queue flush later flips it to 'Sent'. Each queued mail is
+    linked to its bulk ticket (reference_doctype='HD Ticket', reference_name=ticket), and
+    those tickets carry ``custom_bulk_batch_id``. Both join columns are indexed
+    (custom_bulk_batch_id_unity_idx + Email Queue.reference_name), and a batch is <=1000
+    tickets, so this is cheap per poll. Returns (delivered, in_queue) or (None, None) on
+    any error so the caller can just hide the delivery bar.
+
+    NOTE: on a site with the scheduler OFF (e.g. this local bench) nothing flushes the
+    queue, so delivered stays 0 until a flush; on prod it advances on its own."""
+    try:
+        rows = frappe.db.sql(
+            """
+            SELECT eq.status AS status, COUNT(*) AS c
+            FROM `tabHD Ticket` t
+            JOIN `tabEmail Queue` eq
+              ON eq.reference_doctype = 'HD Ticket' AND eq.reference_name = t.name
+            WHERE t.custom_bulk_batch_id = %(bid)s
+            GROUP BY eq.status
+            """,
+            {"bid": batch_id},
+            as_dict=True,
         )
-        return {
-            "tickets": tickets,
-            "sent": sent_count,
-            "student_count": student_count,
-            "error": True,
-        }
+        delivered = 0
+        in_queue = 0
+        for r in rows:
+            n = int(r.get("c") or 0)
+            if r.get("status") == "Sent":
+                delivered += n
+            elif r.get("status") in ("Not Sent", "Sending"):
+                in_queue += n
+        return delivered, in_queue
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Unity bulk delivery counts failed")
+        return None, None
+
+
+@frappe.whitelist()
+def get_bulk_email_batch_status(batch_id):
+    """Live status of a bulk send (BUG-2), polled by the SPA to drive the progress bar
+    and the final "X sent / K failed" result + exportable failed list. Gated like the
+    send itself (can_view_all_tickets)."""
+    capabilities = _require_unity_access()
+    if not capabilities.get("can_view_all_tickets"):
+        frappe.throw(_("You are not allowed to view bulk email status"), frappe.PermissionError)
+
+    batch_id = cstr(batch_id or "").strip()
+    if not batch_id or not frappe.db.exists("Unity Bulk Email Batch", batch_id):
+        return {"found": False, "batch_id": batch_id}
+
+    row = frappe.db.get_value(
+        "Unity Bulk Email Batch",
+        batch_id,
+        [
+            "batch_id",
+            "status",
+            "subject",
+            "total_count",
+            "processed_count",
+            "sent_count",
+            "failed_count",
+            "skipped_count",
+            "failed_rows",
+            "started_at",
+            "finished_at",
+        ],
+        as_dict=True,
+    ) or {}
+
+    failed = _parse_json(row.get("failed_rows"), []) or []
+    total = int(row.get("total_count") or 0)
+    processed = int(row.get("processed_count") or 0)
+    skipped = int(row.get("skipped_count") or 0)
+    queued = int(row.get("sent_count") or 0)  # sendmail(delayed=True) succeeded => queued
+    done = row.get("status") in ("Completed", "Completed with Errors", "Failed")
+
+    # Actual delivery from the Email Queue (queued -> Sent). None => hide the delivery bar.
+    delivered, in_queue = _bulk_delivery_counts(row.get("batch_id"))
+
+    return {
+        "found": True,
+        "batch_id": row.get("batch_id"),
+        "status": row.get("status"),
+        "subject": row.get("subject"),
+        "total": total,
+        "processed": processed,
+        # `sent` kept for back-compat; it means "queued into the Email Queue" (delayed send).
+        "sent": queued,
+        "queued": queued,
+        "delivered": delivered,
+        "in_queue": in_queue,
+        "failed": int(row.get("failed_count") or 0),
+        "skipped": skipped,
+        # Progress counts both processed students and skipped (already-done) ones so the
+        # bar reaches 100% even when a re-run skipped some.
+        "progress": min(100, round(((processed + skipped) / total) * 100)) if total else (100 if done else 0),
+        # Delivery progress against the whole batch (0 on a scheduler-off site until flushed).
+        "delivered_progress": (min(100, round((delivered / total) * 100)) if (total and delivered is not None) else 0),
+        "done": done,
+        "failed_rows": failed,
+        "started_at": str(row.get("started_at")) if row.get("started_at") else None,
+        "finished_at": str(row.get("finished_at")) if row.get("finished_at") else None,
+    }
 
 
 @frappe.whitelist()
@@ -1235,8 +1640,11 @@ def send_test_email(
     elif raised_by:
         context = _merge_context_for_email(raised_by)
 
-    rendered_subject = _safe_render(subject, context) or subject
-    rendered_message = _safe_render(message, context)
+    # Render, then SANITISE the rendered output (BUG-7) so a merge value carrying markup
+    # is cleaned in the test copy exactly as it is in the real send.
+    from frappe.utils import sanitize_html
+    rendered_subject = sanitize_html(_safe_render(subject, context) or subject)
+    rendered_message = sanitize_html(_safe_render(message, context))
 
     # Resolve attachment File names cheaply (single IN(...) query) — same as bulk.
     attachment_list = [n for n in (_parse_json(attachments, []) or []) if n]
@@ -1381,7 +1789,9 @@ def parse_bulk_email_csv(content):
         sid = cstr(row.get(id_col) or "").strip()
         if sid:
             parsed.append((sid, row))
-        if len(parsed) >= RECIPIENT_HARD_CAP * 2:
+        # Read a generous buffer of raw rows (some may be duplicate students); the
+        # distinct-student budget is enforced below on the resolved students.
+        if len(parsed) >= STUDENT_HARD_CAP * 2:
             break
     if not parsed:
         frappe.throw(_("No student IDs found in the CSV"))
@@ -1414,6 +1824,7 @@ def parse_bulk_email_csv(content):
     duplicates = 0
     guardian_added = 0
     student_added = 0
+    truncated = False  # set if we stop early on a cap (distinct students OR total addresses)
     for sid, row in parsed:
         student = students.get(sid.lower())
         if not student:
@@ -1429,6 +1840,12 @@ def parse_bulk_email_csv(content):
         if canonical_id.lower() in processed_students:
             duplicates += 1
             continue
+        # DISTINCT-STUDENT budget (the 500->359 fix): stop taking NEW students once the
+        # cap is reached — the cap counts students, not the mixed student+guardian address
+        # list, so guardians never evict students at parse time.
+        if len(processed_students) >= STUDENT_HARD_CAP:
+            truncated = True
+            break
         processed_students.add(canonical_id.lower())
         # Carried context shared by the student AND their guardians.
         ctx = {**row, "_student": canonical_id}
@@ -1454,7 +1871,10 @@ def parse_bulk_email_csv(content):
                 rows.append({"email": ge, "name": f"{display} (guardian)", "data": ctx})
                 guardian_added += 1
 
-        if len(rows) >= RECIPIENT_HARD_CAP:
+        # Absolute address ceiling (students + guardians). Far above the student cap, so
+        # it only trips on pathological guardian counts — bounds the payload either way.
+        if len(rows) >= TOTAL_ADDRESS_HARD_CAP:
+            truncated = True
             break
 
     school_bcc = _school_bcc_emails(csv_school) if csv_school else []
@@ -1494,9 +1914,9 @@ def parse_bulk_email_csv(content):
             grp["emails"].append(r["email"])
     groups = [groups_by_student[k] for k in group_order]
 
-    # `truncated` => the CSV had more recipients than the per-send cap; the UI warns
-    # so the agent knows to split the batch rather than silently under-sending.
-    truncated = len(rows) >= RECIPIENT_HARD_CAP
+    # `truncated` (set in the loop above) => we stopped early on the distinct-student cap
+    # or the total-address ceiling, so the CSV had more than one send can carry. The UI
+    # warns the agent to split the batch rather than silently under-sending.
 
     return {
         "headers": headers,
