@@ -235,11 +235,107 @@ nav a.router-link-active {
 
 .toolbar {
   display: flex;
+  flex-direction: row;
   flex-wrap: wrap;
-  gap: 10px;
+  gap: 12px;
   align-items: center;
   padding: 18px;
   margin-bottom: 18px;
+}
+/* Two groups that FLOW together: the filters+Apply/Clear group and the search+buttons group
+   sit side-by-side on ONE row when the screen is wide, and wrap to two rows when it isn't.
+   Each group is nowrap internally so it never splits mid-way. */
+.toolbar-top {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: center;
+  flex: 0 1 auto; /* natural width; shrinks its filters to fit rather than overflowing */
+  min-width: 0;
+}
+/* Filter controls: comfortable ~130px default, shrink down to 92px (never overflow/overlap),
+   cap at 160px. Uniform. Target the flex ITEMS (wrappers), then fill the inner button. */
+.toolbar-top select,
+.toolbar-top .filter-searchselect,
+.toolbar-top .date-range-trigger {
+  flex: 1 1 140px;
+  min-width: 96px;
+  max-width: 175px;
+  box-sizing: border-box;
+}
+.toolbar-top .filter-searchselect-trigger,
+.toolbar-top .date-range-btn {
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+/* Apply/Clear keep their natural size, right after the filters. */
+.toolbar-top .apply-filters,
+.toolbar-top .toolbar-clear {
+  flex: 0 0 auto;
+}
+/* The date button holds a date RANGE, so give it a fixed, slightly wider box: "Created Date"
+   AND the selected range (e.g. 01 Jul → 29 Jul) both fit, and the fixed width means picking a
+   date never truncates the label, widens the button, or reflows the row. */
+.toolbar-top .date-range-trigger {
+  flex: 0 0 168px;
+  min-width: 168px;
+  max-width: 168px;
+}
+.toolbar-top .date-range-trigger .date-range-btn {
+  overflow: hidden;
+}
+.toolbar-top .date-range-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Selected date range on its own full-width line below the toolbar rows. */
+.toolbar-active-date {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  margin-top: 2px;
+}
+.toolbar-active-date-clear {
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+.toolbar-active-date-clear:hover {
+  background: var(--surface-2, #f3f4f6);
+  color: #b91c1c;
+}
+/* display:contents so the filter dropdowns flow inline with Apply/Clear on the same row.
+   The mobile query re-boxes .filter-group into a collapsible panel. */
+.filter-group {
+  display: contents;
+}
+.toolbar-bottom {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 8px;
+  align-items: center;
+  flex: 1 1 auto; /* fills the rest of the row on wide screens; wraps below on narrow ones */
+  min-width: 500px; /* wrap the WHOLE group to row 2 rather than squeezing the buttons */
+  justify-content: flex-end; /* search box + Search + Refresh + Columns as a right-aligned cluster */
+}
+/* Refresh + Columns never wrap into a jumpy 2-high stack — they keep their natural size. */
+.toolbar-bottom .toolbar-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  flex: 0 0 auto;
+  gap: 8px;
+  align-items: center;
 }
 
 .toolbar .search {
@@ -253,8 +349,8 @@ nav a.router-link-active {
   position: relative;
   display: flex;
   align-items: center;
-  margin-left: auto;
-  min-width: 300px;
+  flex: 1 1 300px; /* narrower; grows a little to use the space left of the buttons */
+  min-width: 200px;
   max-width: 420px;
 }
 
@@ -2428,6 +2524,18 @@ tbody tr.bulk-email-ticket:hover {
   font-weight: 500;
 }
 
+/* Reference-mode recipient field: a plain container (NOT a <label>, which would forward
+   stray clicks to the first chip's × and delete the first student). Matches the column
+   layout of the sibling .stack label fields; the caption keeps the .stack label styling. */
+.composer-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.composer-field-label {
+  cursor: default;
+}
+
 .stack label:has(input[type="checkbox"]) {
   flex-direction: row;
   align-items: center;
@@ -2749,9 +2857,9 @@ tbody tr.bulk-email-ticket:hover {
 .warning-banner {
   margin: 0 0 12px;
   padding: 12px 14px;
-  border: 1px solid rgba(217, 119, 6, 0.22);
+  border: 1px solid #fcd34d;
   border-radius: 12px;
-  background: rgba(251, 191, 36, 0.14);
+  background: #fef3c7; /* opaque amber shade — never see-through */
   color: #92400e;
   font-size: 13px;
   font-weight: 500;
@@ -2760,9 +2868,9 @@ tbody tr.bulk-email-ticket:hover {
 .success-banner {
   margin: 0 0 12px;
   padding: 12px 14px;
-  border: 1px solid rgba(22, 163, 74, 0.24);
+  border: 1px solid #86efac;
   border-radius: 12px;
-  background: rgba(34, 197, 94, 0.14);
+  background: #dcfce7; /* opaque green shade — never see-through */
   color: #166534;
   font-size: 13px;
   font-weight: 500;
@@ -2964,6 +3072,18 @@ tbody tr.bulk-email-ticket:hover {
 
 .error {
   color: var(--danger);
+}
+
+/* Inline composer/bulk validation error — a SOLID (opaque) box, never see-through, so it
+   stays readable over whatever is behind it. */
+.error-box {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fee2e2;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .reloading-indicator {
@@ -3634,6 +3754,92 @@ body.col-resizing .ticket-table * {
   transition: color 150ms ease-out;
 }
 
+/* Searchable "Created By" filter dropdown — trigger matches the filter selects, panel
+   matches the assignee popover. */
+.filter-searchselect {
+  position: relative;
+  display: inline-block;
+}
+.filter-searchselect-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  max-width: 200px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 120ms ease;
+}
+.filter-searchselect-trigger:hover {
+  border-color: #6366f1;
+}
+.filter-searchselect-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.filter-searchselect-caret {
+  color: var(--muted);
+  font-size: 11px;
+  margin-left: auto;
+}
+.filter-searchselect-panel {
+  position: absolute;
+  z-index: 60;
+  top: calc(100% + 4px);
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 230px;
+  max-height: 320px;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
+}
+.filter-searchselect-search {
+  flex: 0 0 auto;
+  width: 100%;
+  margin-bottom: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 13px;
+}
+.filter-searchselect-options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+}
+.filter-searchselect-option {
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.filter-searchselect-option:hover {
+  background: var(--surface-2, #f3f4f6);
+}
+.filter-searchselect-option.active {
+  background: rgba(99, 102, 241, 0.12);
+  color: #4f46e5;
+  font-weight: 600;
+}
+.filter-searchselect-option.disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
 /* Global non-blocking notice (toast) shown above everything while a send runs. */
 .global-notice {
   position: fixed;
@@ -3651,20 +3857,28 @@ body.col-resizing .ticket-table * {
   cursor: pointer;
   border: 1px solid transparent;
 }
+/* Fully OPAQUE (never see-through over the list's bold text) but soft & professional:
+   a light tint + colored text + a colored left accent, instead of a heavy dark fill. */
+.global-notice {
+  border-left-width: 4px;
+}
 .global-notice--info {
   background: #eef2ff;
   color: #3730a3;
-  border-color: rgba(79, 70, 229, 0.24);
+  border-color: #c7d2fe;
+  border-left-color: #6366f1;
 }
 .global-notice--success {
-  background: rgba(34, 197, 94, 0.14);
-  color: #166534;
-  border-color: rgba(22, 163, 74, 0.24);
+  background: #ecfdf5;
+  color: #065f46;
+  border-color: #a7f3d0;
+  border-left-color: #10b981;
 }
 .global-notice--error {
-  background: rgba(239, 68, 68, 0.12);
-  color: #991b1b;
-  border-color: rgba(220, 38, 38, 0.28);
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
+  border-left-color: #ef4444;
 }
 .global-notice-fade-enter-active,
 .global-notice-fade-leave-active {
@@ -3710,9 +3924,6 @@ body.col-resizing .ticket-table * {
 
 /* Filter group: on desktop it's transparent (children flow inline in .toolbar
    exactly as before); the toggle and mobile collapse only apply ≤640px. */
-.filter-group {
-  display: contents;
-}
 /* Search/Refresh/Columns (+ the mobile-only Filters toggle) grouped as a row. */
 .toolbar-actions {
   display: flex;
@@ -3819,24 +4030,29 @@ body.col-resizing .ticket-table * {
     font-size: 9px;
   }
 
-  /* Stack the toolbar; order: search → action row (Filters/Search/Refresh/Columns)
-     → the collapsible filter panel. */
-  .toolbar {
-    flex-direction: column;
-    align-items: stretch;
-  }
-  .toolbar .search-wrapper {
+  /* Stack the toolbar: the search + action row on top, the filters + Apply/Clear row
+     (with the collapsible filter panel) below. */
+  /* Stack the two groups full-width: search group on top, filters + Apply/Clear below. */
+  .toolbar-bottom {
     order: 1;
-    width: 100%;
+    flex: 1 1 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-start; /* full-width search + left-aligned buttons on mobile */
+  }
+  .toolbar-top {
+    order: 2;
+    flex: 1 1 100%;
+    flex-wrap: wrap; /* allow the opened filter column to wrap (desktop keeps nowrap) */
+  }
+  /* Full-width search box; the Search/Refresh/Columns buttons wrap into a row beneath it. */
+  .toolbar .search-wrapper {
+    flex: 1 1 100%;
     min-width: 0;
     max-width: none;
+  }
+  .toolbar-bottom .toolbar-actions {
     margin-left: 0;
-  }
-  .toolbar-actions {
-    order: 2;
-  }
-  .filter-group {
-    order: 3;
   }
   /* Collapsible filters: hidden behind the toggle until opened. */
   .filters-toggle {
@@ -3852,10 +4068,16 @@ body.col-resizing .ticket-table * {
   .filter-group.open {
     display: flex;
   }
+  /* Every filter control (incl. the searchable Created By dropdown) fills the width.
+     flex: none resets the desktop flex-basis so nothing gets a 140px HEIGHT in this column. */
   .filter-group select,
   .filter-group .date-range-trigger,
-  .filter-group .date-range-btn {
+  .filter-group .date-range-btn,
+  .filter-group .filter-searchselect,
+  .filter-group .filter-searchselect-trigger {
     width: 100%;
+    max-width: none;
+    flex: none;
   }
 
   /* Swap the wide table for stacked summary cards. */

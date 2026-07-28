@@ -2924,6 +2924,11 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 		else:
 			_apply_assignee_filter(res, filters.assigned_to)
 
+	# "Created By" = the ticket's owner (creator). owner is an indexed column, so a plain
+	# equality filter is cheap even over the full table.
+	if filters.get("created_by"):
+		res.append([TICKET_DOCTYPE, "owner", "=", filters.created_by])
+
 	if filters.get("created_from"):
 		res.append([TICKET_DOCTYPE, "creation", ">=", filters.created_from])
 	if filters.get("created_to"):

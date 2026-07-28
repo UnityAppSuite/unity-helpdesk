@@ -142,7 +142,9 @@
           <button class="btn secondary" @click="closeComposer">Close</button>
         </div>
         <div class="modal-body stack">
-          <p v-if="composerError" class="error">{{ composerError }}</p>
+          <p v-if="composerError" class="error error-box">
+            {{ composerError }}
+          </p>
           <p v-else-if="composerWarning" class="warning-banner">
             {{ composerWarning }}
           </p>
@@ -411,7 +413,9 @@
           <button class="btn secondary" @click="closeBulkEmail">Close</button>
         </div>
         <div class="modal-body stack">
-          <p v-if="bulkEmailError" class="error">{{ bulkEmailError }}</p>
+          <p v-if="bulkEmailError" class="error error-box">
+            {{ bulkEmailError }}
+          </p>
           <p v-else-if="bulkEmailWarning" class="warning-banner">
             {{ bulkEmailWarning }}
           </p>
@@ -442,9 +446,18 @@
 
           <!-- Reference-number mode -->
           <template v-if="bulkEmail.mode === 'reference'">
-            <label>
-              Reference numbers / students
-              <div class="recipient-multiselect" @click="focusBccInput">
+            <!-- NOT a <label>: a <label> wrapping the chips would forward any stray click to
+                 its first labelable descendant — the FIRST chip's × button — silently removing
+                 the first student whenever you click a chip's name. Use a plain container with
+                 a `for`-linked caption so clicking blank space still focuses the input, but a
+                 chip-name click does nothing and removal happens ONLY via the × -->
+            <div class="composer-field">
+              <label
+                class="composer-field-label"
+                for="bulk-ref-multiselect-input"
+                >Reference numbers / students</label
+              >
+              <div class="recipient-multiselect" @click.self="focusBccInput">
                 <span
                   v-for="s in bulkEmail.students"
                   :key="s.key"
@@ -467,6 +480,7 @@
                 </span>
                 <div class="recipient-input-wrap">
                   <input
+                    id="bulk-ref-multiselect-input"
                     ref="bccInputRef"
                     v-model="bccSearchQuery"
                     type="text"
@@ -502,7 +516,7 @@
                   }}
                 </span>
               </div>
-            </label>
+            </div>
           </template>
 
           <!-- CSV mode -->
@@ -997,16 +1011,23 @@
             v-else-if="bulkProgress.done && !bulkProgress.failed"
             class="bulk-send-all-ok"
           >
-            All {{ bulkProgress.queued }} email(s) queued for delivery.
-            <span
+            <template
               v-if="
                 bulkProgress.delivered !== null &&
-                bulkProgress.delivered < bulkProgress.queued
+                bulkProgress.delivered >= bulkProgress.queued
               "
-              class="muted"
             >
-              Delivery runs in the background.
-            </span>
+              All {{ bulkProgress.queued }} email(s) delivered.
+            </template>
+            <template v-else>
+              All {{ bulkProgress.queued }} email(s) queued for delivery.
+              <span v-if="bulkProgress.delivered !== null" class="muted">
+                Delivering… {{ bulkProgress.delivered }}/{{
+                  bulkProgress.queued
+                }}
+                sent.
+              </span>
+            </template>
           </p>
           <p v-else-if="!bulkProgress.done" class="muted">
             You can keep working — minimize this and the tickets appear in the
@@ -1165,6 +1186,11 @@ let bulkPollTimer = null;
 // otherwise queue ahead of the lightweight status poll and freeze the live counts.
 let _lastListRefresh = 0;
 const BULK_LIST_REFRESH_MS = 15000;
+// After the job finishes QUEUEING every mail (status "done"), the Email Queue still has to
+// actually SEND them (Not Sent -> Sent happens seconds later). Keep polling past "done" so
+// the Delivered bar climbs, until every queued mail is delivered or this bounded wait ends.
+let _deliveryDeadline = 0;
+const BULK_DELIVERY_WAIT_MS = 180000; // 3 min cap on the post-queue delivery watch
 // Duplicate-submission prompt: { message, payload }. Set when the server refuses an
 // identical send within the guard window; "Resend anyway" re-submits with confirm_resend.
 const bulkDuplicate = ref(null);
@@ -2488,6 +2514,7 @@ function startBulkProgress(batchId, subject, total, invalidCount) {
   });
   bulkProgressMinimized.value = false;
   _lastListRefresh = Date.now(); // don't refresh the list immediately on open
+  _deliveryDeadline = 0; // (re)start the post-queue delivery watch fresh
   bulkProgressOpen.value = true;
   if (invalidCount) {
     showGlobalNotice(
@@ -2532,7 +2559,18 @@ async function pollBulkProgressOnce() {
       _lastListRefresh = now;
       signalTicketsRefresh();
     }
-    if (s.done) stopBulkPolling();
+    // The job being "done" only means every mail is QUEUED. Keep polling so the Delivered
+    // bar climbs as the Email Queue actually sends them. Stop when delivery can't be tracked,
+    // when every queued mail is delivered, or after a bounded wait (delivery may lag or, on a
+    // scheduler-off site, never run — we don't poll forever).
+    if (s.done) {
+      if (!_deliveryDeadline) _deliveryDeadline = now + BULK_DELIVERY_WAIT_MS;
+      const cannotTrack = s.delivered === null || s.delivered === undefined;
+      const allDelivered = !cannotTrack && s.delivered >= s.queued;
+      if (cannotTrack || allDelivered || now > _deliveryDeadline) {
+        stopBulkPolling();
+      }
+    }
   } catch (err) {
     // Transient — keep polling; a later tick will succeed.
   }
