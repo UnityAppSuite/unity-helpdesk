@@ -1,148 +1,150 @@
 <template>
   <section class="page">
     <div class="toolbar">
-      <div class="filter-group" :class="{ open: filtersOpen }">
-        <select v-model="filterDraft.status">
-          <option value="">Status: All</option>
-          <option>Open</option>
-          <option>Replied</option>
-          <option>On Hold</option>
-          <option>Resolved</option>
-          <option>Closed</option>
-        </select>
-        <select v-model="filterDraft.priority">
-          <option value="">Priority: All</option>
-          <option>High</option>
-          <option>Medium</option>
-          <option>Low</option>
-        </select>
-        <select v-model="filterDraft.ticket_type">
-          <option value="">Ticket Type: All</option>
-          <option
-            v-for="type in ticketTypes"
-            :key="type.name"
-            :value="type.name"
-          >
-            {{ type.name }}
-          </option>
-        </select>
-        <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
-        <select v-if="props.view === 'all'" v-model="filterDraft.assigned_to">
-          <option value="">Assigned: All</option>
-          <option value="Unassigned">Unassigned</option>
-          <option v-for="agent in agents" :key="agent.name" :value="agent.name">
-            {{ agent.full_name || agent.name }}
-          </option>
-        </select>
-        <span v-else class="badge blue">Assigned to me</span>
-        <div ref="dateRangeRef" class="date-range-trigger">
-          <button
-            type="button"
-            class="date-range-btn"
-            :class="{
-              'has-value': filterDraft.created_from || filterDraft.created_to,
-            }"
-            :title="dateRangeLabel"
-            @click="toggleDateRange"
-          >
-            <span class="date-range-icon" aria-hidden="true">📅</span>
-            <span class="date-range-label">{{ dateRangeLabel }}</span>
-          </button>
-          <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
-            <div class="date-range-pop-row">
-              <label class="date-range-field">
-                <span>From</span>
-                <input
-                  v-model="dateRangeDraft.from"
-                  type="date"
-                  :max="dateRangeDraft.to || undefined"
-                />
-              </label>
-              <label class="date-range-field">
-                <span>To</span>
-                <input
-                  v-model="dateRangeDraft.to"
-                  type="date"
-                  :min="dateRangeDraft.from || undefined"
-                />
-              </label>
-            </div>
-            <div class="date-range-pop-actions">
-              <button
-                type="button"
-                class="btn secondary"
-                @click="clearDateRange"
+      <!-- Row 1: filters + their Apply/Clear (and the mobile Filters toggle). -->
+      <div class="toolbar-top">
+        <div class="filter-group" :class="{ open: filtersOpen }">
+          <select v-model="filterDraft.status">
+            <option value="">Status: All</option>
+            <option>Open</option>
+            <option>Replied</option>
+            <option>On Hold</option>
+            <option>Resolved</option>
+            <option>Closed</option>
+          </select>
+          <select v-model="filterDraft.priority">
+            <option value="">Priority: All</option>
+            <option>High</option>
+            <option>Medium</option>
+            <option>Low</option>
+          </select>
+          <select v-model="filterDraft.ticket_type">
+            <option value="">Ticket Type: All</option>
+            <option
+              v-for="type in ticketTypes"
+              :key="type.name"
+              :value="type.name"
+            >
+              {{ type.name }}
+            </option>
+          </select>
+          <!-- In My Tickets view the backend already filters to the current user — hide Assigned filter -->
+          <select v-if="props.view === 'all'" v-model="filterDraft.assigned_to">
+            <option value="">Assigned: All</option>
+            <option value="Unassigned">Unassigned</option>
+            <option
+              v-for="agent in agents"
+              :key="agent.name"
+              :value="agent.name"
+            >
+              {{ agent.full_name || agent.name }}
+            </option>
+          </select>
+          <span v-else class="badge blue">Assigned to me</span>
+          <!-- Searchable "Created By" filter — the agent list is long, so typing narrows it. -->
+          <div ref="createdByRef" class="filter-searchselect">
+            <button
+              type="button"
+              class="filter-searchselect-trigger"
+              :title="createdByLabel"
+              @click.stop="toggleCreatedBy"
+            >
+              <span class="filter-searchselect-value">{{
+                createdByLabel
+              }}</span>
+              <span class="filter-searchselect-caret" aria-hidden="true"
+                >▾</span
               >
-                Clear
-              </button>
-              <button type="button" class="btn" @click="applyDateRange">
-                Apply
-              </button>
+            </button>
+            <div
+              v-if="createdByOpen"
+              class="filter-searchselect-panel"
+              @click.stop
+            >
+              <input
+                ref="createdBySearchRef"
+                v-model="createdByQuery"
+                class="filter-searchselect-search"
+                type="text"
+                placeholder="Search creator…"
+                autocomplete="off"
+                @keydown.escape="closeCreatedBy"
+              />
+              <ul class="filter-searchselect-options">
+                <li
+                  class="filter-searchselect-option"
+                  :class="{ active: !filterDraft.created_by }"
+                  @click="pickCreatedBy('')"
+                >
+                  Created By: All
+                </li>
+                <li
+                  v-for="agent in createdByMatches"
+                  :key="'cb-' + agent.name"
+                  class="filter-searchselect-option"
+                  :class="{ active: filterDraft.created_by === agent.name }"
+                  @click="pickCreatedBy(agent.name)"
+                >
+                  {{ agent.full_name || agent.name }}
+                </li>
+                <li
+                  v-if="!createdByMatches.length"
+                  class="filter-searchselect-option disabled"
+                >
+                  No match
+                </li>
+              </ul>
+            </div>
+          </div>
+          <div ref="dateRangeRef" class="date-range-trigger">
+            <button
+              type="button"
+              class="date-range-btn"
+              :class="{
+                'has-value': filterDraft.created_from || filterDraft.created_to,
+              }"
+              :title="dateRangeLabel"
+              @click="toggleDateRange"
+            >
+              <span class="date-range-icon" aria-hidden="true">📅</span>
+              <!-- Shows "Created Date" when unset, else the compact range (e.g. 01 Jul → 29 Jul).
+                 The button has a fixed min-width so this never overflows or reflows the row. -->
+              <span class="date-range-label">{{ dateRangeLabel }}</span>
+            </button>
+            <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
+              <div class="date-range-pop-row">
+                <label class="date-range-field">
+                  <span>From</span>
+                  <input
+                    v-model="dateRangeDraft.from"
+                    type="date"
+                    :max="dateRangeDraft.to || undefined"
+                  />
+                </label>
+                <label class="date-range-field">
+                  <span>To</span>
+                  <input
+                    v-model="dateRangeDraft.to"
+                    type="date"
+                    :min="dateRangeDraft.from || undefined"
+                  />
+                </label>
+              </div>
+              <div class="date-range-pop-actions">
+                <button
+                  type="button"
+                  class="btn secondary"
+                  @click="clearDateRange"
+                >
+                  Clear
+                </button>
+                <button type="button" class="btn" @click="applyDateRange">
+                  Apply
+                </button>
+              </div>
             </div>
           </div>
         </div>
-      </div>
-      <div class="search-wrapper">
-        <span class="search-icon">🔍</span>
-        <input
-          ref="searchInput"
-          v-model="draftSearch"
-          class="search"
-          type="text"
-          placeholder="Ticket ID, student, ref no., email, subject, mail body…"
-          aria-label="Search tickets (press Ctrl+K to focus)"
-          autocomplete="off"
-          @keydown.enter.prevent="onSearchEnter"
-          @keydown.esc="closeSuggestions"
-          @focus="searchFocused = true"
-          @blur="onSearchBlur"
-        />
-        <kbd
-          v-if="!draftSearch && !searchFocused"
-          class="search-shortcut"
-          aria-hidden="true"
-          >{{ shortcutLabel }}</kbd
-        >
-        <span
-          v-if="(loading || reloading) && appliedSearch"
-          class="search-loading"
-          title="Searching…"
-          >⏳</span
-        >
-        <button
-          v-if="draftSearch"
-          class="search-clear"
-          type="button"
-          title="Clear search"
-          @click="clearSearch"
-        >
-          ✕
-        </button>
-        <ul
-          v-if="searchFocused && !draftSearch.trim() && recentSearches.length"
-          class="recent-searches"
-          @mousedown.prevent
-        >
-          <li class="recent-searches__heading">Recent searches</li>
-          <li
-            v-for="(item, idx) in recentSearches"
-            :key="`${item}-${idx}`"
-            class="recent-searches__item"
-            @click="useRecentSearch(item)"
-          >
-            <span class="recent-searches__term">{{ item }}</span>
-            <button
-              type="button"
-              class="recent-searches__remove"
-              title="Remove from recent"
-              @click.stop="removeRecentSearch(item)"
-            >
-              ✕
-            </button>
-          </li>
-        </ul>
-      </div>
-      <div class="toolbar-actions">
         <button
           type="button"
           class="btn secondary filters-toggle"
@@ -171,6 +173,69 @@
         >
           Clear
         </button>
+      </div>
+      <!-- Row 2: search box (grows) + Search beside it; Refresh/Columns as a separate group. -->
+      <div class="toolbar-bottom">
+        <div class="search-wrapper">
+          <span class="search-icon">🔍</span>
+          <input
+            ref="searchInput"
+            v-model="draftSearch"
+            class="search"
+            type="text"
+            placeholder="Ticket ID, student, ref no., email, subject, mail body…"
+            aria-label="Search tickets (press Ctrl+K to focus)"
+            autocomplete="off"
+            @keydown.enter.prevent="onSearchEnter"
+            @keydown.esc="closeSuggestions"
+            @focus="searchFocused = true"
+            @blur="onSearchBlur"
+          />
+          <kbd
+            v-if="!draftSearch && !searchFocused"
+            class="search-shortcut"
+            aria-hidden="true"
+            >{{ shortcutLabel }}</kbd
+          >
+          <span
+            v-if="(loading || reloading) && appliedSearch"
+            class="search-loading"
+            title="Searching…"
+            >⏳</span
+          >
+          <button
+            v-if="draftSearch"
+            class="search-clear"
+            type="button"
+            title="Clear search"
+            @click="clearSearch"
+          >
+            ✕
+          </button>
+          <ul
+            v-if="searchFocused && !draftSearch.trim() && recentSearches.length"
+            class="recent-searches"
+            @mousedown.prevent
+          >
+            <li class="recent-searches__heading">Recent searches</li>
+            <li
+              v-for="(item, idx) in recentSearches"
+              :key="`${item}-${idx}`"
+              class="recent-searches__item"
+              @click="useRecentSearch(item)"
+            >
+              <span class="recent-searches__term">{{ item }}</span>
+              <button
+                type="button"
+                class="recent-searches__remove"
+                title="Remove from recent"
+                @click.stop="removeRecentSearch(item)"
+              >
+                ✕
+              </button>
+            </li>
+          </ul>
+        </div>
         <button
           class="btn secondary toolbar-search"
           type="button"
@@ -178,21 +243,23 @@
         >
           Search
         </button>
-        <button
-          class="btn secondary toolbar-refresh"
-          type="button"
-          @click="refreshList"
-        >
-          Refresh
-        </button>
-        <button
-          class="btn secondary toolbar-columns"
-          type="button"
-          title="Customize columns"
-          @click="openColumnPanel"
-        >
-          Columns
-        </button>
+        <div class="toolbar-actions">
+          <button
+            class="btn secondary toolbar-refresh"
+            type="button"
+            @click="refreshList"
+          >
+            Refresh
+          </button>
+          <button
+            class="btn secondary toolbar-columns"
+            type="button"
+            title="Customize columns"
+            @click="openColumnPanel"
+          >
+            Columns
+          </button>
+        </div>
       </div>
     </div>
 
@@ -1017,10 +1084,18 @@ const PAGE_SIZE_OPTIONS = [20, 50, 100, 500];
 const PAGE_SIZE_STORAGE_KEY = "unity_helpdesk_page_size";
 
 function _initialPageSize() {
-  // Always start at the smallest page size on load/reload so the first paint is
-  // fast and never inherits a large page (e.g. 500) that slows the first render.
-  // Changing "Rows per page" to 500 still works for the rest of the session (it
-  // refetches immediately); it just resets to 20 on the next reload/remount.
+  // Persist the user's "Rows per page" choice across reloads/remounts (e.g. opening a
+  // ticket and returning). Read back the value the size-watcher stores, and only honor it
+  // if it's a valid option; otherwise fall back to the smallest (20) for a fast first paint.
+  try {
+    const stored = parseInt(
+      window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY),
+      10
+    );
+    if (PAGE_SIZE_OPTIONS.includes(stored)) return stored;
+  } catch {
+    // localStorage unavailable (private mode / quota) — fall through to the default.
+  }
   return 20;
 }
 
@@ -1078,6 +1153,7 @@ const filters = reactive({
   priority: "",
   ticket_type: "",
   assigned_to: "",
+  created_by: "",
   created_from: "",
   created_to: "",
 });
@@ -1089,6 +1165,7 @@ const filterDraft = reactive({
   priority: "",
   ticket_type: "",
   assigned_to: "",
+  created_by: "",
   created_from: "",
   created_to: "",
 });
@@ -1097,6 +1174,7 @@ const FILTER_KEYS = [
   "priority",
   "ticket_type",
   "assigned_to",
+  "created_by",
   "created_from",
   "created_to",
 ];
@@ -1110,6 +1188,47 @@ const filtersDirty = computed(
 // Mobile: the filter row collapses behind a "Filters" toggle. On desktop the
 // filter group is always shown via CSS (display:contents), so this only gates mobile.
 const filtersOpen = ref(false);
+
+// --- Searchable "Created By" filter dropdown (the agent list is long) ---
+const createdByOpen = ref(false);
+const createdByQuery = ref("");
+const createdByRef = ref(null);
+const createdBySearchRef = ref(null);
+const createdByLabel = computed(() => {
+  // Short placeholder ("Created By") so it fits the compact control; the selected agent's
+  // full name otherwise (with a title tooltip on the trigger for the full text).
+  if (!filterDraft.created_by) return "Created By";
+  const a = agents.value.find((x) => x.name === filterDraft.created_by);
+  return a ? a.full_name || a.name : filterDraft.created_by;
+});
+const createdByMatches = computed(() => {
+  const q = createdByQuery.value.trim().toLowerCase();
+  if (!q) return agents.value;
+  return agents.value.filter(
+    (a) =>
+      String(a.full_name || "")
+        .toLowerCase()
+        .includes(q) ||
+      String(a.name || "")
+        .toLowerCase()
+        .includes(q)
+  );
+});
+function toggleCreatedBy() {
+  createdByOpen.value = !createdByOpen.value;
+  if (createdByOpen.value) {
+    createdByQuery.value = "";
+    nextTick(() => createdBySearchRef.value?.focus());
+  }
+}
+function closeCreatedBy() {
+  createdByOpen.value = false;
+}
+function pickCreatedBy(name) {
+  filterDraft.created_by = name;
+  createdByOpen.value = false;
+  createdByQuery.value = "";
+}
 // Preview the count from the DRAFT so the badge reflects what's about to apply.
 const activeFilterCount = computed(
   () =>
@@ -1118,6 +1237,7 @@ const activeFilterCount = computed(
       filterDraft.priority,
       filterDraft.ticket_type,
       filterDraft.assigned_to,
+      filterDraft.created_by,
       filterDraft.created_from || filterDraft.created_to,
     ].filter(Boolean).length
 );
@@ -1373,8 +1493,16 @@ async function addColumn(key) {
 
 // Close add-column dropdown on outside click (menu items + button are @click.stop,
 // so this only fires for genuine outside clicks).
-function onDocClick() {
+function onDocClick(e) {
   closeAddColMenu();
+  // Close the Created By searchable dropdown when clicking outside it.
+  if (
+    createdByOpen.value &&
+    createdByRef.value &&
+    !createdByRef.value.contains(e?.target)
+  ) {
+    createdByOpen.value = false;
+  }
 }
 onMounted(() => document.addEventListener("click", onDocClick));
 onBeforeUnmount(() => {
@@ -1664,6 +1792,7 @@ function applyRouteState() {
   filters.priority = String(route.query.priority || "");
   filters.ticket_type = String(route.query.ticket_type || "");
   filters.assigned_to = String(route.query.assigned_to || "");
+  filters.created_by = String(route.query.created_by || "");
   filters.created_from = String(route.query.created_from || "");
   filters.created_to = String(route.query.created_to || "");
   // Mirror the applied snapshot into the draft so the dropdowns/date label reflect
@@ -1762,11 +1891,11 @@ function formatShortDate(value) {
 const dateRangeLabel = computed(() => {
   const from = filterDraft.created_from;
   const to = filterDraft.created_to;
-  if (!from && !to) return "Ticket created";
-  if (from && to)
-    return `Created: ${formatShortDate(from)} → ${formatShortDate(to)}`;
-  if (from) return `Created: from ${formatShortDate(from)}`;
-  return `Created: until ${formatShortDate(to)}`;
+  // Compact (no "Created:" prefix) so the selected range fits inside the filter button.
+  if (!from && !to) return "Created Date";
+  if (from && to) return `${formatShortDate(from)} → ${formatShortDate(to)}`;
+  if (from) return `From ${formatShortDate(from)}`;
+  return `Until ${formatShortDate(to)}`;
 });
 function toggleDateRange() {
   if (dateRangeOpen.value) {
@@ -1982,6 +2111,7 @@ function routeQueryFromState() {
     priority: filters.priority || undefined,
     ticket_type: filters.ticket_type || undefined,
     assigned_to: filters.assigned_to || undefined,
+    created_by: filters.created_by || undefined,
     created_from: filters.created_from || undefined,
     created_to: filters.created_to || undefined,
     search: appliedSearch.value.trim() || undefined,

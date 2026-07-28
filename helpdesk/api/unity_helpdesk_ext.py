@@ -1046,7 +1046,11 @@ def bulk_send_email(
             sender=frappe.session.user,
             file_names=file_names,
             ticket_type=ticket_type,
-            now=instant,
+            # NEVER pass now=instant here: frappe.enqueue(now=True) runs the job INLINE in
+            # this web request, blocking it for the whole send (minutes) so the SPA can't get
+            # batch_id or poll live progress. The job always runs in the background worker; it
+            # already queues each mail with delayed=True, so "instant" delivery is unrelated
+            # to how the job is dispatched.
             batch_id=resume_batch_id,
             batch_name=resumable["name"],
         )
@@ -1110,7 +1114,9 @@ def bulk_send_email(
         sender=frappe.session.user,
         file_names=file_names,
         ticket_type=ticket_type,
-        now=instant,
+        # NEVER pass now=instant: frappe.enqueue(now=True) runs the job INLINE in this web
+        # request, blocking it for the whole send so the SPA can't get batch_id or poll live
+        # progress. Always background it; the job queues each mail with delayed=True anyway.
         batch_id=batch_id,
         batch_name=batch.name,
     )
