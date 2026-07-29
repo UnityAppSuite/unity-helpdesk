@@ -859,6 +859,22 @@
                 <template v-else-if="col.key === 'creation'">
                   {{ formatDateTime(ticket.creation) }}
                 </template>
+                <template v-else-if="col.key === 'creation_age'">
+                  <span
+                    v-if="relativeTime(ticket.creation)"
+                    :title="formatDateTime(ticket.creation)"
+                    >{{ relativeTime(ticket.creation) }}</span
+                  >
+                  <span v-else class="muted">-</span>
+                </template>
+                <template v-else-if="col.key === 'modified_age'">
+                  <span
+                    v-if="relativeTime(ticket.modified)"
+                    :title="formatDateTime(ticket.modified)"
+                    >{{ relativeTime(ticket.modified) }}</span
+                  >
+                  <span v-else class="muted">-</span>
+                </template>
                 <template v-else-if="col.key === 'owner'">
                   <span
                     v-if="ticket.created_by || ticket.owner"
@@ -1035,6 +1051,10 @@ import {
   watch,
 } from "vue";
 import { useRoute, useRouter } from "vue-router";
+// Upstream's dayjs wrapper (relativeTime plugin already registered) so the
+// relative date columns read exactly like the Frappe Helpdesk list:
+// "20 days ago", "2 months ago".
+import { dayjs } from "@desk/dayjs";
 import {
   AuthRedirectError,
   bulkUpdateTickets,
@@ -1142,6 +1162,16 @@ const dateRangeDraft = reactive({ from: "", to: "" });
 // don't flicker the UI on top of fast post-index responses.
 const showFilteringBanner = ref(false);
 let filteringBannerTimer = null;
+// The relative-time columns are derived from the wall clock, so they have to be
+// re-derived or a tab left open overnight shows yesterday's wording. The text
+// changes slowly, so a coarse tick is plenty; the visibilitychange listener covers
+// laptop sleep, where interval timers get throttled or skipped entirely.
+const NOW_TICK_INTERVAL_MS = 10 * 60 * 1000;
+const nowTick = ref(Date.now());
+let nowTickTimer = null;
+function bumpNowTick() {
+  nowTick.value = Date.now();
+}
 // True from request start until the get_tickets_summary response lands.
 // Drives "…" placeholders on the KPI cards so the user doesn't stare at
 // stale sessionStorage-cached numbers while the dashboard aggregate
@@ -1767,7 +1797,9 @@ onMounted(async () => {
   loadRecentSearches();
   if (typeof window !== "undefined") {
     window.addEventListener("keydown", onGlobalKeydown);
+    nowTickTimer = window.setInterval(bumpNowTick, NOW_TICK_INTERVAL_MS);
   }
+  document.addEventListener("visibilitychange", bumpNowTick);
   await loadLookups();
 });
 
@@ -1776,6 +1808,11 @@ onBeforeUnmount(() => {
     window.removeEventListener("keydown", onGlobalKeydown);
   }
   document.removeEventListener("mousedown", onDateRangeOutsideClick);
+  document.removeEventListener("visibilitychange", bumpNowTick);
+  if (nowTickTimer) {
+    clearInterval(nowTickTimer);
+    nowTickTimer = null;
+  }
   if (filteringBannerTimer) {
     clearTimeout(filteringBannerTimer);
     filteringBannerTimer = null;
@@ -2524,6 +2561,18 @@ function formatCellValue(ticket, key) {
     return ticket.assignee || "Unassigned";
   }
   return String(raw);
+}
+
+// Elapsed time worded like the upstream Helpdesk list ("20 days ago",
+// "2 months ago") — backs the "Created" and "Last Modified" columns. Returns null
+// for missing/unparseable values so the cell falls back to a muted dash. dayjs is
+// used rather than `new Date()` because it parses Frappe's
+// "2026-06-16 19:41:29.810407" shape reliably on every engine.
+function relativeTime(value) {
+  void nowTick.value; // re-render this cell when the tick advances
+  if (!value) return null;
+  const parsed = dayjs(value);
+  return parsed.isValid() ? parsed.fromNow() : null;
 }
 
 function formatHoldWindow(ticket) {

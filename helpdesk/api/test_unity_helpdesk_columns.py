@@ -8,13 +8,18 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 
 from helpdesk.api.unity_helpdesk import (
+	AVAILABLE_TICKET_COLUMN_KEYS,
 	AVAILABLE_TICKET_COLUMNS,
+	COLUMN_AUTOADD_DEFAULT_KEY,
 	COLUMN_PREFS_DEFAULT_KEY,
 	COLUMN_PREFS_MAX_ITEMS,
 	COLUMN_WIDTH_MAX,
 	COLUMN_WIDTH_MIN,
+	TICKET_DOCTYPE,
+	UNITY_TICKET_FIELDS,
 	_default_column_preferences,
 	_load_column_preferences,
+	_selected_column_fields,
 	update_column_preferences,
 )
 
@@ -23,11 +28,18 @@ FIXED_KEYS = [c["key"] for c in AVAILABLE_TICKET_COLUMNS if c["fixed"]]
 
 
 def _clear_default(user):
+	# Both keys, not just the prefs one: _load_column_preferences() writes the
+	# autoadd flag as a side effect, so leaving it behind leaks state into sibling
+	# tests and makes them order-dependent.
 	frappe.db.sql(
-		"DELETE FROM `tabDefaultValue` WHERE parent=%s AND defkey=%s",
-		(user, COLUMN_PREFS_DEFAULT_KEY),
+		"DELETE FROM `tabDefaultValue` WHERE parent=%s AND defkey IN (%s, %s)",
+		(user, COLUMN_PREFS_DEFAULT_KEY, COLUMN_AUTOADD_DEFAULT_KEY),
 	)
 	frappe.clear_cache(user=user)
+
+
+def _column_def(key):
+	return next(c for c in AVAILABLE_TICKET_COLUMNS if c["key"] == key)
 
 
 class TestColumnPreferencesLoad(FrappeTestCase):
@@ -120,3 +132,117 @@ class TestUpdateColumnPreferences(FrappeTestCase):
 		oversize = [{"key": "priority", "width": 130}] * (COLUMN_PREFS_MAX_ITEMS + 1)
 		with self.assertRaises(frappe.exceptions.ValidationError):
 			update_column_preferences(json.dumps(oversize))
+
+
+class TestRelativeDateColumns(FrappeTestCase):
+	"""The "Created" / "Last Modified" columns render elapsed time client-side
+	("2 months ago"), alongside the absolute "Created On" / "Last Updated" pair.
+
+	Both are virtual: there is no `creation_age` / `modified_age` field on HD
+	Ticket, and `creation` / `modified` are already fetched for every row, so
+	neither column may reach the SQL SELECT or trigger a refetch in the SPA.
+	"""
+
+	# (virtual key, source field, label, the absolute column it sits beside)
+	RELATIVE_COLUMNS = [
+		("creation_age", "creation", "Created"),
+		("modified_age", "modified", "Last Modified"),
+	]
+
+	def setUp(self):
+		_clear_default(frappe.session.user)
+
+	def tearDown(self):
+		_clear_default(frappe.session.user)
+
+	def test_columns_registered(self):
+		for key, _source, label in self.RELATIVE_COLUMNS:
+			with self.subTest(key=key):
+				self.assertIn(key, AVAILABLE_TICKET_COLUMN_KEYS)
+				col = _column_def(key)
+				self.assertEqual(col["label"], label)
+				self.assertFalse(col["fixed"])
+
+	def test_columns_are_virtual(self):
+		# Guards the SPA's columnNeedsFetch() contract — without this flag, adding
+		# either column would force a full get_tickets reload every single time.
+		for key, _source, _label in self.RELATIVE_COLUMNS:
+			with self.subTest(key=key):
+				self.assertTrue(_column_def(key).get("virtual"))
+
+	def test_columns_are_not_ticket_fields(self):
+		# If someone ever adds a real field with one of these names, the virtual key
+		# would silently start being fetched. Fail loudly here instead.
+		meta = frappe.get_meta(TICKET_DOCTYPE)
+		for key, _source, _label in self.RELATIVE_COLUMNS:
+			with self.subTest(key=key):
+				self.assertFalse(meta.has_field(key))
+
+	def test_source_fields_always_fetched(self):
+		# The columns render from these without asking for them, so they must be
+		# unconditionally present in the list query.
+		for _key, source, _label in self.RELATIVE_COLUMNS:
+			with self.subTest(source=source):
+				self.assertIn(source, UNITY_TICKET_FIELDS)
+
+	def test_excluded_from_selected_fields(self):
+		update_column_preferences(
+			json.dumps(
+				[
+					{"key": "creation_age", "width": 130},
+					{"key": "modified_age", "width": 130},
+					{"key": "priority", "width": 130},
+				]
+			)
+		)
+		fields = _selected_column_fields()
+		self.assertNotIn("creation_age", fields)
+		self.assertNotIn("modified_age", fields)
+		# ...but real keys alongside them still come through — the filter targets
+		# virtual columns specifically, not everything.
+		self.assertIn("priority", fields)
+
+	def test_ordered_beside_their_absolute_twin(self):
+		keys = [c["key"] for c in AVAILABLE_TICKET_COLUMNS]
+		for key, source, _label in self.RELATIVE_COLUMNS:
+			with self.subTest(key=key):
+				self.assertEqual(keys.index(key), keys.index(source) + 1)
+
+	def test_in_default_preferences(self):
+		defaults = {p["key"] for p in _default_column_preferences()}
+		for key, _source, _label in self.RELATIVE_COLUMNS:
+			with self.subTest(key=key):
+				self.assertIn(key, defaults)
+
+	def test_absolute_twins_still_registered(self):
+		# All four date columns coexist — the relative ones are additive and must
+		# not have displaced the exact-datetime pair.
+		self.assertEqual(_column_def("creation")["label"], "Created On")
+		self.assertEqual(_column_def("modified")["label"], "Last Updated")
+
+	def test_autoadded_for_existing_user_once(self):
+		user = frappe.session.user
+		# A user who saved prefs before these columns existed, and who has already
+		# been auto-given the previous new default ("owner").
+		frappe.db.set_default(
+			COLUMN_PREFS_DEFAULT_KEY,
+			json.dumps([{"key": "subject", "width": 280}, {"key": "owner", "width": 180}]),
+			user,
+		)
+		frappe.db.set_default(COLUMN_AUTOADD_DEFAULT_KEY, json.dumps(["owner"]), user)
+		frappe.clear_cache(user=user)
+
+		loaded = {p["key"] for p in _load_column_preferences()}
+		self.assertIn("creation_age", loaded)
+		self.assertIn("modified_age", loaded)
+
+		# The user then hides them. That must stick — no re-adding on the next load.
+		kept = [
+			p
+			for p in _load_column_preferences()
+			if p["key"] not in ("creation_age", "modified_age")
+		]
+		update_column_preferences(json.dumps(kept))
+		reloaded = {p["key"] for p in _load_column_preferences()}
+		self.assertNotIn("creation_age", reloaded)
+		self.assertNotIn("modified_age", reloaded)
