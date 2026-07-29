@@ -332,8 +332,14 @@ export async function getSidebarProfile() {
   }
 }
 
-export async function getAgentCandidates() {
-  return (await call("helpdesk.api.unity_helpdesk.get_agent_candidates")) || [];
+export async function getAgentCandidates(search = "") {
+  // Searched server-side across every enabled System User — passing no `search`
+  // returns a short default browse list, not the whole table.
+  return (
+    (await call("helpdesk.api.unity_helpdesk.get_agent_candidates", {
+      search,
+    })) || []
+  );
 }
 
 export async function createAgent(user) {
