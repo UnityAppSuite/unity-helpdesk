@@ -125,47 +125,45 @@
               <p v-if="studentContext.message">{{ studentContext.message }}</p>
             </div>
 
-            <div v-if="structuredStudents.length" class="scroll-x">
-              <table class="compact-info-table student-context-table">
-                <thead>
-                  <tr>
-                    <th>Detail</th>
-                    <th
-                      v-for="student in structuredStudentColumns"
-                      :key="student.key"
-                    >
-                      <div class="student-context-table__heading">
-                        <strong>{{ student.name }}</strong>
-                        <small>
-                          <a
-                            :href="`/app/student/${student.id}`"
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            class="student-id-link"
-                            >{{ student.id }}</a
-                          >
-                          <span v-if="student.academicYear" class="student-ay"
-                            >- {{ student.academicYear }}</span
-                          >
-                        </small>
-                        <span v-if="student.role" class="student-context-pill">
-                          {{ student.role }}
-                        </span>
-                      </div>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="row in structuredStudentRows" :key="row.field">
-                    <th class="row-heading">{{ row.field }}</th>
-                    <td
-                      v-for="value in row.values"
-                      :key="`${row.field}-${value.key}`"
-                      v-html="sanitize(value.html || '-')"
-                    ></td>
-                  </tr>
-                </tbody>
-              </table>
+            <!-- Deliberately NOT wrapped in .scroll-x: an auto-fit grid can
+                 never exceed its container, so there is nothing to scroll. -->
+            <div v-if="structuredStudents.length" class="student-card-grid">
+              <article
+                v-for="student in structuredStudentCards"
+                :key="student.key"
+                class="student-context-card"
+              >
+                <header class="student-context-card__header">
+                  <div>
+                    <strong>{{ student.name }}</strong>
+                    <small>
+                      <a
+                        :href="`/app/student/${student.id}`"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        class="student-id-link"
+                        >{{ student.id }}</a
+                      >
+                      <span v-if="student.academicYear" class="student-ay"
+                        >- {{ student.academicYear }}</span
+                      >
+                    </small>
+                  </div>
+                  <span v-if="student.role" class="student-context-pill">{{
+                    student.role
+                  }}</span>
+                </header>
+                <div class="field-grid">
+                  <div
+                    v-for="field in student.fields"
+                    :key="field.label"
+                    class="field"
+                  >
+                    <label>{{ field.label }}</label>
+                    <strong v-html="sanitize(field.html || '-')"></strong>
+                  </div>
+                </div>
+              </article>
             </div>
 
             <div
@@ -881,7 +879,30 @@ const showLegacyFeeSection = computed(
       ticket.value.custom_payment_schedule
     )
 );
-const structuredStudentColumns = computed(() =>
+// One card per student, rather than one COLUMN per student. The transposed
+// table needed a 980px min-width inside a ~680px column, so a guardian with two
+// children forced a horizontal scroll on any laptop. Same four values, same
+// formatters, same sanitize() — only the axis changed.
+const STUDENT_CARD_FIELDS = [
+  {
+    label: "Class",
+    format: (student) => displayClassCell(student),
+  },
+  {
+    label: "Status",
+    format: (student) => displayValue(student.student_status),
+  },
+  {
+    label: "Confirm for Next Year",
+    format: (student) => displayConfirmNextYear(student),
+  },
+  {
+    label: "Payment Plan",
+    format: (student) => displayPaymentPlan(student),
+  },
+];
+
+const structuredStudentCards = computed(() =>
   structuredStudents.value.map((student, index) => ({
     key: student.student_id || `student-${index}`,
     id: student.student_id || `Student ${index + 1}`,
@@ -892,24 +913,12 @@ const structuredStudentColumns = computed(() =>
     // ref so a mixed sibling family isn't all labelled the global current year.
     academicYear:
       student.academic_year || student.enrollment?.academic_year || "",
+    fields: STUDENT_CARD_FIELDS.map((field) => ({
+      label: field.label,
+      html: field.format(student),
+    })),
   }))
 );
-const structuredStudentRows = computed(() => {
-  const rows = [
-    ["Class", (student) => displayClassCell(student)],
-    ["Status", (student) => displayValue(student.student_status)],
-    ["Confirm for Next Year", (student) => displayConfirmNextYear(student)],
-    ["Payment Plan", (student) => displayPaymentPlan(student)],
-  ];
-
-  return rows.map(([field, formatter]) => ({
-    field,
-    values: structuredStudents.value.map((student, index) => ({
-      key: student.student_id || `student-${index}`,
-      html: formatter(student),
-    })),
-  }));
-});
 const showGuardianTable = computed(
   () =>
     !studentContext.value.siblings_present &&

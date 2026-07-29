@@ -1203,6 +1203,9 @@ a.legend-row:hover {
   gap: 12px;
   padding: 13px 18px;
   border-bottom: 1px solid var(--border);
+  /* Four page-size pills + "Showing X of Y" + "Load more" overflow a narrow
+     phone otherwise — this row has no other wrapping mechanism. */
+  flex-wrap: wrap;
 }
 
 .table-header strong {
@@ -1221,18 +1224,57 @@ a.legend-row:hover {
 .page-size-control {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 12px;
   color: var(--muted, #6b7280);
+  /* Keeps "Showing X of Y" + Load more pushed to the right. */
   margin-right: auto;
 }
 
-.page-size-control select {
+.page-size-label {
   font-size: 12px;
-  padding: 3px 6px;
-  border: 1px solid var(--border, #d1d5db);
-  border-radius: 6px;
+  color: var(--muted, #6b7280);
+}
+
+.page-size-seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
   background: #fff;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 999px;
+}
+
+.page-size-opt {
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--muted, #6b7280);
+  cursor: pointer;
+}
+
+.page-size-opt:hover:not(.active):not(:disabled) {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.page-size-opt.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.page-size-opt:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.page-size-opt:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .link-btn {
@@ -2191,28 +2233,10 @@ tbody tr.bulk-email-ticket:hover {
   font-weight: 700;
 }
 
-.student-context-table {
-  min-width: 980px;
-}
-
-.student-context-table__heading {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-}
-
-.student-context-table__heading strong {
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text);
-}
-
-.student-context-table__heading small {
-  font-size: 11px;
-  color: var(--muted);
-  font-weight: 500;
-}
+/* .student-context-table / __heading removed with the transposed student table
+   they styled — the card grid below replaces it. .compact-info-table's own
+   720px floor is intentionally left alone: the guardian, legacy-student and
+   previous-ticket tables still use it. */
 
 .student-id-link {
   color: var(--accent);
@@ -2298,6 +2322,12 @@ tbody tr.bulk-email-ticket:hover {
 .student-card-grid {
   display: grid;
   gap: 12px;
+  /* auto-fit + min(): once the available width drops below 240px the track
+     collapses to 100% instead of overflowing. That's what makes "never scrolls
+     sideways" true at every viewport and every sibling count — no media query
+     needed, and the existing max-width:980px rule already gives this section
+     the full page width on smaller screens. */
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
 }
 
 .student-context-card {
@@ -2305,6 +2335,15 @@ tbody tr.bulk-email-ticket:hover {
   border-radius: 14px;
   padding: 12px 14px;
   background: #fff;
+}
+
+/* One field per row. The shared .field-grid is 2-up (ProfileView needs that),
+   which left Status and "Confirm for Next Year" sharing a row while Class and
+   Payment Plan spanned the full width — an inconsistent, hard-to-scan mix.
+   Every field reads down a single column here. */
+.student-context-card .field-grid {
+  grid-template-columns: 1fr;
+  gap: 10px;
 }
 
 .student-context-card__header {
@@ -2363,10 +2402,6 @@ tbody tr.bulk-email-ticket:hover {
   color: #4b5b77;
   font-size: 12px;
   font-weight: 500;
-}
-
-.student-context-table td {
-  min-width: 210px;
 }
 
 .student-context-subsection {
@@ -3154,6 +3189,137 @@ th.col-dragging { opacity: 0.45; background: #eef2ff; }
 }
 .col-remove-btn:hover { background: #fee2e2; }
 th:hover .col-remove-btn { display: inline; }
+
+/* Sortable column header. `font/color: inherit` keeps it visually identical to
+   a plain header label — the surrounding th rule still supplies size/weight. */
+.col-sort-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.col-sort-btn:hover {
+  color: var(--text);
+}
+.col-sort-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.col-sort-ind {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--accent);
+}
+.col-sort-ind sup {
+  font-size: 8px;
+  margin-left: 1px;
+}
+
+/* Sort toolbar button + popover */
+.sort-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.toolbar-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sort-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 5px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+.sort-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.15);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 360px;
+}
+.sort-pop-empty {
+  font-size: 12px;
+  color: var(--muted);
+}
+.sort-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.sort-pop-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.sort-pop-row select,
+.sort-pop-add {
+  font-size: 12px;
+  padding: 4px 6px;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: #fff;
+}
+.sort-pop-dir {
+  flex: 0 0 118px;
+}
+.sort-pop-remove {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+.sort-pop-remove:hover {
+  background: #fee2e2;
+}
+.sort-pop-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.sort-pop-add {
+  flex: 1 1 auto;
+}
+.sort-pop-clear {
+  flex: 0 0 auto;
+}
+.sort-truncation-note {
+  margin: 0 0 10px;
+  padding: 7px 11px;
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 8px;
+  color: #92400e;
+  font-size: 12px;
+}
 
 .col-add-th {
   width: 36px;

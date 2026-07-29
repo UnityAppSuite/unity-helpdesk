@@ -251,6 +251,27 @@
           >
             Refresh
           </button>
+          <div ref="sortRef" class="sort-wrap">
+            <button
+              class="btn secondary toolbar-sort"
+              type="button"
+              title="Sort tickets"
+              :aria-expanded="sortOpen"
+              @click="toggleSortPopover"
+            >
+              Sort<span v-if="activeSorts.length" class="sort-count">{{
+                activeSorts.length
+              }}</span>
+            </button>
+            <SortPopover
+              v-if="sortOpen"
+              :model-value="activeSorts"
+              :fields="sortableFields"
+              :max="MAX_SORT_TERMS"
+              @update:model-value="applySort"
+              @close="closeSortPopover"
+            />
+          </div>
           <button
             class="btn secondary toolbar-columns"
             type="button"
@@ -534,6 +555,12 @@
           >Filtering tickets… results below are from the previous request.</span
         >
       </div>
+      <!-- Only when the search actually hit the relevance-candidate cap AND a
+           sort is active: ordering is exact for a normal search, approximate
+           only when both are true. -->
+      <div v-if="showSortTruncationNote" class="sort-truncation-note">
+        Sorting the first 1,000 matches — narrow your search for an exact order.
+      </div>
       <div v-if="reloadPrompt" class="reload-prompt">
         <span>Couldn't load tickets.</span>
         <button type="button" class="btn secondary" @click="load()">
@@ -591,13 +618,39 @@
                   'col-draggable': !col.fixed,
                 }"
                 :draggable="!col.fixed"
+                :aria-sort="ariaSortFor(col.key)"
                 @dragstart="onColDragStart($event, colIdx)"
                 @dragover="onColDragOver($event, colIdx)"
                 @dragend="onColDragEnd"
                 @drop.prevent
               >
                 <span v-if="!col.fixed" class="col-drag-handle">⠿</span>
-                {{ col.label }}
+                <!-- The sort handler lives on a BUTTON, not on the <th>. The
+                     resize grabber below is a bare @mousedown span with no
+                     .stop, so a resize bubbles a click to the <th> — a th-level
+                     handler would re-sort on every column resize. Scoping to a
+                     button that doesn't contain the grabber removes that
+                     conflict, and gets keyboard access + a focus ring free.
+                     (HTML5 drag never emits a click, so :draggable is safe.) -->
+                <button
+                  v-if="sortableFieldMap[col.key]"
+                  class="col-sort-btn"
+                  type="button"
+                  :title="sortHint(col.key)"
+                  @click.stop="toggleSortFromHeader(col.key, $event)"
+                >
+                  {{ col.label
+                  }}<span
+                    v-if="sortIndexFor(col.key) >= 0"
+                    class="col-sort-ind"
+                    aria-hidden="true"
+                    >{{ sortDirFor(col.key) === "asc" ? "▲" : "▼"
+                    }}<sup v-if="activeSorts.length > 1">{{
+                      sortIndexFor(col.key) + 1
+                    }}</sup></span
+                  >
+                </button>
+                <template v-else>{{ col.label }}</template>
                 <button
                   v-if="!col.fixed"
                   class="col-remove-btn"
@@ -1020,18 +1073,49 @@
         </div>
       </div>
       <div class="table-header">
-        <label class="page-size-control" title="Rows fetched per request">
-          Rows per page
-          <select v-model.number="result.page_length" @change="reload">
-            <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">
+        <!-- Segmented, always visible — the options are the point, so hiding
+             them behind a dropdown costs a click for no benefit.
+             NOTE: `.table-header span` is a bare element selector that pill-
+             styles ANY span in this footer, so every control here uses <label>
+             or <button> with a bare text node, never a nested <span>. -->
+        <div
+          class="page-size-control"
+          role="radiogroup"
+          aria-label="Rows per page"
+          title="Rows fetched per request"
+        >
+          <label class="page-size-label">Rows</label>
+          <div class="page-size-seg">
+            <button
+              v-for="(size, sizeIdx) in PAGE_SIZE_OPTIONS"
+              :key="size"
+              ref="pageSizeBtns"
+              type="button"
+              role="radio"
+              :aria-checked="result.page_length === size"
+              :tabindex="result.page_length === size ? 0 : -1"
+              :class="[
+                'page-size-opt',
+                { active: result.page_length === size },
+              ]"
+              :disabled="loading || loadingMore || reloading"
+              @keydown.left.prevent="stepPageSize(sizeIdx, -1)"
+              @keydown.right.prevent="stepPageSize(sizeIdx, 1)"
+              @click="setPageSize(size)"
+            >
               {{ size }}
-            </option>
-          </select>
-        </label>
+            </button>
+          </div>
+        </div>
         <span
           >Showing {{ tickets.length }} of {{ result.total_count || 0 }}</span
         >
-        <button v-if="canLoadMore" class="btn secondary" @click="loadMore">
+        <button
+          v-if="canLoadMore"
+          class="btn secondary"
+          :disabled="loading || loadingMore || reloading"
+          @click="loadMore"
+        >
           Load more
         </button>
       </div>
@@ -1055,6 +1139,7 @@ import { useRoute, useRouter } from "vue-router";
 // relative date columns read exactly like the Frappe Helpdesk list:
 // "20 days ago", "2 months ago".
 import { dayjs } from "@desk/dayjs";
+import SortPopover from "@/components/SortPopover.vue";
 import {
   AuthRedirectError,
   bulkUpdateTickets,
@@ -1125,7 +1210,92 @@ const result = reactive({
   cards: {},
   start: 0,
   page_length: _initialPageSize(),
+  search_truncated: false,
 });
+
+// ---- Sorting -------------------------------------------------------------
+// Sort is applied by the SERVER (an `order_by` string over all ~67k tickets) —
+// reordering only the rows already on screen would sort 20 of 67,000 and be
+// quietly wrong. What makes it feel instant is that we ALSO reorder the loaded
+// rows locally the moment the user clicks, then let the real result swap in
+// silently. See applySort().
+const SORT_STORAGE_KEY = "unity_helpdesk_sort";
+const MAX_SORT_TERMS = 3;
+
+function _initialSorts() {
+  // Shape: [{ key: "status", direction: "asc" }] — `key` is a STRING. (Upstream's
+  // Sort.vue stores the whole field object here, which is why its list can't be
+  // keyed or spliced correctly; we don't copy that.)
+  try {
+    const raw = JSON.parse(
+      window.localStorage.getItem(SORT_STORAGE_KEY) || "[]"
+    );
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .filter(
+        (s) =>
+          s &&
+          typeof s.key === "string" &&
+          (s.direction === "asc" || s.direction === "desc")
+      )
+      .slice(0, MAX_SORT_TERMS);
+  } catch {
+    return [];
+  }
+}
+
+const sortOpen = ref(false);
+const sortRef = ref(null);
+const pageSizeBtns = ref([]);
+
+function setPageSize(size) {
+  if (result.page_length === size) return;
+  result.page_length = size; // watcher persists it to localStorage
+  reload(); // resets start to 0, exactly as the old <select> @change did
+}
+
+// Roving tabindex: a radiogroup is one tab stop, arrows move within it.
+function stepPageSize(index, delta) {
+  const next =
+    (index + delta + PAGE_SIZE_OPTIONS.length) % PAGE_SIZE_OPTIONS.length;
+  setPageSize(PAGE_SIZE_OPTIONS[next]);
+  nextTick(() => pageSizeBtns.value?.[next]?.focus());
+}
+
+const sorts = ref(_initialSorts());
+watch(
+  sorts,
+  (value) => {
+    try {
+      window.localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify(value));
+    } catch {
+      // Quota / private mode — non-fatal.
+    }
+  },
+  { deep: true }
+);
+
+const sortableFields = computed(() => unitySession?.sortable_fields || []);
+const sortableFieldMap = computed(() =>
+  Object.fromEntries(sortableFields.value.map((f) => [f.key, f]))
+);
+// Drop persisted keys the backend no longer offers — but only once the registry
+// has actually arrived, or the first render (session still loading) would wipe a
+// perfectly good saved sort. This is what lets the backend reject unknown sort
+// fields outright instead of silently ignoring them.
+const activeSorts = computed(() =>
+  sortableFields.value.length
+    ? sorts.value.filter((s) => sortableFieldMap.value[s.key])
+    : sorts.value
+);
+const orderByString = computed(() =>
+  activeSorts.value.map((s) => `${s.key} ${s.direction}`).join(", ")
+);
+// Under search the backend can only order the top 1,000 relevance candidates,
+// so a sorted broad search is approximate. Say so — but only when it bites.
+const showSortTruncationNote = computed(
+  () => !!result.search_truncated && activeSorts.value.length > 0
+);
 
 watch(
   () => result.page_length,
@@ -1162,6 +1332,9 @@ const dateRangeDraft = reactive({ from: "", to: "" });
 // don't flicker the UI on top of fast post-index responses.
 const showFilteringBanner = ref(false);
 let filteringBannerTimer = null;
+// Number of in-flight loads the user should not perceive as loading (sorting).
+// While > 0 the dim/banner watcher below stays quiet. See load({silent}).
+const silentLoads = ref(0);
 // The relative-time columns are derived from the wall clock, so they have to be
 // re-derived or a tab left open overnight shows yesterday's wording. The text
 // changes slowly, so a coarse tick is plenty; the visibilitychange listener covers
@@ -1774,7 +1947,7 @@ watch(
 // Show the "Filtering…" banner only after a brief delay so fast loads don't
 // flash it on/off and create visual noise.
 watch(
-  () => loading.value || reloading.value,
+  () => (loading.value || reloading.value) && silentLoads.value === 0,
   (isLoading) => {
     if (isLoading) {
       if (filteringBannerTimer) return;
@@ -1808,6 +1981,7 @@ onBeforeUnmount(() => {
     window.removeEventListener("keydown", onGlobalKeydown);
   }
   document.removeEventListener("mousedown", onDateRangeOutsideClick);
+  document.removeEventListener("mousedown", onSortOutsideClick);
   document.removeEventListener("visibilitychange", bumpNowTick);
   if (nowTickTimer) {
     clearInterval(nowTickTimer);
@@ -2117,6 +2291,137 @@ async function reload(opts = {}) {
   await load({ append: false, ...opts });
 }
 
+// ---- Sorting: instant local reorder, then a silent server refetch ----------
+// The comparators below deliberately mirror the SQL the backend builds, so the
+// optimistic paint lands on the same order the server is about to return and
+// the rows don't visibly jump. Ranks come from the registry the backend ships
+// (spec.rank), so "Urgent > High > Medium > Low" has exactly one definition.
+function _compareValues(a, b, spec) {
+  if (spec.rank) {
+    // indexOf -> -1 for unknown/blank, which sorts FIRST ascending — identical
+    // to MariaDB's FIELD() returning 0. Free agreement; don't "fix" it.
+    return spec.rank.indexOf(a) - spec.rank.indexOf(b);
+  }
+  if (spec.type === "int") return (Number(a) || 0) - (Number(b) || 0);
+  if (spec.type === "datetime" || spec.type === "date") {
+    // Frappe datetimes are "YYYY-MM-DD HH:MM:SS[.ffffff]", so lexicographic
+    // order IS chronological order — no Date parsing, no timezone hazard.
+    const x = String(a || "");
+    const y = String(b || "");
+    return x < y ? -1 : x > y ? 1 : 0;
+  }
+  return String(a || "").localeCompare(String(b || ""), undefined, {
+    sensitivity: "base",
+  });
+}
+
+function sortRowsLocally(rows, terms) {
+  const out = rows.slice();
+  out.sort((x, y) => {
+    for (const term of terms) {
+      const spec = sortableFieldMap.value[term.key];
+      if (!spec) continue;
+      // spec.field, not term.key — "creation_age" has to read row.creation.
+      const cmp = _compareValues(x[spec.field], y[spec.field], spec);
+      if (cmp) return term.direction === "desc" ? -cmp : cmp;
+    }
+    // Same `name` tiebreaker the server appends, in the same direction.
+    const dir = terms.length ? terms[terms.length - 1].direction : "desc";
+    const diff = Number(x.name) - Number(y.name);
+    return dir === "desc" ? -diff : diff;
+  });
+  return out;
+}
+
+async function applySort(nextSorts) {
+  sorts.value = (nextSorts || []).slice(0, MAX_SORT_TERMS);
+  // Reorder what's already in memory so the header indicator and the rows
+  // change in the same frame — same trick quickUpdate() uses to patch a row
+  // before its POST so the value never flashes back.
+  result.data = sortRowsLocally(result.data, activeSorts.value);
+  syncEditState(result.data);
+  // "Select all on page" now means a different set of rows; a later bulk edit
+  // could silently hit rows the user can no longer see.
+  clearSelection();
+  // A changed sort invalidates every offset — page 1 under the new order is not
+  // the rows we hold. Reset and replace; never append.
+  result.start = 0;
+  // fresh: skip the SWR cache read. Returning to a previously-used sort inside
+  // the 60s TTL would otherwise paint a cached page OVER the optimistic order,
+  // producing a visible double-jump. The local reorder already gave us the
+  // instant paint, so the cache read buys nothing here.
+  await load({ append: false, fresh: true, silent: true });
+}
+
+// Mirrors the date-range popover: plain absolute positioning + a deferred
+// outside-click listener. The setTimeout is load-bearing — without it the very
+// click that opens the popover matches the handler and closes it again.
+function toggleSortPopover() {
+  if (sortOpen.value) {
+    closeSortPopover();
+    return;
+  }
+  sortOpen.value = true;
+  setTimeout(() => {
+    document.addEventListener("mousedown", onSortOutsideClick);
+  }, 0);
+}
+function closeSortPopover() {
+  sortOpen.value = false;
+  document.removeEventListener("mousedown", onSortOutsideClick);
+}
+function onSortOutsideClick(event) {
+  if (!sortRef.value) return;
+  if (!sortRef.value.contains(event.target)) closeSortPopover();
+}
+
+function sortIndexFor(key) {
+  return activeSorts.value.findIndex((s) => s.key === key);
+}
+function sortDirFor(key) {
+  const index = sortIndexFor(key);
+  return index >= 0 ? activeSorts.value[index].direction : "";
+}
+function ariaSortFor(key) {
+  const dir = sortDirFor(key);
+  return dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none";
+}
+function sortHint(key) {
+  const label = sortableFieldMap.value[key]?.label || key;
+  const dir = sortDirFor(key);
+  if (dir === "asc") return `${label}: ascending — click for descending`;
+  if (dir === "desc") return `${label}: descending — click to clear`;
+  return `Sort by ${label}`;
+}
+
+function toggleSortFromHeader(key, event) {
+  if (!sortableFieldMap.value[key]) return;
+  const current = activeSorts.value;
+  // Shift-click appends, so a second key can be added without opening the
+  // popover. A plain click replaces — what every list UI does.
+  if (event?.shiftKey) {
+    const existing = current.findIndex((s) => s.key === key);
+    if (existing >= 0) {
+      const next = current.map((s, i) =>
+        i === existing
+          ? { key, direction: s.direction === "asc" ? "desc" : "asc" }
+          : s
+      );
+      return applySort(next);
+    }
+    if (current.length >= MAX_SORT_TERMS) return;
+    return applySort([...current, { key, direction: "asc" }]);
+  }
+  // Sole active sort on this column → cycle none -> asc -> desc -> none.
+  if (current.length === 1 && current[0].key === key) {
+    if (current[0].direction === "asc") {
+      return applySort([{ key, direction: "desc" }]);
+    }
+    return applySort([]);
+  }
+  return applySort([{ key, direction: "asc" }]);
+}
+
 // Refresh ONLY the KPI cards / total_count — not the whole page. Used after an
 // inline or bulk edit, where the affected rows are already patched + reconciled
 // locally, so a full get_tickets_page refetch would just churn the table.
@@ -2240,6 +2545,9 @@ function _listCacheKey() {
     filters: cleanFilters(),
     search: appliedSearch.value,
     page_length: result.page_length,
+    // Without this, returning to the list repaints the PREVIOUS sort order from
+    // cache before the fetch corrects it.
+    sort: orderByString.value,
   };
   return "unity_helpdesk_tickets_cache:" + JSON.stringify(sig);
 }
@@ -2266,11 +2574,16 @@ function _writeListCache(data) {
   }
 }
 
-async function load({ append = false, fresh = false } = {}) {
+async function load({ append = false, fresh = false, silent = false } = {}) {
   const requestId = activeRequestId + 1;
   activeRequestId = requestId;
   activeController?.abort();
   activeController = new AbortController();
+  // `silent` suppresses the dim/banner for loads the user shouldn't perceive as
+  // loading at all (sorting). Counted, not boolean: a second sort click landing
+  // while the first refetch is in flight must not un-suppress when the first
+  // one settles. Released unconditionally in the finally below.
+  if (silent) silentLoads.value += 1;
 
   // Stale-while-revalidate: if we have a fresh cache entry for this exact
   // filter set, paint it immediately and treat the API call as a background
@@ -2315,6 +2628,7 @@ async function load({ append = false, fresh = false } = {}) {
       search: appliedSearch.value,
       page_length: result.page_length,
       start: append ? tickets.value.length : 0,
+      order_by: orderByString.value,
     };
     const callOptions = {
       signal: activeController.signal,
@@ -2363,6 +2677,9 @@ async function load({ append = false, fresh = false } = {}) {
       result.start = pageData.start || 0;
       // Do not overwrite result.page_length — user selection is source of truth.
     }
+    // Whether the search hit the relevance-candidate cap; drives the
+    // "sorting the first 1,000 matches" note.
+    result.search_truncated = !!pageData.search_truncated;
     syncEditState(pageData.data || []);
 
     // Page is on screen — drop the "Loading…" indicator now so the cards
@@ -2428,6 +2745,10 @@ async function load({ append = false, fresh = false } = {}) {
       error.value = err.message;
     }
   } finally {
+    // Released unconditionally — NOT inside the requestId guard below. An
+    // aborted silent load would otherwise leak an increment and the loading
+    // banner would stay suppressed for the rest of the session.
+    if (silent && silentLoads.value > 0) silentLoads.value -= 1;
     if (requestId === activeRequestId) {
       if (append) {
         loadingMore.value = false;
@@ -2444,7 +2765,10 @@ async function load({ append = false, fresh = false } = {}) {
 }
 
 async function loadMore() {
-  if (loading.value || loadingMore.value) return;
+  // `reloading` matters here: a silent sort refetch sets it (not `loading`), and
+  // appending page 2 of the new order onto page 1 of the old one would interleave
+  // rows that were never a contiguous page.
+  if (loading.value || loadingMore.value || reloading.value) return;
   await load({ append: true });
 }
 

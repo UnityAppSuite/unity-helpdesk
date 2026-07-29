@@ -58,6 +58,7 @@ def ensure_unity_custom_fields():
 		unity_helpdesk_student_search_fields,
 		unity_reply_link_field,
 		unity_ticket_message_search_fields,
+		unity_ticket_sort_indexes,
 		unity_ticket_type_color_field,
 		unity_ticket_type_index,
 	)
@@ -70,6 +71,8 @@ def ensure_unity_custom_fields():
 	unity_ticket_type_color_field.execute()
 	unity_canned_response_extension.execute()
 	unity_ticket_type_index.execute()
+	# Sort indexes last: they only need the columns above to exist.
+	unity_ticket_sort_indexes.execute()
 
 
 def add_support_redirect_to_tickets():

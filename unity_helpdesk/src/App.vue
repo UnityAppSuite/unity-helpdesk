@@ -1123,6 +1123,7 @@ const session = reactive({
     column_preferences: [],
   },
   available_columns: [],
+  sortable_fields: [],
 });
 let suggestTimeout = null;
 const composer = reactive({
@@ -1356,6 +1357,9 @@ async function loadSession() {
     };
     session.available_columns = Array.isArray(data.available_columns)
       ? data.available_columns
+      : [];
+    session.sortable_fields = Array.isArray(data.sortable_fields)
+      ? data.sortable_fields
       : [];
     enforceRouteAccess();
   } catch (err) {
