@@ -15,6 +15,7 @@ from helpdesk.api.unity_helpdesk import (
 	COLUMN_PREFS_MAX_ITEMS,
 	COLUMN_WIDTH_MAX,
 	COLUMN_WIDTH_MIN,
+	DEFAULT_COLUMN_ORDER,
 	TICKET_DOCTYPE,
 	UNITY_TICKET_FIELDS,
 	_default_column_preferences,
@@ -213,6 +214,34 @@ class TestRelativeDateColumns(FrappeTestCase):
 		for key, _source, _label in self.RELATIVE_COLUMNS:
 			with self.subTest(key=key):
 				self.assertIn(key, defaults)
+
+	def test_default_view_uses_the_requested_sequence(self):
+		# The first nine columns are specified exactly; the rest follow.
+		keys = [p["key"] for p in _default_column_preferences()]
+		self.assertEqual(keys[:9], [
+			"name",  # Ticket ID
+			"subject",  # Subject
+			"priority",  # Priority
+			"ticket_type",  # Ticket Type
+			"_assign",  # Assigned To
+			"creation_age",  # Created
+			"modified_age",  # Last Modified
+			"custom_hold_reason",  # Reason Of Hold
+			"creation",  # Created On
+		])
+
+	def test_relative_pair_stays_adjacent(self):
+		# "raised a day ago, touched 20 days ago" only reads as a pair.
+		keys = [p["key"] for p in _default_column_preferences()]
+		self.assertEqual(keys.index("modified_age"), keys.index("creation_age") + 1)
+
+	def test_every_default_column_appears_in_the_default_order(self):
+		# DEFAULT_COLUMN_ORDER is maintained by hand; a new default:True column
+		# that nobody added to it would silently be appended to the far right.
+		defaults = {c["key"] for c in AVAILABLE_TICKET_COLUMNS if c["default"]}
+		self.assertEqual(defaults - set(DEFAULT_COLUMN_ORDER), set())
+		# ...and the reverse: a stale key left behind after a column was removed.
+		self.assertEqual(set(DEFAULT_COLUMN_ORDER) - defaults, set())
 
 	def test_absolute_twins_still_registered(self):
 		# All four date columns coexist — the relative ones are additive and must

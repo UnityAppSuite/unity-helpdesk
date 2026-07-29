@@ -1,4 +1,5 @@
 import contextlib
+import datetime
 import functools
 import html
 import json
@@ -326,17 +327,237 @@ COLUMN_PREFS_MAX_ITEMS = 100
 NEWLY_DEFAULTED_COLUMNS = ["owner", "creation_age", "modified_age"]
 COLUMN_AUTOADD_DEFAULT_KEY = "unity_helpdesk_columns_autoadded"
 
+DEFAULT_TICKET_ORDER_BY = "modified desc"
+MAX_SORT_TERMS = 3
+SORT_DIRECTIONS = ("asc", "desc")
+
+# Fields the tickets list can be sorted by. Deliberately CURATED rather than
+# "every meta field" (which is what helpdesk/api/doc.py sort_options() does for
+# the upstream desk list, and why its picker offers unusable entries like
+# "Primary Message HTML").
+#   key    what the SPA sends; matches an AVAILABLE_TICKET_COLUMNS key where one exists
+#   field  the REAL HD Ticket column. `creation_age`/`modified_age` are virtual
+#          relative-time twins, so they map back to `creation`/`modified`.
+#   type   which comparator the SPA uses for its optimistic client-side reorder,
+#          so the instant paint matches what the server will return.
+#   rank   Select/Link fields that must sort by MEANING, not alphabetically.
+TICKET_SORT_FIELDS = [
+	{"key": "name", "label": "Ticket ID", "field": "name", "type": "int"},
+	{"key": "subject", "label": "Subject", "field": "subject", "type": "string"},
+	{"key": "ticket_type", "label": "Ticket Type", "field": "ticket_type", "type": "string"},
+	{
+		"key": "priority",
+		"label": "Priority",
+		"field": "priority",
+		"type": "rank",
+		"rank": ["Urgent", "High", "Medium", "Low"],
+	},
+	{
+		"key": "status",
+		"label": "Status",
+		"field": "status",
+		"type": "rank",
+		"rank": list(STATUS_OPTIONS),
+	},
+	{"key": "creation", "label": "Created On", "field": "creation", "type": "datetime"},
+	{"key": "creation_age", "label": "Created", "field": "creation", "type": "datetime"},
+	{"key": "owner", "label": "Created By", "field": "owner", "type": "string"},
+	{"key": "modified", "label": "Last Updated", "field": "modified", "type": "datetime"},
+	{"key": "modified_age", "label": "Last Modified", "field": "modified", "type": "datetime"},
+	{"key": "custom_is_on_hold", "label": "Issues On Hold", "field": "custom_is_on_hold", "type": "int"},
+	{"key": "raised_by", "label": "Raised By", "field": "raised_by", "type": "string"},
+	{"key": "agent_group", "label": "Agent Group", "field": "agent_group", "type": "string"},
+	{"key": "agreement_status", "label": "SLA Status", "field": "agreement_status", "type": "string"},
+	{"key": "response_by", "label": "Response Due", "field": "response_by", "type": "datetime"},
+	{"key": "resolution_by", "label": "Resolution Due", "field": "resolution_by", "type": "datetime"},
+	{"key": "first_responded_on", "label": "First Responded On", "field": "first_responded_on", "type": "datetime"},
+	{"key": "resolution_date", "label": "Resolved On", "field": "resolution_date", "type": "datetime"},
+	{"key": "custom_hold_from", "label": "Hold From", "field": "custom_hold_from", "type": "date"},
+	{"key": "custom_hold_to", "label": "Hold To", "field": "custom_hold_to", "type": "date"},
+]
+# Deliberately EXCLUDED, and why:
+#   summary, hold_summary        virtual composites with no single backing column
+#   _assign                      a JSON blob — '["a@x.com"]' sorts by the bracket
+#   custom_hold_reason           Small Text; free-form, and a filesort on TEXT
+#                                truncates at max_sort_length
+#   custom_primary_message_text  Long Text; same but far worse (whole mail bodies)
+TICKET_SORT_FIELD_MAP = {f["key"]: f for f in TICKET_SORT_FIELDS}
+
 
 def _localized_available_columns():
 	return [{**col, "label": _(col["label"])} for col in AVAILABLE_TICKET_COLUMNS]
 
 
+def _localized_sort_fields():
+	# Same shape as _localized_available_columns(). Keeps `field`, `type` and
+	# `rank` — the SPA needs all three to reorder rows optimistically in a way
+	# that matches what the server is about to return.
+	return [{**f, "label": _(f["label"])} for f in TICKET_SORT_FIELDS]
+
+
+def _parse_sort_terms(order_by):
+	"""Parse an order_by string ("status asc, creation desc") into a validated
+	[(key, direction)] list.
+
+	Throws on anything outside the curated registry rather than silently falling
+	back to the default — a silent fallback makes a real UI bug invisible (the
+	user clicks "Subject", gets modified-desc rows, and concludes sorting is
+	broken). The stale-preference risk that throwing would otherwise create is
+	closed on the client, which filters its persisted sort against the registry
+	before sending it. Mirrors the ALLOWED_BULK_FIELDS check in
+	bulk_update_tickets().
+	"""
+	raw = cstr(order_by or "").strip()
+	if not raw:
+		return []
+	terms = []
+	seen = set()
+	for chunk in raw.split(","):
+		chunk = chunk.strip()
+		if not chunk:
+			continue
+		parts = chunk.split()
+		if len(parts) > 2:
+			frappe.throw(_("Invalid sort expression: {0}").format(chunk))
+		key = parts[0].strip("`")
+		direction = parts[1].lower() if len(parts) == 2 else "asc"
+		if direction not in SORT_DIRECTIONS:
+			frappe.throw(_("Invalid sort direction: {0}").format(parts[1]))
+		if key not in TICKET_SORT_FIELD_MAP:
+			frappe.throw(_("Sorting by {0} is not supported").format(key))
+		if key in seen:
+			continue  # dedupe; first occurrence wins
+		seen.add(key)
+		terms.append((key, direction))
+	if len(terms) > MAX_SORT_TERMS:
+		frappe.throw(_("Sort by at most {0} fields").format(MAX_SORT_TERMS))
+	return terms
+
+
+def _rank_order_term(field, ranked_values, direction):
+	"""ORDER BY FIELD(col, 'Urgent', 'High', ...) — sorts a Select by meaning.
+
+	FIELD() returns 0 for NULL/unrecognised values, so unknowns sort FIRST in asc
+	and LAST in desc. That matches both MariaDB's NULL handling on plain columns
+	and JS Array.indexOf()'s -1 in the SPA's optimistic reorder, so server and
+	client agree for free. Don't "fix" it.
+	"""
+	quoted = ", ".join("'" + cstr(v).replace("\\", "").replace("'", "") + "'" for v in ranked_values)
+	return f"field(`tab{TICKET_DOCTYPE}`.`{field}`, {quoted}) {direction}"
+
+
+def _ticket_order_by(order_by):
+	"""Curated order_by -> a safe SQL ORDER BY for frappe.get_list.
+
+	ALWAYS terminated with a `name` tiebreaker. Offset pagination over a sort
+	with ties silently duplicates and drops rows between "Load more" pages
+	without a deterministic total order — and status/priority/ticket_type have
+	only a handful of distinct values across ~67k rows, so ties are the norm,
+	not the exception. `name` is the bigint PRIMARY, so it costs nothing.
+
+	The tiebreaker's DIRECTION follows the last sort term, which is not cosmetic:
+	InnoDB secondary indexes carry the PK ascending, so a matching direction lets
+	the whole ORDER BY be served by an index walk, while a mismatched one forces
+	a filesort over the entire table. Measured on this site:
+
+	    ORDER BY subject ASC, name DESC  ->  rows 37631, Using index; Using filesort
+	    ORDER BY subject ASC, name ASC   ->  rows 20,    Using index
+
+	`name` is unique either way, so the total order — and therefore pagination
+	safety — is identical. Only the plan changes.
+	"""
+	terms = _parse_sort_terms(order_by)
+	table = f"`tab{TICKET_DOCTYPE}`"
+	clauses = []
+	for key, direction in terms:
+		spec = TICKET_SORT_FIELD_MAP[key]
+		if spec.get("rank"):
+			clauses.append(_rank_order_term(spec["field"], spec["rank"], direction))
+		else:
+			clauses.append(f"{table}.`{spec['field']}` {direction}")
+	if not clauses:
+		clauses.append(DEFAULT_TICKET_ORDER_BY)
+	tiebreak = terms[-1][1] if terms else "desc"  # "desc" matches DEFAULT_TICKET_ORDER_BY
+	clauses.append(f"{table}.`name` {tiebreak}")
+	return ", ".join(clauses)
+
+
+def _python_sort_key(row, spec):
+	"""Mirror of the SQL comparator, so the search branch (which sorts in Python)
+	orders identically to the list branch (which sorts in SQL). Missing values
+	sort FIRST in asc, matching MariaDB's NULL-first and FIELD()=0-first."""
+	value = row.get(spec["field"])
+	if spec.get("rank"):
+		try:
+			return spec["rank"].index(cstr(value)) + 1  # 1-based; unknown -> 0
+		except ValueError:
+			return 0
+	kind = spec.get("type")
+	if kind in ("datetime", "date"):
+		return get_datetime(value) if value else datetime.datetime.min
+	if kind == "int":
+		try:
+			return int(value or 0)
+		except (TypeError, ValueError):
+			return 0
+	return cstr(value or "").casefold()  # approximates utf8mb4_*_ci
+
+
+def _apply_sort_to_ranked_ids(ranked_ids, candidate_rows, sort_terms):
+	"""Reorder search results by an explicit user sort.
+
+	An explicit sort overrides relevance ORDERING but must never touch relevance
+	MEMBERSHIP: _ranked_ticket_ids both filters (rank is None -> dropped) and
+	orders. So we reorder the ids it kept and never go back to candidate_rows —
+	doing that would resurrect tickets the ranker judged non-matching.
+	"""
+	if not sort_terms:
+		return ranked_ids
+	row_map = {row.name: row for row in candidate_rows}
+	rows = [row_map[name] for name in ranked_ids if name in row_map]
+	# Seed the `name` tiebreaker first, then apply each sort key from last to
+	# first — Python's stable sort then yields the same precedence as SQL's
+	# "a asc, b desc, name <dir>". Direction mirrors _ticket_order_by().
+	rows.sort(key=lambda r: int(r.name), reverse=(sort_terms[-1][1] == "desc"))
+	for key, direction in reversed(sort_terms):
+		spec = TICKET_SORT_FIELD_MAP[key]
+		rows.sort(key=lambda r, s=spec: _python_sort_key(r, s), reverse=(direction == "desc"))
+	return [r.name for r in rows]
+
+
+# Left-to-right order a brand-new user sees. Kept separate from
+# AVAILABLE_TICKET_COLUMNS because that list is a catalogue — it also drives the
+# "+ Add column" menu, where fields are grouped by topic — and the default VIEW
+# wants a different, workflow-driven order. Any default column missing from this
+# list is appended in catalogue order, so adding a new default can't silently
+# drop it. Fixed columns must come first; _load_column_preferences() re-inserts
+# them at the front anyway, but keeping them here makes the order readable.
+DEFAULT_COLUMN_ORDER = [
+	"name",  # Ticket ID
+	"subject",  # Subject
+	"priority",  # Priority
+	"ticket_type",  # Ticket Type
+	"_assign",  # Assigned To
+	# The two relative-time columns stay adjacent — "raised a day ago, touched
+	# 20 days ago" only reads as a pair.
+	"creation_age",  # Created
+	"modified_age",  # Last Modified
+	"custom_hold_reason",  # Reason Of Hold
+	"creation",  # Created On (exact datetime)
+	# Not in the requested sequence, so they follow it rather than disappearing
+	# from anyone's default view.
+	"status",
+	"owner",
+	"custom_is_on_hold",
+]
+
+
 def _default_column_preferences():
-	return [
-		{"key": col["key"], "width": col["width"]}
-		for col in AVAILABLE_TICKET_COLUMNS
-		if col["default"]
-	]
+	defaults = {col["key"]: col for col in AVAILABLE_TICKET_COLUMNS if col["default"]}
+	ordered = [key for key in DEFAULT_COLUMN_ORDER if key in defaults]
+	seen = set(ordered)
+	ordered += [key for key in defaults if key not in seen]
+	return [{"key": key, "width": defaults[key]["width"]} for key in ordered]
 
 
 def _load_column_preferences():
@@ -3389,7 +3610,7 @@ def benchmark_ticket_search(queries=None, view="all", repeat=1):
 	return {"results": results, "repeat": repeat, "view": view}
 
 
-def _resolve_ticket_context(view, filters, search, message_body, page_length, start):
+def _resolve_ticket_context(view, filters, search, message_body, page_length, start, order_by=None):
 	"""Compute the shared context that get_tickets_page and get_tickets_summary
 	both need: capabilities, effective view, base filter list, cleaned search
 	text, and (when searching) the candidate-name set + family expansion. The
@@ -3402,9 +3623,13 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	# list query can never be asked for an unbounded number of rows and time out.
 	page_length = max(1, min(int(page_length or 20), MAX_TICKET_PAGE_LENGTH))
 	start = max(0, int(start or 0))
+	# Validated eagerly so an unsupported sort fails fast, before any DB work.
+	sort_terms = _parse_sort_terms(order_by)
+	order_by_sql = _ticket_order_by(order_by)
 
 	# Cache key embeds the inputs so different filter combinations don't
-	# collide within the same request.
+	# collide within the same request. Sort is deliberately NOT part of it —
+	# see the note where it's patched on below.
 	cache_key = (
 		"_ticket_context",
 		view,
@@ -3420,6 +3645,14 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 		cached = dict(cached)
 		cached["page_length"] = page_length
 		cached["start"] = start
+		# Sort is patched on like pagination, NOT baked into the cache key.
+		# Nothing the context computes (capabilities, filters, fields, candidate
+		# names) depends on ordering — and keying on it would split the contexts
+		# of get_tickets_page (which sends order_by) and get_tickets_summary
+		# (which doesn't), costing a second _fetch_candidate_rows on the search
+		# path: the slowest path there is.
+		cached["sort_terms"] = sort_terms
+		cached["order_by_sql"] = order_by_sql
 		return cached
 
 	capabilities = _require_unity_access()
@@ -3481,6 +3714,11 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 		"start": start,
 	}
 	cache[cache_key] = context
+	# Sort-independent state is what gets cached; the sort rides along on the
+	# returned dict (see the cache-hit branch above for why).
+	context = dict(context)
+	context["sort_terms"] = sort_terms
+	context["order_by_sql"] = order_by_sql
 	return context
 
 
@@ -3539,6 +3777,15 @@ def _compute_tickets_page(context):
 				)
 			]
 		)
+		# An explicit user sort overrides relevance ORDERING but never relevance
+		# MEMBERSHIP — see _apply_sort_to_ranked_ids.
+		ranked_ids = _apply_sort_to_ranked_ids(
+			ranked_ids, candidate_rows, context.get("sort_terms") or []
+		)
+		# Disclose to the SPA when the candidate cap actually bit: under search we
+		# can only sort the top MAX_SEARCH_CANDIDATES by relevance, not the whole
+		# match set, so a sorted broad search is approximate.
+		search_truncated = len(candidate_rows) >= MAX_SEARCH_CANDIDATES
 		paginated_ids = ranked_ids[start : start + page_length]
 		# `candidate_rows` already holds every candidate with the same `fields`,
 		# and `paginated_ids` is a slice of names ranked *from* candidate_rows —
@@ -3552,10 +3799,11 @@ def _compute_tickets_page(context):
 			TICKET_DOCTYPE,
 			fields=fields,
 			filters=list_filters,
-			order_by="modified desc",
+			order_by=context.get("order_by_sql") or _ticket_order_by(None),
 			limit_start=start,
 			page_length=page_length,
 		)
+		search_truncated = False
 
 	return {
 		"data": _decorate_ticket_rows(rows),
@@ -3563,6 +3811,7 @@ def _compute_tickets_page(context):
 		"start": start,
 		"page_length": page_length,
 		"view": effective_view,
+		"search_truncated": search_truncated,
 	}
 
 
@@ -3665,12 +3914,19 @@ def _compute_tickets_summary(context):
 
 
 @frappe.whitelist()
-def get_tickets_page(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+def get_tickets_page(
+	view="all", filters=None, search=None, message_body=None, page_length=20, start=0, order_by=None
+):
 	"""Paginated ticket rows for the current view + filters. Companion to
 	`get_tickets_summary`. The Unity SPA fires both in parallel so the list
 	paints as soon as the page response lands — typically tens of
-	milliseconds — without waiting for the dashboard-cards aggregate."""
-	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	milliseconds — without waiting for the dashboard-cards aggregate.
+
+	`order_by` is the curated sort string ("status asc, creation desc"); see
+	_parse_sort_terms for the allowlist."""
+	context = _resolve_ticket_context(
+		view, filters, search, message_body, page_length, start, order_by
+	)
 	return _compute_tickets_page(context)
 
 
@@ -3679,20 +3935,31 @@ def get_tickets_summary(view="all", filters=None, search=None, message_body=None
 	"""Dashboard-card counts (total/pending/on_hold/resolved/closed/replied)
 	for the current view + filters. Companion to `get_tickets_page`. Issues
 	a single aggregate SQL via `_dashboard_cards_for_filters` (empty-search
-	path) or replays the candidate-rank set (search path)."""
+	path) or replays the candidate-rank set (search path).
+
+	Deliberately takes NO `order_by`: counts are order-independent. Adding it
+	"for symmetry" would (a) fork _resolve_ticket_context's cache key away from
+	get_tickets_page's, costing a second candidate-rows fetch on the search
+	path, and (b) require adding it to _summary_cache_key or the 30s Redis
+	cache would serve one sort's counts for another. Leave it out.
+	"""
 	context = _resolve_ticket_context(view, filters, search, message_body, page_length=1, start=0)
 	return _compute_tickets_summary(context)
 
 
 @frappe.whitelist()
-def get_tickets(view="all", filters=None, search=None, message_body=None, page_length=20, start=0):
+def get_tickets(
+	view="all", filters=None, search=None, message_body=None, page_length=20, start=0, order_by=None
+):
 	"""Back-compat wrapper that returns the same shape the previous monolithic
 	endpoint did — `{data, total_count, cards, row_count, start, page_length, view}`.
 	Internally calls the same helpers as `get_tickets_page` and
 	`get_tickets_summary`, sharing the candidate-rows fetch via the
 	per-request cache so no extra DB work is paid for back-compat.
 	"""
-	context = _resolve_ticket_context(view, filters, search, message_body, page_length, start)
+	context = _resolve_ticket_context(
+		view, filters, search, message_body, page_length, start, order_by
+	)
 	page = _compute_tickets_page(context)
 	summary = _compute_tickets_summary(context)
 	return {**page, **summary}
@@ -4600,6 +4867,7 @@ def get_profile():
 			"bulk_email_default_recipients": _default_bulk_recipients(),
 		},
 		"available_columns": _localized_available_columns(),
+		"sortable_fields": _localized_sort_fields(),
 	}
 
 
