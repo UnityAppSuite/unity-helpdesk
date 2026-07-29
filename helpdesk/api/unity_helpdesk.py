@@ -286,6 +286,13 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "status", "label": "Status", "default": True, "fixed": False, "width": 140},
 	{"key": "_assign", "label": "Assigned To", "default": True, "fixed": False, "width": 170},
 	{"key": "creation", "label": "Created On", "default": True, "fixed": False, "width": 130},
+	# Relative-time twin of the column above ("2 months ago"), worded like the
+	# upstream Helpdesk list. Virtual: it's rendered client-side from `creation`,
+	# which is always fetched (UNITY_TICKET_FIELDS), so `virtual` keeps it out of
+	# _selected_column_fields() and — the reason it matters — out of the SPA's
+	# columnNeedsFetch() reload path. There's no HD Ticket field to backfill, so
+	# adding this column must never trigger a refetch. Same for `modified_age`.
+	{"key": "creation_age", "label": "Created", "default": True, "fixed": False, "width": 130, "virtual": True},
 	# HD Ticket.owner (creator). The SPA renders the resolved full name from
 	# row.created_by (see _decorate_ticket_rows), falling back to the raw owner email.
 	{"key": "owner", "label": "Created By", "default": True, "fixed": False, "width": 180},
@@ -294,6 +301,8 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "raised_by", "label": "Raised By", "default": False, "fixed": False, "width": 220},
 	{"key": "agent_group", "label": "Agent Group", "default": False, "fixed": False, "width": 150},
 	{"key": "modified", "label": "Last Updated", "default": False, "fixed": False, "width": 130},
+	# Relative-time twin of "Last Updated" — `modified` is likewise always fetched.
+	{"key": "modified_age", "label": "Last Modified", "default": True, "fixed": False, "width": 130, "virtual": True},
 	{"key": "response_by", "label": "Response Due", "default": False, "fixed": False, "width": 140},
 	{"key": "resolution_by", "label": "Resolution Due", "default": False, "fixed": False, "width": 150},
 	{"key": "agreement_status", "label": "SLA Status", "default": False, "fixed": False, "width": 130},
@@ -314,7 +323,7 @@ COLUMN_PREFS_MAX_ITEMS = 100
 # without their manual action — while still letting them hide it afterwards (the
 # flag stops us re-adding it on every load). Users with no saved prefs already get
 # these via _default_column_preferences() since they're marked default:True.
-NEWLY_DEFAULTED_COLUMNS = ["owner"]
+NEWLY_DEFAULTED_COLUMNS = ["owner", "creation_age", "modified_age"]
 COLUMN_AUTOADD_DEFAULT_KEY = "unity_helpdesk_columns_autoadded"
 
 
