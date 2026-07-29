@@ -3198,17 +3198,70 @@ def _log_hold_reason(ticket_name, hold_reason):
 	).insert(ignore_permissions=True)
 
 
-def _agent_candidates():
-	assigned_users = [row.user for row in frappe.get_all("HD Agent", fields=["user"], page_length=0) if row.user]
-	filters = {"enabled": 1, "user_type": "System User"}
-	if assigned_users:
-		filters["name"] = ["not in", assigned_users]
-	return frappe.get_all(
-		"User",
-		fields=["name", "full_name", "email", "user_image"],
-		filters=filters,
-		order_by="full_name asc",
-		page_length=200,
+AGENT_CANDIDATE_LIMIT = 25
+AGENT_CANDIDATE_MIN_QUERY = 2
+
+
+def _agent_candidates(search=None, limit=AGENT_CANDIDATE_LIMIT):
+	"""Enabled System Users for the "Add Agent" picker, searched server-side.
+
+	This used to load the first 200 users by `full_name` and let the SPA filter
+	them client-side. With ~8k enabled System Users that window ended inside the
+	"Aa..." names, so every user sorting after it — including any newly created
+	one — was unreachable: typing their name simply returned "no match".
+
+	So search happens in SQL over the whole table instead. Users who are already
+	agents are returned too (flagged `is_agent`, ranked last) rather than filtered
+	out, so searching for one shows "already an agent" instead of a bare "no
+	users match". Hardened like search_users(): wildcards are stripped so a bare
+	'%' can't dump the table, and the row count is always bounded.
+	"""
+	try:
+		limit = int(limit or AGENT_CANDIDATE_LIMIT)
+	except (TypeError, ValueError):
+		limit = AGENT_CANDIDATE_LIMIT
+	limit = max(1, min(limit, 100))
+
+	search = cstr(search or "").strip()
+	# A 1-char query matches thousands of rows; the caller gets the default
+	# browse list until they've typed enough to narrow things down.
+	safe = search.replace("%", "").replace("_", "") if len(search) >= AGENT_CANDIDATE_MIN_QUERY else ""
+
+	where = [
+		"u.enabled = 1",
+		"u.user_type = 'System User'",
+		"u.name NOT IN ('Administrator', 'Guest')",
+	]
+	params = {"limit": limit}
+	if safe:
+		where.append("(u.name LIKE %(like)s OR u.email LIKE %(like)s OR u.full_name LIKE %(like)s)")
+		params["like"] = f"%{safe}%"
+		params["prefix"] = f"{safe}%"
+		# Prefix matches first, mirroring search_users() ranking.
+		rank = """
+			CASE WHEN u.name LIKE %(prefix)s
+			       OR u.email LIKE %(prefix)s
+			       OR u.full_name LIKE %(prefix)s THEN 0 ELSE 1 END,
+		"""
+	else:
+		rank = ""
+
+	return frappe.db.sql(
+		f"""
+		SELECT u.name, u.full_name, u.email, u.user_image,
+		       CASE WHEN a.user IS NULL THEN 0 ELSE 1 END AS is_agent
+		FROM `tabUser` u
+		LEFT JOIN `tabHD Agent` a ON a.user = u.name
+		WHERE {' AND '.join(where)}
+		ORDER BY
+		  is_agent,
+		  {rank}
+		  TRIM(u.full_name),
+		  u.name
+		LIMIT %(limit)s
+		""",
+		params,
+		as_dict=True,
 	)
 
 
@@ -4036,11 +4089,11 @@ def update_ticket_type_keywords(name, keywords=None):
 
 
 @frappe.whitelist()
-def get_agent_candidates():
+def get_agent_candidates(search=None, limit=AGENT_CANDIDATE_LIMIT):
 	capabilities = _require_unity_access()
 	if not capabilities.can_manage_agents:
 		frappe.throw(_("You are not allowed to manage agents"), frappe.PermissionError)
-	return _agent_candidates()
+	return _agent_candidates(search=search, limit=limit)
 
 
 @frappe.whitelist()

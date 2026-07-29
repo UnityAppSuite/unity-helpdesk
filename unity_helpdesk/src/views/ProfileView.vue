@@ -507,12 +507,19 @@
                 <li
                   v-for="candidate in candidateMatches"
                   :key="candidate.name"
+                  :class="{ disabled: candidate.is_agent }"
                   @mousedown.prevent="pickCandidate(candidate)"
                 >
                   <span>{{ candidate.full_name || candidate.name }}</span>
                   <small>{{ candidate.email || candidate.name }}</small>
+                  <small v-if="candidate.is_agent" class="muted">
+                    Already an agent
+                  </small>
                 </li>
-                <li v-if="!candidateMatches.length" class="disabled">
+                <li v-if="candidatesLoading" class="disabled">
+                  <small class="muted">Searching…</small>
+                </li>
+                <li v-else-if="!candidateMatches.length" class="disabled">
                   <small class="muted">No users match</small>
                 </li>
               </ul>
@@ -678,6 +685,10 @@ const creatingAgent = ref(false);
 // Searchable "Add Agent" candidate combobox.
 const candidateQuery = ref("");
 const candidateOpen = ref(false);
+const candidatesLoading = ref(false);
+// The picked row is held onto rather than looked up in `candidates`, because a
+// later search replaces that list and would otherwise lose the selection label.
+const selectedCandidate = ref(null);
 
 const ticketTypes = ref([]);
 const ticketTypeError = ref("");
@@ -757,29 +768,35 @@ const filteredAgents = computed(() => {
 });
 
 // --- Searchable "Add Agent" candidate combobox ---
-const _candidatesAsc = computed(() =>
-  [...candidates.value].sort((a, b) =>
-    (a.full_name || a.name || "").localeCompare(b.full_name || b.name || "")
-  )
-);
-const candidateMatches = computed(() => {
-  const q = candidateQuery.value.trim().toLowerCase();
-  if (!q) return _candidatesAsc.value;
-  return _candidatesAsc.value.filter((c) =>
-    [c.name, c.full_name, c.email].some((v) =>
-      String(v || "")
-        .toLowerCase()
-        .includes(q)
-    )
-  );
-});
-function candidateLabel(name) {
-  if (!name) return "";
-  const c = candidates.value.find((x) => x.name === name);
-  return c ? `${c.full_name || c.name} (${c.email || c.name})` : name;
+// Searching happens on the server across every enabled System User. It used to
+// be a client-side filter over the first 200 users by name, which silently made
+// anyone sorting past that window — every newly created user included —
+// impossible to find.
+const CANDIDATE_DEBOUNCE_MS = 300;
+let candidateSearchTimer = null;
+// Guards against a slow early response overwriting a later, more specific one.
+let candidateSearchSeq = 0;
+
+const candidateMatches = computed(() => candidates.value);
+
+function candidateLabel(candidate) {
+  if (!candidate) return "";
+  return `${candidate.full_name || candidate.name} (${
+    candidate.email || candidate.name
+  })`;
 }
 function onCandidateInput() {
   candidateOpen.value = true;
+  // Typing invalidates any previous pick — otherwise "Add Agent" stays enabled
+  // and would add the old user while the box shows a different name.
+  selectedUser.value = "";
+  selectedCandidate.value = null;
+  clearTimeout(candidateSearchTimer);
+  const query = candidateQuery.value.trim();
+  candidateSearchTimer = setTimeout(
+    () => loadCandidates(query),
+    CANDIDATE_DEBOUNCE_MS
+  );
 }
 function onCandidateFocus() {
   candidateOpen.value = true;
@@ -787,14 +804,15 @@ function onCandidateFocus() {
 function onCandidateBlur() {
   setTimeout(() => {
     candidateOpen.value = false;
-    candidateQuery.value = candidateLabel(selectedUser.value);
+    candidateQuery.value = candidateLabel(selectedCandidate.value);
   }, 120);
 }
 function pickCandidate(candidate) {
+  // Already-an-agent rows are shown for findability but can't be picked.
+  if (candidate.is_agent) return;
   selectedUser.value = candidate.name;
-  candidateQuery.value = `${candidate.full_name || candidate.name} (${
-    candidate.email || candidate.name
-  })`;
+  selectedCandidate.value = candidate;
+  candidateQuery.value = candidateLabel(candidate);
   candidateOpen.value = false;
 }
 
@@ -864,12 +882,19 @@ async function loadAgents() {
   }
 }
 
-async function loadCandidates() {
+async function loadCandidates(search = "") {
   if (!canManageAgents.value) return;
+  const seq = ++candidateSearchSeq;
+  candidatesLoading.value = true;
   try {
-    candidates.value = await getAgentCandidates();
+    const rows = await getAgentCandidates(search);
+    if (seq !== candidateSearchSeq) return; // a newer search already answered
+    candidates.value = rows;
   } catch {
+    if (seq !== candidateSearchSeq) return;
     candidates.value = [];
+  } finally {
+    if (seq === candidateSearchSeq) candidatesLoading.value = false;
   }
 }
 
@@ -965,6 +990,7 @@ async function handleCreateAgent() {
   try {
     await createAgent(selectedUser.value);
     selectedUser.value = "";
+    selectedCandidate.value = null;
     candidateQuery.value = "";
     await Promise.allSettled([loadAgents(), loadCandidates()]);
   } catch (err) {
