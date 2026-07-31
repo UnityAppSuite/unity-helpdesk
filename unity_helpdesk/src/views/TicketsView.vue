@@ -41,109 +41,16 @@
             </option>
           </select>
           <span v-else class="badge blue">Assigned to me</span>
-          <!-- Searchable "Created By" filter — the agent list is long, so typing narrows it. -->
-          <div ref="createdByRef" class="filter-searchselect">
-            <button
-              type="button"
-              class="filter-searchselect-trigger"
-              :title="createdByLabel"
-              @click.stop="toggleCreatedBy"
+          <select v-model="filterDraft.agent_group">
+            <option value="">Agent Group: All</option>
+            <option
+              v-for="grp in agentGroups"
+              :key="grp.name"
+              :value="grp.name"
             >
-              <span class="filter-searchselect-value">{{
-                createdByLabel
-              }}</span>
-              <span class="filter-searchselect-caret" aria-hidden="true"
-                >▾</span
-              >
-            </button>
-            <div
-              v-if="createdByOpen"
-              class="filter-searchselect-panel"
-              @click.stop
-            >
-              <input
-                ref="createdBySearchRef"
-                v-model="createdByQuery"
-                class="filter-searchselect-search"
-                type="text"
-                placeholder="Search creator…"
-                autocomplete="off"
-                @keydown.escape="closeCreatedBy"
-              />
-              <ul class="filter-searchselect-options">
-                <li
-                  class="filter-searchselect-option"
-                  :class="{ active: !filterDraft.created_by }"
-                  @click="pickCreatedBy('')"
-                >
-                  Created By: All
-                </li>
-                <li
-                  v-for="agent in createdByMatches"
-                  :key="'cb-' + agent.name"
-                  class="filter-searchselect-option"
-                  :class="{ active: filterDraft.created_by === agent.name }"
-                  @click="pickCreatedBy(agent.name)"
-                >
-                  {{ agent.full_name || agent.name }}
-                </li>
-                <li
-                  v-if="!createdByMatches.length"
-                  class="filter-searchselect-option disabled"
-                >
-                  No match
-                </li>
-              </ul>
-            </div>
-          </div>
-          <div ref="dateRangeRef" class="date-range-trigger">
-            <button
-              type="button"
-              class="date-range-btn"
-              :class="{
-                'has-value': filterDraft.created_from || filterDraft.created_to,
-              }"
-              :title="dateRangeLabel"
-              @click="toggleDateRange"
-            >
-              <span class="date-range-icon" aria-hidden="true">📅</span>
-              <!-- Shows "Created Date" when unset, else the compact range (e.g. 01 Jul → 29 Jul).
-                 The button has a fixed min-width so this never overflows or reflows the row. -->
-              <span class="date-range-label">{{ dateRangeLabel }}</span>
-            </button>
-            <div v-if="dateRangeOpen" class="date-range-pop" @click.stop>
-              <div class="date-range-pop-row">
-                <label class="date-range-field">
-                  <span>From</span>
-                  <input
-                    v-model="dateRangeDraft.from"
-                    type="date"
-                    :max="dateRangeDraft.to || undefined"
-                  />
-                </label>
-                <label class="date-range-field">
-                  <span>To</span>
-                  <input
-                    v-model="dateRangeDraft.to"
-                    type="date"
-                    :min="dateRangeDraft.from || undefined"
-                  />
-                </label>
-              </div>
-              <div class="date-range-pop-actions">
-                <button
-                  type="button"
-                  class="btn secondary"
-                  @click="clearDateRange"
-                >
-                  Clear
-                </button>
-                <button type="button" class="btn" @click="applyDateRange">
-                  Apply
-                </button>
-              </div>
-            </div>
-          </div>
+              {{ grp.name }}
+            </option>
+          </select>
         </div>
         <button
           type="button"
@@ -154,6 +61,34 @@
             activeFilterCount
           }}</span>
         </button>
+        <!-- Everything the five primary dropdowns don't cover (Created By, Created
+             On, SLA, hold dates, subject/raised-by text …) lives behind this. It sits
+             immediately before Apply because it feeds the same draft state and is
+             committed by the same click. -->
+        <div ref="filterRef" class="filter-wrap">
+          <button
+            class="btn secondary toolbar-filter"
+            type="button"
+            title="Filter on any field"
+            :aria-expanded="filterOpen"
+            @click="toggleFilterPopover"
+          >
+            Filter<span
+              v-if="filterDraft.conditions.length"
+              class="sort-count"
+              >{{ filterDraft.conditions.length }}</span
+            >
+          </button>
+          <FilterPopover
+            v-if="filterOpen"
+            :model-value="filterDraft.conditions"
+            :fields="filterableFields"
+            :options-by-key="filterOptionsByKey"
+            :max="MAX_FILTER_CONDITIONS"
+            @update:model-value="setConditions"
+            @close="closeFilterPopover"
+          />
+        </div>
         <button
           type="button"
           class="btn apply-filters"
@@ -1139,6 +1074,7 @@ import { useRoute, useRouter } from "vue-router";
 // relative date columns read exactly like the Frappe Helpdesk list:
 // "20 days ago", "2 months ago".
 import { dayjs } from "@desk/dayjs";
+import FilterPopover from "@/components/FilterPopover.vue";
 import SortPopover from "@/components/SortPopover.vue";
 import {
   AuthRedirectError,
@@ -1150,6 +1086,7 @@ import {
   getAgents,
   getTicketTypes,
   listAgentGroups,
+  listTicketPriorities,
 } from "../api";
 
 const props = defineProps({ view: { type: String, default: "my" } });
@@ -1297,6 +1234,51 @@ const showSortTruncationNote = computed(
   () => !!result.search_truncated && activeSorts.value.length > 0
 );
 
+// ---- Generic filters ------------------------------------------------------
+// The curated registry the backend ships (unitySession.filterable_fields), the
+// exact counterpart of sortable_fields above. Same contract, too: we drop any
+// condition whose field/operator the backend no longer offers BEFORE sending,
+// but only once the registry has actually arrived — otherwise the first render
+// (session still loading) would wipe a perfectly good filter from the URL.
+// That client-side pruning is what lets _parse_filter_conditions throw on
+// anything unknown instead of silently ignoring it.
+const filterableFields = computed(() => unitySession?.filterable_fields || []);
+const filterableFieldMap = computed(() =>
+  Object.fromEntries(filterableFields.value.map((f) => [f.key, f]))
+);
+const MAX_FILTER_CONDITIONS = computed(
+  () => unitySession?.max_filter_conditions || 8
+);
+function validConditions(rows) {
+  if (!filterableFields.value.length) return rows;
+  return rows.filter((row) => {
+    const spec = filterableFieldMap.value[row.key];
+    return !!spec && (spec.operators || []).includes(row.operator);
+  });
+}
+// Link-field choices for the popover, from lookups the view already loads for
+// the primary controls. A field absent here falls back to a text input.
+const filterOptionsByKey = computed(() => ({
+  ticket_type: ticketTypes.value.map((t) => ({
+    value: t.name,
+    label: t.name,
+  })),
+  agent_group: agentGroups.value.map((g) => ({
+    value: g.name,
+    label: g.name,
+  })),
+  owner: agents.value.map((a) => ({
+    value: a.name,
+    label: a.full_name || a.name,
+  })),
+  priority: ticketPriorities.value.map((p) => ({
+    value: p.name,
+    label: p.name,
+  })),
+}));
+const filterOpen = ref(false);
+const filterRef = ref(null);
+
 watch(
   () => result.page_length,
   (size) => {
@@ -1317,6 +1299,9 @@ const bulkResult = ref(null); // { updated: [...], failed: [...] }
 const bulkProgress = ref({ done: 0, total: 0 });
 const BULK_CHUNK_SIZE = 100;
 const agentGroups = ref([]);
+// Link-field choices for the generic filter popover. Loaded lazily when the
+// popover first opens, the same way agentGroups is for the bulk-edit dialog.
+const ticketPriorities = ref([]);
 const BULK_FIELD_LABELS = {
   status: "Status",
   priority: "Priority",
@@ -1324,9 +1309,6 @@ const BULK_FIELD_LABELS = {
   ticket_type: "Ticket Type",
   agent_group: "Agent Group",
 };
-const dateRangeOpen = ref(false);
-const dateRangeRef = ref(null);
-const dateRangeDraft = reactive({ from: "", to: "" });
 // Debounced "is something loading" flag for the table-dim + filtering banner.
 // Goes true only after ~120ms of continuous loading so quick (<120ms) loads
 // don't flicker the UI on top of fast post-index responses.
@@ -1351,14 +1333,19 @@ function bumpNowTick() {
 // refreshes in the background. Independent of the row-skeleton `loading`
 // flag because rows usually render seconds before cards.
 const summaryPending = ref(false);
+// The five PRIMARY filters, always visible as dropdowns in the toolbar. Everything
+// else — Created By, Created On, SLA status, hold dates, subject/raised-by text —
+// is reachable through the Filter popover instead (`conditions` below), which
+// offers richer operators than a dropdown can.
 const filters = reactive({
   status: "",
   priority: "",
   ticket_type: "",
   assigned_to: "",
-  created_by: "",
-  created_from: "",
-  created_to: "",
+  agent_group: "",
+  // Generic field/operator/value rows from the Filter popover, ANDed onto the
+  // fixed dropdowns above. Shape: [{ key, operator, value }].
+  conditions: [],
 });
 // Draft mirror of `filters`. The UI binds to this; nothing fetches until the user
 // clicks Apply, which copies the draft into `filters` (the committed snapshot read
@@ -1368,81 +1355,78 @@ const filterDraft = reactive({
   priority: "",
   ticket_type: "",
   assigned_to: "",
-  created_by: "",
-  created_from: "",
-  created_to: "",
+  agent_group: "",
+  conditions: [],
 });
 const FILTER_KEYS = [
   "status",
   "priority",
   "ticket_type",
   "assigned_to",
-  "created_by",
-  "created_from",
-  "created_to",
+  "agent_group",
 ];
+// `conditions` is deliberately NOT in FILTER_KEYS: it's an array, so it needs
+// structural compare and deep copy rather than the scalar `!==` / assignment
+// the other keys use. Kept separate so nobody adds it to the list by reflex.
+function conditionsSignature(rows) {
+  return JSON.stringify(rows || []);
+}
+function cloneConditions(rows) {
+  // Deep enough for the shape we store — `value` can be an array (in / between),
+  // so a shallow map would still share that inner reference.
+  return (rows || []).map((r) => ({
+    ...r,
+    value: Array.isArray(r.value) ? [...r.value] : r.value,
+  }));
+}
+// Conditions travel in ONE url param as JSON. Filters are URL-only in this view
+// (unlike sort, which persists to localStorage), so links stay shareable and
+// back/forward keeps working — encoding them as JSON avoids inventing a
+// delimiter that a subject/email value could contain.
+const CONDITIONS_QUERY_KEY = "fc";
+function encodeConditions(rows) {
+  return rows && rows.length ? JSON.stringify(rows) : undefined;
+}
+function decodeConditions(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(String(raw));
+    if (!Array.isArray(parsed)) return [];
+    // Hand-edited URLs land here, so keep only well-formed rows. Unknown
+    // fields/operators are pruned later by validConditions, once the registry
+    // has arrived.
+    return parsed
+      .filter((r) => r && typeof r === "object" && r.key && r.operator)
+      .slice(0, MAX_FILTER_CONDITIONS.value)
+      .map((r) => ({
+        key: String(r.key),
+        operator: String(r.operator),
+        value: Array.isArray(r.value)
+          ? r.value.map(String)
+          : String(r.value ?? ""),
+      }));
+  } catch {
+    return [];
+  }
+}
 // True when the draft filters or the typed search differ from what's applied, so
 // the Apply button can enable/highlight only when there's something to commit.
 const filtersDirty = computed(
   () =>
     FILTER_KEYS.some((k) => filterDraft[k] !== filters[k]) ||
+    conditionsSignature(filterDraft.conditions) !==
+      conditionsSignature(filters.conditions) ||
     draftSearch.value.trim() !== appliedSearch.value
 );
 // Mobile: the filter row collapses behind a "Filters" toggle. On desktop the
 // filter group is always shown via CSS (display:contents), so this only gates mobile.
 const filtersOpen = ref(false);
 
-// --- Searchable "Created By" filter dropdown (the agent list is long) ---
-const createdByOpen = ref(false);
-const createdByQuery = ref("");
-const createdByRef = ref(null);
-const createdBySearchRef = ref(null);
-const createdByLabel = computed(() => {
-  // Short placeholder ("Created By") so it fits the compact control; the selected agent's
-  // full name otherwise (with a title tooltip on the trigger for the full text).
-  if (!filterDraft.created_by) return "Created By";
-  const a = agents.value.find((x) => x.name === filterDraft.created_by);
-  return a ? a.full_name || a.name : filterDraft.created_by;
-});
-const createdByMatches = computed(() => {
-  const q = createdByQuery.value.trim().toLowerCase();
-  if (!q) return agents.value;
-  return agents.value.filter(
-    (a) =>
-      String(a.full_name || "")
-        .toLowerCase()
-        .includes(q) ||
-      String(a.name || "")
-        .toLowerCase()
-        .includes(q)
-  );
-});
-function toggleCreatedBy() {
-  createdByOpen.value = !createdByOpen.value;
-  if (createdByOpen.value) {
-    createdByQuery.value = "";
-    nextTick(() => createdBySearchRef.value?.focus());
-  }
-}
-function closeCreatedBy() {
-  createdByOpen.value = false;
-}
-function pickCreatedBy(name) {
-  filterDraft.created_by = name;
-  createdByOpen.value = false;
-  createdByQuery.value = "";
-}
 // Preview the count from the DRAFT so the badge reflects what's about to apply.
 const activeFilterCount = computed(
   () =>
-    [
-      filterDraft.status,
-      filterDraft.priority,
-      filterDraft.ticket_type,
-      filterDraft.assigned_to,
-      filterDraft.created_by,
-      filterDraft.created_from || filterDraft.created_to,
-    ].filter(Boolean).length
+    FILTER_KEYS.filter((k) => filterDraft[k]).length +
+    (filterDraft.conditions?.length || 0)
 );
 let activeController = null;
 let activeRequestId = 0;
@@ -1696,16 +1680,8 @@ async function addColumn(key) {
 
 // Close add-column dropdown on outside click (menu items + button are @click.stop,
 // so this only fires for genuine outside clicks).
-function onDocClick(e) {
+function onDocClick() {
   closeAddColMenu();
-  // Close the Created By searchable dropdown when clicking outside it.
-  if (
-    createdByOpen.value &&
-    createdByRef.value &&
-    !createdByRef.value.contains(e?.target)
-  ) {
-    createdByOpen.value = false;
-  }
 }
 onMounted(() => document.addEventListener("click", onDocClick));
 onBeforeUnmount(() => {
@@ -1980,8 +1956,8 @@ onBeforeUnmount(() => {
   if (typeof window !== "undefined") {
     window.removeEventListener("keydown", onGlobalKeydown);
   }
-  document.removeEventListener("mousedown", onDateRangeOutsideClick);
   document.removeEventListener("mousedown", onSortOutsideClick);
+  document.removeEventListener("mousedown", onFilterOutsideClick);
   document.removeEventListener("visibilitychange", bumpNowTick);
   if (nowTickTimer) {
     clearInterval(nowTickTimer);
@@ -2003,14 +1979,14 @@ function applyRouteState() {
   filters.priority = String(route.query.priority || "");
   filters.ticket_type = String(route.query.ticket_type || "");
   filters.assigned_to = String(route.query.assigned_to || "");
-  filters.created_by = String(route.query.created_by || "");
-  filters.created_from = String(route.query.created_from || "");
-  filters.created_to = String(route.query.created_to || "");
-  // Mirror the applied snapshot into the draft so the dropdowns/date label reflect
-  // the URL state on first load, shared links, and back/forward nav.
+  filters.agent_group = String(route.query.agent_group || "");
+  filters.conditions = decodeConditions(route.query[CONDITIONS_QUERY_KEY]);
+  // Mirror the applied snapshot into the draft so the dropdowns reflect the URL
+  // state on first load, shared links, and back/forward nav.
   FILTER_KEYS.forEach((k) => {
     filterDraft[k] = filters[k];
   });
+  filterDraft.conditions = cloneConditions(filters.conditions);
 }
 
 function syncEditState(rows) {
@@ -2061,6 +2037,11 @@ if (injectedTicketTypes) {
 }
 
 async function loadLookups() {
+  // Agent Group is a PRIMARY dropdown now, so its options have to be there on
+  // first paint — unlike the Filter popover's link choices, which can stay lazy.
+  // Fired unconditionally (and not awaited below) because the parent never
+  // provides teams, only agents and ticket types.
+  loadAgentGroups();
   // If the parent already provided lookups, we're already in sync via the
   // watchers above — no need to round-trip the network again.
   if (
@@ -2087,63 +2068,21 @@ function isSaving(name) {
 }
 
 function cleanFilters() {
-  return Object.fromEntries(
-    Object.entries(filters).filter(([, value]) => value)
+  const out = Object.fromEntries(
+    Object.entries(filters).filter(
+      ([key, value]) => key !== "conditions" && !!value
+    )
   );
-}
-
-// --- Date range picker helpers ---
-function formatShortDate(value) {
-  if (!value) return "";
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
-  return d.toLocaleDateString(undefined, { day: "2-digit", month: "short" });
-}
-const dateRangeLabel = computed(() => {
-  const from = filterDraft.created_from;
-  const to = filterDraft.created_to;
-  // Compact (no "Created:" prefix) so the selected range fits inside the filter button.
-  if (!from && !to) return "Created Date";
-  if (from && to) return `${formatShortDate(from)} → ${formatShortDate(to)}`;
-  if (from) return `From ${formatShortDate(from)}`;
-  return `Until ${formatShortDate(to)}`;
-});
-function toggleDateRange() {
-  if (dateRangeOpen.value) {
-    closeDateRange();
-    return;
-  }
-  dateRangeDraft.from = filterDraft.created_from || "";
-  dateRangeDraft.to = filterDraft.created_to || "";
-  dateRangeOpen.value = true;
-  // Defer the listener attach so the click that opened the popover doesn't
-  // immediately match the outside-click handler and close it.
-  setTimeout(() => {
-    document.addEventListener("mousedown", onDateRangeOutsideClick);
-  }, 0);
-}
-function closeDateRange() {
-  dateRangeOpen.value = false;
-  document.removeEventListener("mousedown", onDateRangeOutsideClick);
-}
-function onDateRangeOutsideClick(event) {
-  if (!dateRangeRef.value) return;
-  if (!dateRangeRef.value.contains(event.target)) {
-    closeDateRange();
-  }
-}
-// The popover only updates the DRAFT + closes; the toolbar Apply does the fetch.
-function applyDateRange() {
-  filterDraft.created_from = dateRangeDraft.from || "";
-  filterDraft.created_to = dateRangeDraft.to || "";
-  closeDateRange();
-}
-function clearDateRange() {
-  dateRangeDraft.from = "";
-  dateRangeDraft.to = "";
-  filterDraft.created_from = "";
-  filterDraft.created_to = "";
-  closeDateRange();
+  // Only send conditions the shipped registry still recognises (see
+  // validConditions), and OMIT the key entirely when there are none.
+  //
+  // The omission is load-bearing: an EMPTY ARRAY IS TRUTHY, so leaving
+  // `conditions: []` in would make the filter payload permanently non-empty,
+  // and the backend's `if not filters` fast path — six index-only COUNTs
+  // instead of a full-table SUM(CASE) aggregate — would never fire again.
+  const conditions = validConditions(filters.conditions || []);
+  if (conditions.length) out.conditions = conditions;
+  return out;
 }
 
 // --- Bulk edit helpers ---
@@ -2185,15 +2124,9 @@ async function openBulkModal() {
   bulkField.value = "status";
   bulkValue.value = defaultBulkValueFor(bulkField.value);
   bulkModalOpen.value = true;
-  // Lazy-load agent groups the first time the dialog opens.
-  if (!agentGroups.value.length) {
-    try {
-      agentGroups.value = await listAgentGroups();
-    } catch (e) {
-      // Non-fatal — the field stays empty.
-      agentGroups.value = [];
-    }
-  }
+  // Normally already loaded for the Agent Group filter; this covers the case
+  // where that fetch failed. Idempotent.
+  await loadAgentGroups();
 }
 function closeBulkModal() {
   bulkModalOpen.value = false;
@@ -2375,6 +2308,62 @@ function onSortOutsideClick(event) {
   if (!sortRef.value.contains(event.target)) closeSortPopover();
 }
 
+// Filter popover — same open/close shape as sort, including the setTimeout(0)
+// before attaching the listener, without which the click that OPENED the
+// popover is itself seen as an outside click and closes it again.
+function toggleFilterPopover() {
+  if (filterOpen.value) {
+    closeFilterPopover();
+    return;
+  }
+  filterOpen.value = true;
+  loadFilterLookups();
+  setTimeout(() => {
+    document.addEventListener("mousedown", onFilterOutsideClick);
+  }, 0);
+}
+function closeFilterPopover() {
+  filterOpen.value = false;
+  document.removeEventListener("mousedown", onFilterOutsideClick);
+}
+function onFilterOutsideClick(event) {
+  if (!filterRef.value) return;
+  if (!filterRef.value.contains(event.target)) closeFilterPopover();
+}
+
+// Editing a condition only touches the DRAFT — nothing fetches until Apply,
+// exactly like the primary dropdowns. That is deliberate: a filter change is
+// two backend queries over ~67k rows, and the user is usually still building
+// the row (field, then operator, then value) when the first edit lands.
+function setConditions(rows) {
+  filterDraft.conditions = cloneConditions(rows);
+}
+
+// Teams back both the primary Agent Group dropdown and the popover's link
+// choices, so this is fetched on mount. Idempotent and never throws — an empty
+// list just means the dropdown has only "All".
+async function loadAgentGroups() {
+  if (agentGroups.value.length) return;
+  try {
+    agentGroups.value = (await listAgentGroups()) || [];
+  } catch {
+    agentGroups.value = [];
+  }
+}
+
+// Priorities are only needed by the Filter popover, so they stay lazy — most
+// sessions never open it.
+async function loadFilterLookups() {
+  await loadAgentGroups();
+  if (!ticketPriorities.value.length) {
+    try {
+      ticketPriorities.value = await listTicketPriorities();
+    } catch {
+      ticketPriorities.value = [];
+    }
+  }
+}
+
 function sortIndexFor(key) {
   return activeSorts.value.findIndex((s) => s.key === key);
 }
@@ -2453,9 +2442,14 @@ function routeQueryFromState() {
     priority: filters.priority || undefined,
     ticket_type: filters.ticket_type || undefined,
     assigned_to: filters.assigned_to || undefined,
-    created_by: filters.created_by || undefined,
-    created_from: filters.created_from || undefined,
-    created_to: filters.created_to || undefined,
+    agent_group: filters.agent_group || undefined,
+    // Stale keys from links shared before Created By / Created Date moved into the
+    // Filter popover. Explicitly undefined so compactQuery strips them instead of
+    // the `...route.query` spread carrying a filter the UI can no longer show.
+    created_by: undefined,
+    created_from: undefined,
+    created_to: undefined,
+    [CONDITIONS_QUERY_KEY]: encodeConditions(filters.conditions),
     search: appliedSearch.value.trim() || undefined,
   };
 }
@@ -2484,6 +2478,11 @@ async function replaceRouteOrReload() {
 // Commit the draft filters AND any typed-but-unsubmitted search in one fetch.
 async function applyAll() {
   Object.assign(filters, filterDraft);
+  // Object.assign copies the array by REFERENCE, which would make the draft and
+  // the committed snapshot the same object: every later edit in the popover
+  // would silently mutate `filters` too, so filtersDirty could never be true
+  // and Apply would stay disabled. Snapshot it instead.
+  filters.conditions = cloneConditions(filterDraft.conditions);
   const q = draftSearch.value.trim();
   if (q !== appliedSearch.value) {
     appliedSearch.value = q;
@@ -2500,8 +2499,9 @@ async function clearAll() {
     filterDraft[k] = "";
     filters[k] = "";
   });
-  dateRangeDraft.from = "";
-  dateRangeDraft.to = "";
+  filterDraft.conditions = [];
+  filters.conditions = [];
+  closeFilterPopover();
   draftSearch.value = "";
   appliedSearch.value = "";
   searchFocused.value = false;

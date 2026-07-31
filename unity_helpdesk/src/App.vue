@@ -1124,6 +1124,12 @@ const session = reactive({
   },
   available_columns: [],
   sortable_fields: [],
+  // Registry for the ticket-list Filter popover. NOTE: loadSession() copies the
+  // profile field-by-field rather than spreading it, so every key added here must
+  // be copied there too — a key that exists here but not there stays permanently
+  // empty, and the UI it feeds silently disables itself.
+  filterable_fields: [],
+  max_filter_conditions: 8,
 });
 let suggestTimeout = null;
 const composer = reactive({
@@ -1361,6 +1367,10 @@ async function loadSession() {
     session.sortable_fields = Array.isArray(data.sortable_fields)
       ? data.sortable_fields
       : [];
+    session.filterable_fields = Array.isArray(data.filterable_fields)
+      ? data.filterable_fields
+      : [];
+    session.max_filter_conditions = Number(data.max_filter_conditions) || 8;
     enforceRouteAccess();
   } catch (err) {
     if (err instanceof AuthRedirectError) {

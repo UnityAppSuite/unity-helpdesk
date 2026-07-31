@@ -10,7 +10,7 @@ import frappe
 from frappe import _
 from frappe.desk.form.assign_to import add as assign_to_add, clear as clear_all_assignments
 from frappe.query_builder import Case, Order
-from frappe.query_builder.functions import Count, Sum
+from frappe.query_builder.functions import Coalesce, Count, Sum
 from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
@@ -383,9 +383,247 @@ TICKET_SORT_FIELDS = [
 #   custom_primary_message_text  Long Text; same but far worse (whole mail bodies)
 TICKET_SORT_FIELD_MAP = {f["key"]: f for f in TICKET_SORT_FIELDS}
 
+MAX_FILTER_CONDITIONS = 8
+MAX_FILTER_IN_VALUES = 50
+
+# Generic ("add a filter on any field") conditions, the Unity answer to upstream
+# Helpdesk's Filter button. These sit ALONGSIDE the fixed toolbar dropdowns
+# (status/priority/ticket_type/assigned_to/created_by/date-range), which are
+# untouched — see _build_filters.
+#
+# operator key (what the SPA sends) -> how it becomes a frappe.get_list filter.
+#   sql    the operator handed to frappe.get_list
+#   arity  "one"  a single value
+#          "many" a list (in / not in)
+#          "none" no value at all (is set / is not set)
+#          "two"  a [from, to] pair (between)
+#   value  fixed value the operator always carries, regardless of user input
+#   wrap   %…% the value for a LIKE
+FILTER_OPERATORS = {
+	"equals": {"sql": "=", "arity": "one"},
+	"not equals": {"sql": "!=", "arity": "one"},
+	"like": {"sql": "like", "arity": "one", "wrap": True},
+	"not like": {"sql": "not like", "arity": "one", "wrap": True},
+	"in": {"sql": "in", "arity": "many"},
+	"not in": {"sql": "not in", "arity": "many"},
+	"is set": {"sql": "is", "arity": "none", "value": "set"},
+	"is not set": {"sql": "is", "arity": "none", "value": "not set"},
+	">": {"sql": ">", "arity": "one"},
+	"<": {"sql": "<", "arity": "one"},
+	">=": {"sql": ">=", "arity": "one"},
+	"<=": {"sql": "<=", "arity": "one"},
+	"between": {"sql": "between", "arity": "two"},
+}
+
+# Which operators each field TYPE offers. Derived from the type rather than
+# listed per field so a new registry entry can't accidentally offer `>` on a
+# Select or `between` on a checkbox.
+_FILTER_TYPE_OPERATORS = {
+	"text": ("like", "not like", "equals", "not equals", "is set", "is not set"),
+	"int": ("equals", "not equals", ">", "<", ">=", "<="),
+	"select": ("equals", "not equals", "in", "not in", "is set", "is not set"),
+	"link": ("equals", "not equals", "in", "not in", "is set", "is not set"),
+	"check": ("equals",),
+	"date": ("equals", ">", "<", ">=", "<=", "between", "is set", "is not set"),
+	# No "equals" on a Datetime: the SPA sends a bare YYYY-MM-DD, and
+	# `creation = '2026-07-30'` means midnight exactly, so it matches nothing.
+	# "between" (which we expand to cover the whole end day) is the honest
+	# single-day filter.
+	"datetime": (">", "<", ">=", "<=", "between", "is set", "is not set"),
+}
+
+# Fields the tickets list can be filtered by. CURATED, exactly like
+# TICKET_SORT_FIELDS and for the same reason: upstream's get_filterable_fields
+# returns every non-hidden DocField, which is why its picker offers unusable
+# entries like "Primary Message HTML".
+#   key      what the SPA sends
+#   field    the real HD Ticket column
+#   type     drives both the operator list (_FILTER_TYPE_OPERATORS) and the
+#            value control the SPA renders
+#   options  fixed choices for a Select
+#   doctype  target doctype for a Link, so the SPA can autocomplete it
+TICKET_FILTER_FIELDS = [
+	{"key": "name", "label": "Ticket ID", "field": "name", "type": "int"},
+	{"key": "subject", "label": "Subject", "field": "subject", "type": "text"},
+	{"key": "status", "label": "Status", "field": "status", "type": "select", "options": list(STATUS_OPTIONS)},
+	{"key": "priority", "label": "Priority", "field": "priority", "type": "link", "doctype": "HD Ticket Priority"},
+	{"key": "ticket_type", "label": "Ticket Type", "field": "ticket_type", "type": "link", "doctype": "HD Ticket Type"},
+	{"key": "agent_group", "label": "Agent Group", "field": "agent_group", "type": "link", "doctype": "HD Team"},
+	{"key": "owner", "label": "Created By", "field": "owner", "type": "link", "doctype": "User"},
+	{"key": "raised_by", "label": "Raised By", "field": "raised_by", "type": "text"},
+	{
+		"key": "agreement_status",
+		"label": "SLA Status",
+		"field": "agreement_status",
+		"type": "select",
+		"options": ["First Response Due", "Resolution Due", "Failed", "Fulfilled", "Paused"],
+	},
+	{"key": "creation", "label": "Created On", "field": "creation", "type": "datetime"},
+	{"key": "modified", "label": "Last Updated", "field": "modified", "type": "datetime"},
+	{"key": "response_by", "label": "Response Due", "field": "response_by", "type": "datetime"},
+	{"key": "resolution_by", "label": "Resolution Due", "field": "resolution_by", "type": "datetime"},
+	{"key": "first_responded_on", "label": "First Responded On", "field": "first_responded_on", "type": "datetime"},
+	{"key": "resolution_date", "label": "Resolved On", "field": "resolution_date", "type": "datetime"},
+	# custom_* entries are gated by _has_field at parse time, so a site that
+	# hasn't run the Unity patches degrades instead of 500ing.
+	{"key": "custom_is_on_hold", "label": "Issues On Hold", "field": "custom_is_on_hold", "type": "check"},
+	{"key": "custom_hold_reason", "label": "Reason Of Hold", "field": "custom_hold_reason", "type": "text"},
+	{"key": "custom_hold_from", "label": "Hold From", "field": "custom_hold_from", "type": "date"},
+	{"key": "custom_hold_to", "label": "Hold To", "field": "custom_hold_to", "type": "date"},
+]
+# Deliberately EXCLUDED, and why:
+#   _assign                      a JSON blob, so a generic filter could only be a
+#                                leading-wildcard LIKE (full scan). The fixed
+#                                "Assigned To" dropdown already covers it via the
+#                                indexed ToDo lookup in _apply_assignee_filter.
+#   custom_primary_message_text  Long Text — whole mail bodies. That's what the
+#   custom_search_*              search box is for; a LIKE here full-scans ~67k rows.
+#   summary, hold_summary        virtual composites with no single backing column.
+#
+# NOTE on "On Hold": the fixed Status dropdown offers it as a virtual status that
+# maps to custom_is_on_hold=1. It is NOT offered here, because `status in
+# ("Open", "On Hold")` cannot be expressed as a single AND-able tuple. Generic
+# filtering on hold state goes through the custom_is_on_hold checkbox field
+# instead, which is unambiguous under every operator.
+TICKET_FILTER_FIELD_MAP = {f["key"]: f for f in TICKET_FILTER_FIELDS}
+
+
+def _filter_field_operators(spec):
+	return list(_FILTER_TYPE_OPERATORS.get(spec["type"], ()))
+
 
 def _localized_available_columns():
 	return [{**col, "label": _(col["label"])} for col in AVAILABLE_TICKET_COLUMNS]
+
+
+def _localized_filter_fields():
+	"""Registry shipped to the SPA. Mirrors _localized_sort_fields(): the client
+	needs `type` to pick a value control, `operators` to populate the operator
+	dropdown, and `options`/`doctype` to fill the value control — and it filters
+	its own persisted/URL state against this list before sending, which is what
+	makes it safe for _parse_filter_conditions to throw on anything unknown.
+
+	custom_* fields absent on this site are dropped rather than shipped, so the
+	picker never offers a filter that would be silently discarded server-side.
+	"""
+	fields = []
+	for spec in TICKET_FILTER_FIELDS:
+		if spec["field"].startswith("custom_") and not _has_field(TICKET_DOCTYPE, spec["field"]):
+			continue
+		fields.append({**spec, "label": _(spec["label"]), "operators": _filter_field_operators(spec)})
+	return fields
+
+
+def _filter_end_of_day(value):
+	"""Expand a bare YYYY-MM-DD upper bound to end-of-day.
+
+	Same rule the fixed `created_to` filter already applies (see _build_filters):
+	without it, "created on or before the 5th" silently means "before 00:00:00 on
+	the 5th" and drops a whole day of tickets. A full datetime is left alone.
+	"""
+	text = cstr(value).strip()
+	return f"{text} 23:59:59" if len(text) == 10 else text
+
+
+def _coerce_filter_value(spec, operator_key, value):
+	"""Cast one user-supplied value to what the column expects."""
+	kind = spec["type"]
+	if kind == "int":
+		try:
+			return int(cstr(value).strip())
+		except (TypeError, ValueError):
+			frappe.throw(_("{0} needs a number").format(_(spec["label"])))
+	if kind == "check":
+		return 1 if cstr(value).strip().lower() in ("1", "yes", "true", "on") else 0
+	if kind in ("date", "datetime"):
+		text = cstr(value).strip()
+		if not text:
+			frappe.throw(_("{0} needs a date").format(_(spec["label"])))
+		# Only an upper bound gets stretched to end-of-day; `>=`/`>` want the raw
+		# start of the day, and `between` is handled by its own branch.
+		if kind == "datetime" and operator_key == "<=":
+			return _filter_end_of_day(text)
+		return text
+	return cstr(value)
+
+
+def _parse_filter_conditions(conditions):
+	"""Validated generic filter rows -> frappe.get_list filter tuples.
+
+	`conditions` is what the SPA sends inside the `filters` dict:
+	    [{"key": "agent_group", "operator": "in", "value": ["Team A", "Team B"]}]
+
+	Throws on anything outside the curated registry rather than silently dropping
+	it — for the same reason _parse_sort_terms does. A dropped filter is worse
+	than a rejected one: the user gets a wider result set than they asked for and
+	has no way to tell. The stale-preference risk that throwing creates is closed
+	on the client, which filters its persisted/URL state against the registry
+	shipped by _localized_filter_fields() before sending.
+	"""
+	rows = _parse_json(conditions, []) or []
+	if isinstance(rows, dict):  # tolerate a single condition sent unwrapped
+		rows = [rows]
+	if not isinstance(rows, (list, tuple)):
+		frappe.throw(_("Invalid filter conditions"))
+	if len(rows) > MAX_FILTER_CONDITIONS:
+		frappe.throw(_("Apply at most {0} filters").format(MAX_FILTER_CONDITIONS))
+
+	built = []
+	for row in rows:
+		if not isinstance(row, dict):
+			frappe.throw(_("Invalid filter condition: {0}").format(cstr(row)))
+		key = cstr(row.get("key") or row.get("field") or "").strip()
+		operator_key = cstr(row.get("operator") or "equals").strip().lower()
+
+		spec = TICKET_FILTER_FIELD_MAP.get(key)
+		if not spec:
+			frappe.throw(_("Filtering by {0} is not supported").format(key or "?"))
+		if operator_key not in FILTER_OPERATORS:
+			frappe.throw(_("Unknown filter operator: {0}").format(operator_key))
+		if operator_key not in _filter_field_operators(spec):
+			frappe.throw(
+				_("{0} cannot be filtered with '{1}'").format(_(spec["label"]), operator_key)
+			)
+		# A custom field the site never got (patch not run) — skip rather than
+		# hand frappe.get_list a column that doesn't exist.
+		if spec["field"].startswith("custom_") and not _has_field(TICKET_DOCTYPE, spec["field"]):
+			continue
+
+		op = FILTER_OPERATORS[operator_key]
+		arity = op["arity"]
+		raw = row.get("value")
+
+		if arity == "none":
+			value = op["value"]
+		elif arity == "many":
+			values = raw if isinstance(raw, (list, tuple)) else [raw]
+			values = [v for v in values if cstr(v).strip() != ""]
+			if not values:
+				frappe.throw(_("{0} needs at least one value").format(_(spec["label"])))
+			if len(values) > MAX_FILTER_IN_VALUES:
+				frappe.throw(
+					_("{0}: choose at most {1} values").format(_(spec["label"]), MAX_FILTER_IN_VALUES)
+				)
+			value = [_coerce_filter_value(spec, operator_key, v) for v in values]
+		elif arity == "two":
+			pair = raw if isinstance(raw, (list, tuple)) else []
+			pair = [cstr(v).strip() for v in pair]
+			if len(pair) != 2 or not all(pair):
+				frappe.throw(_("{0} needs a start and an end").format(_(spec["label"])))
+			start, end = pair
+			# BETWEEN is inclusive, so the upper bound has to cover the whole day
+			# or "between the 1st and the 5th" loses the 5th.
+			value = [start, _filter_end_of_day(end) if spec["type"] == "datetime" else end]
+		else:
+			if cstr(raw).strip() == "":
+				frappe.throw(_("{0} needs a value").format(_(spec["label"])))
+			value = _coerce_filter_value(spec, operator_key, raw)
+			if op.get("wrap"):
+				text = cstr(value)
+				value = text if text.startswith("%") or text.endswith("%") else f"%{text}%"
+
+		built.append([TICKET_DOCTYPE, spec["field"], op["sql"], value])
+	return built
 
 
 def _localized_sort_fields():
@@ -2675,8 +2913,12 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 	)
 
 	# base_filters is the same shape as the list passed to frappe.get_list — fold
-	# them into the qb query as additional WHERE clauses. We only handle the few
-	# operators _build_filters actually emits (=, in, is set/not set).
+	# them into the qb query as additional WHERE clauses. This must cover EVERY
+	# operator _build_filters can emit: unlike the other candidate probes, this
+	# one never re-queries through frappe.get_list, so an operator dropped here
+	# silently WIDENS the result set — the user gets rows their filter excluded,
+	# and (since the team restriction is one of these filters) rows they may not
+	# be allowed to see. Hence: fold it, or raise; never skip.
 	for filt in base_filters or []:
 		if not isinstance(filt, (list, tuple)) or len(filt) < 3:
 			continue
@@ -2687,22 +2929,41 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 			field, op, value = filt
 		col = QBTicket[field]
 		op_norm = cstr(op).strip().lower()
+		# Same NULL-semantics mirror as _apply_ticket_filters_to_query.
+		target = _qb_filter_target(col, field, op_norm, value)
 		if op_norm == "=":
-			query = query.where(col == value)
+			query = query.where(target == value)
+		elif op_norm == "!=":
+			query = query.where(target != value)
+		elif op_norm == "like":
+			query = query.where(target.like(value))
+		elif op_norm == "not like":
+			query = query.where(target.not_like(value))
 		elif op_norm == "in":
-			query = query.where(col.isin(list(value or [])))
+			query = query.where(_qb_in_condition(col, field, list(value or [])))
 		elif op_norm == "not in":
-			query = query.where(col.notin(list(value or [])))
+			query = query.where(_qb_in_condition(col, field, list(value or []), negate=True))
+		elif op_norm == ">=":
+			query = query.where(target >= value)
+		elif op_norm == "<=":
+			query = query.where(target <= value)
+		elif op_norm == ">":
+			query = query.where(target > value)
+		elif op_norm == "<":
+			query = query.where(target < value)
+		elif op_norm == "between":
+			pair = list(value if isinstance(value, (list, tuple)) else [])
+			if len(pair) != 2:
+				frappe.throw(_("Invalid range filter on {0}").format(field))
+			query = query.where(col.between(pair[0], pair[1]))
 		elif op_norm in ("is", "is not"):
-			# "is", "set" / "is", "not set"
-			if cstr(value).strip().lower() in ("set", "not set"):
-				if cstr(value).strip().lower() == "set":
-					query = query.where(col.notnull())
-				else:
-					query = query.where(col.isnull())
-		# Other operators (rare in base_filters) are skipped — base_filters always
-		# already passed into get_list elsewhere so user-permission scoping is preserved
-		# by the column-level filters above.
+			# "is", "set" / "is", "not set" — "" counts as unset, as in get_list.
+			if cstr(value).strip().lower() == "set":
+				query = query.where(Coalesce(col, "") != "")
+			else:
+				query = query.where(Coalesce(col, "") == "")
+		else:
+			frappe.throw(_("Unsupported filter operator: {0}").format(op_norm))
 
 	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
 	# Statement-time guarded: the Data-field LIKEs are small but a cold buffer pool
@@ -3127,9 +3388,103 @@ def _apply_assignee_filter(res, user):
 	res.append([TICKET_DOCTYPE, "name", "in", list(names)])
 
 
+def _user_teams(user=None):
+	"""[(team_name, ignore_restrictions)] for the given user, from HD Team.users.
+
+	HD Team.autoname is `field:team_name`, so a team's `name` IS the string stored
+	in HD Ticket.agent_group — no second lookup needed.
+
+	Reads HD Team Member (the `users` Table MultiSelect on HD Team), NOT
+	HD Agent.groups. Both exist and nothing keeps them in sync; HD Team.users is
+	the one upstream's own restriction query uses, and the one the desk Team
+	screen edits.
+	"""
+	user = user or _session_user()
+	cache = _request_cache().setdefault("_user_teams", {})
+	if user in cache:
+		return cache[user]
+	try:
+		rows = frappe.db.sql(
+			"""SELECT t.name AS team, t.ignore_restrictions AS ignore_restrictions
+			   FROM `tabHD Team Member` m
+			   JOIN `tabHD Team` t ON t.name = m.parent
+			   WHERE m.user = %s AND m.parenttype = 'HD Team'""",
+			(user,),
+			as_dict=True,
+		)
+	except Exception:
+		# A site without the Helpdesk team tables is not a reason to 500 the list.
+		# Falling back to "no teams" is the safe direction: with restrictions off
+		# (the default) it changes nothing, and with them on it under-shares
+		# rather than over-shares.
+		frappe.log_error(frappe.get_traceback(), "Unity Helpdesk _user_teams")
+		rows = []
+	cache[user] = rows
+	return rows
+
+
+def _team_restriction_settings():
+	"""(restrict_by_team, allow_untagged) from HD Settings — the SAME two
+	switches upstream's own restriction reads, so Desk and Unity can't disagree.
+	Both default off, so this whole feature is inert until someone turns it on.
+	"""
+	row = frappe.db.get_value(
+		"HD Settings",
+		"HD Settings",
+		["restrict_tickets_by_agent_group", "do_not_restrict_tickets_without_an_agent_group"],
+	)
+	if not row:
+		return (0, 0)
+	return (row[0] or 0, row[1] or 0)
+
+
+def _team_restriction_filters():
+	"""Scope the ticket list to the current user's teams, or [] when unrestricted.
+
+	Semantics mirror HDTicket.get_list_filters (hd_ticket.py) so Unity and the
+	legacy desk agree, and reuse the SAME switches — HD Settings
+	`restrict_tickets_by_agent_group` plus the per-team `ignore_restrictions`
+	escape hatch — so this ships OFF and is enabled deliberately. Upstream's
+	version is unreachable from Unity: it only runs through
+	helpdesk.extends.client.get_list, which the Unity API never calls.
+
+	One quirk worth knowing: `agent_group in [..., ""]` is not a typo. Frappe's
+	DatabaseQuery keeps `can_be_null` true when an `in` list contains "" and
+	renders `ifnull(col, '') in (...)` (frappe/model/db_query.py), so the single
+	tuple means "one of my teams OR untagged". That's why this needs no
+	or_filters and no second query path — it stays an AND-able tuple and rides
+	the existing _build_filters choke point into the list, both search branches,
+	the cards aggregate and _summary_cache_key.
+	"""
+	restrict, allow_untagged = _team_restriction_settings()
+	if not int(restrict or 0):
+		return []
+	# Whoever administers the system must keep full visibility, or enabling this
+	# locks them out of tickets they're responsible for.
+	if _is_super_admin():
+		return []
+
+	teams = _user_teams()
+	if any(int(t.get("ignore_restrictions") or 0) for t in teams):
+		return []
+
+	allowed = [cstr(t.get("team")) for t in teams if cstr(t.get("team") or "").strip()]
+	if int(allow_untagged or 0):
+		# "" matches NULL/blank agent_group via the ifnull() rendering above.
+		allowed.append("")
+	if not allowed:
+		# In no team and untagged tickets are restricted too: match nothing,
+		# explicitly. Upstream builds Criterion.any([]) here, which is a latent
+		# bug — an empty OR is not "deny", and we don't want to find out which.
+		return [[TICKET_DOCTYPE, "name", "in", ["__unity_no_teams__"]]]
+	return [[TICKET_DOCTYPE, "agent_group", "in", allowed]]
+
+
 def _build_filters(view="all", filters=None, assigned_agent=None):
 	filters = frappe._dict(_parse_json(filters, {}) or {})
-	res = []
+	# Team scoping first: it is a permission boundary, not a user preference, so
+	# it must be present on every filter list this function can return.
+	res = list(_team_restriction_filters())
 
 	if assigned_agent:
 		_apply_assignee_filter(res, assigned_agent)
@@ -3154,8 +3509,17 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 		else:
 			_apply_assignee_filter(res, filters.assigned_to)
 
+	# Agent Group = HD Ticket.agent_group (Link -> HD Team). A primary toolbar
+	# dropdown; `agent_group_unity_idx` makes the equality cheap. Independent of
+	# _team_restriction_filters above — that one bounds what you MAY see, this one
+	# narrows within it.
+	if filters.get("agent_group"):
+		res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
+
 	# "Created By" = the ticket's owner (creator). owner is an indexed column, so a plain
-	# equality filter is cheap even over the full table.
+	# equality filter is cheap even over the full table. No longer a toolbar dropdown —
+	# it moved into the generic Filter popover as the `owner` registry field — but the
+	# key is kept so older shared links and any API caller keep working.
 	if filters.get("created_by"):
 		res.append([TICKET_DOCTYPE, "owner", "=", filters.created_by])
 
@@ -3175,6 +3539,11 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 	if _has_field(TICKET_DOCTYPE, "custom_hold_to") and filters.get("hold_to"):
 		res.append([TICKET_DOCTYPE, "custom_hold_to", "<=", filters.hold_to])
 
+	# Generic "filter on any field" rows, ANDed onto the fixed dropdowns above.
+	# Every key handled above keeps working untouched, so existing URLs and the
+	# primary toolbar controls are unaffected.
+	res.extend(_parse_filter_conditions(filters.get("conditions")))
+
 	return res
 
 
@@ -3189,10 +3558,91 @@ def _count(filters=None, or_filters=None):
 	return int((row[0].total_count if row else 0) or 0)
 
 
+_QB_NUMERIC_FIELDTYPES = ("Check", "Float", "Int", "Currency", "Percent")
+# frappe.database.utils.FallBackDateTimeStr — inlined rather than imported so a
+# rename upstream surfaces here as a failing count test, not a hard ImportError
+# on every list load.
+_QB_DATETIME_FALLBACK = "0001-01-01 00:00:00.000000"
+_QB_DATE_FALLBACK = "0001-01-01"
+
+
+def _qb_filter_target(col, field, op_norm, value):
+	"""The column expression to compare against, mirroring frappe.get_list.
+
+	This is the subtle part of hand-writing pypika that has to AGREE with
+	frappe.get_list. Frappe's DatabaseQuery wraps nullable columns in
+	`ifnull(col, <fallback>)` for most operators (frappe/model/db_query.py), which
+	means NULL rows genuinely MATCH `!=`, `not like`, `not in` and `<`/`<=`. Bare
+	pypika compares against NULL, which is never true, so those rows silently
+	vanish from the count while staying in the list — measured on this site:
+	`agent_group != x` gave 67,279 rows but 57,443 in the cards.
+
+	Frappe skips the wrapper in exactly these cases, and so do we:
+	  * numeric fieldtypes (never null-compared)
+	  * `>` / `>=` on a Date/Datetime — NULL can't exceed a real value anyway
+	  * `between` — both bounds are non-null, so the wrapper only costs an index
+	  * `=` / `like` with a truthy value — the common path, kept index-friendly
+	"""
+	if field in _qb_numeric_fields():
+		return col
+	is_temporal = field in _qb_temporal_fields()
+	if op_norm in (">", ">=") and is_temporal:
+		return col
+	if op_norm == "between":
+		return col
+	if op_norm in ("=", "like") and value:
+		return col
+	if is_temporal:
+		return Coalesce(col, _QB_DATE_FALLBACK if field in _qb_date_fields() else _QB_DATETIME_FALLBACK)
+	return Coalesce(col, "")
+
+
+# These three read the schema, which doesn't change within a process — cached
+# forever for the same reason (and with the same deploy caveat) as _has_field:
+# `bench migrate` reloads the worker, so they're fresh after a deploy.
+@functools.lru_cache(maxsize=1)
+def _qb_numeric_fields():
+	meta = frappe.get_meta(TICKET_DOCTYPE)
+	return {df.fieldname for df in meta.fields if df.fieldtype in _QB_NUMERIC_FIELDTYPES}
+
+
+@functools.lru_cache(maxsize=1)
+def _qb_date_fields():
+	meta = frappe.get_meta(TICKET_DOCTYPE)
+	return {df.fieldname for df in meta.fields if df.fieldtype == "Date"}
+
+
+@functools.lru_cache(maxsize=1)
+def _qb_temporal_fields():
+	meta = frappe.get_meta(TICKET_DOCTYPE)
+	fields = {df.fieldname for df in meta.fields if df.fieldtype in ("Date", "Datetime")}
+	# creation/modified are real columns but not DocFields, so meta misses them.
+	return fields | {"creation", "modified"}
+
+
+def _qb_in_condition(col, field, values, negate=False):
+	"""`col in (...)` / `not in (...)` with frappe's NULL semantics.
+
+	Frappe renders `ifnull(col, '') in (...)` whenever the list can involve a
+	blank, which is what makes `agent_group in ["Support", ""]` match untagged
+	tickets — the whole basis of the team restriction's "my teams OR untagged".
+	"""
+	values = list(values if isinstance(values, (list, tuple)) else [values])
+	target = _qb_filter_target(col, field, "not in" if negate else "in", values)
+	return target.notin(values) if negate else target.isin(values)
+
+
 def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
 	"""Apply a Unity-style filter list (list of `[doctype, field, op, value]`)
-	to a `frappe.qb` SELECT query. Supports the operators we actually produce
-	in `_build_filters`: `=`, `!=`, `like`, `in`, `not in`, `>=`, `<=`, `>`, `<`."""
+	to a `frappe.qb` SELECT query.
+
+	This backs the dashboard-cards aggregate, which is a SEPARATE query from the
+	`frappe.get_list` the rows come from. Any operator this handles differently —
+	or doesn't handle at all — shows up as KPI counts that disagree with the list
+	below them, which reads as a data bug rather than a filter bug. So it covers
+	the full set _build_filters can emit (see FILTER_OPERATORS) and RAISES on
+	anything else rather than degrading to equality.
+	"""
 	if not filters_list:
 		return query
 	for entry in filters_list:
@@ -3200,30 +3650,46 @@ def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
 			continue
 		_, field, op, value = entry[0], entry[1], entry[2], entry[3]
 		col = doctype_ref[field]
-		op_norm = (op or "=").lower()
+		op_norm = cstr(op or "=").strip().lower()
+		# Every comparison goes through _qb_filter_target so NULL rows land on
+		# the same side of the predicate as they do in frappe.get_list.
+		target = _qb_filter_target(col, field, op_norm, value)
 		if op_norm == "=":
-			query = query.where(col == value)
+			query = query.where(target == value)
 		elif op_norm == "!=":
-			query = query.where(col != value)
+			query = query.where(target != value)
 		elif op_norm == "like":
-			query = query.where(col.like(value))
+			query = query.where(target.like(value))
 		elif op_norm == "not like":
-			query = query.where(col.not_like(value))
+			query = query.where(target.not_like(value))
 		elif op_norm == "in":
-			query = query.where(col.isin(value if isinstance(value, (list, tuple)) else [value]))
+			query = query.where(_qb_in_condition(col, field, value))
 		elif op_norm == "not in":
-			query = query.where(col.notin(value if isinstance(value, (list, tuple)) else [value]))
+			query = query.where(_qb_in_condition(col, field, value, negate=True))
 		elif op_norm == ">=":
-			query = query.where(col >= value)
+			query = query.where(target >= value)
 		elif op_norm == "<=":
-			query = query.where(col <= value)
+			query = query.where(target <= value)
 		elif op_norm == ">":
-			query = query.where(col > value)
+			query = query.where(target > value)
 		elif op_norm == "<":
-			query = query.where(col < value)
+			query = query.where(target < value)
+		elif op_norm == "between":
+			pair = list(value if isinstance(value, (list, tuple)) else [])
+			if len(pair) != 2:
+				frappe.throw(_("Invalid range filter on {0}").format(field))
+			query = query.where(col.between(pair[0], pair[1]))
+		elif op_norm == "is":
+			# frappe.get_list spells these `["is", "set"]` / `["is", "not set"]`,
+			# and treats "" as unset just like NULL.
+			if cstr(value).strip().lower() == "set":
+				query = query.where(Coalesce(col, "") != "")
+			else:
+				query = query.where(Coalesce(col, "") == "")
 		else:
-			# Unknown op — fall back to equality so we don't silently drop a filter.
-			query = query.where(col == value)
+			# Never degrade to equality: a wrong operator here is a silent
+			# count/row mismatch, which is far harder to notice than an error.
+			frappe.throw(_("Unsupported filter operator: {0}").format(op_norm))
 	return query
 
 
@@ -4868,6 +5334,8 @@ def get_profile():
 		},
 		"available_columns": _localized_available_columns(),
 		"sortable_fields": _localized_sort_fields(),
+		"filterable_fields": _localized_filter_fields(),
+		"max_filter_conditions": MAX_FILTER_CONDITIONS,
 	}
 
 
