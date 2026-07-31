@@ -253,42 +253,19 @@ nav a.router-link-active {
   flex: 0 1 auto; /* natural width; shrinks its filters to fit rather than overflowing */
   min-width: 0;
 }
-/* Filter controls: comfortable ~130px default, shrink down to 92px (never overflow/overlap),
-   cap at 160px. Uniform. Target the flex ITEMS (wrappers), then fill the inner button. */
-.toolbar-top select,
-.toolbar-top .filter-searchselect,
-.toolbar-top .date-range-trigger {
+/* The five primary filter dropdowns: comfortable ~140px default, shrink to 96px
+   (never overflow/overlap), cap at 175px. Uniform. */
+.toolbar-top select {
   flex: 1 1 140px;
   min-width: 96px;
   max-width: 175px;
   box-sizing: border-box;
 }
-.toolbar-top .filter-searchselect-trigger,
-.toolbar-top .date-range-btn {
-  width: 100%;
-  max-width: none;
-  box-sizing: border-box;
-}
-/* Apply/Clear keep their natural size, right after the filters. */
+/* Filter / Apply / Clear keep their natural size, right after the dropdowns. */
+.toolbar-top .filter-wrap,
 .toolbar-top .apply-filters,
 .toolbar-top .toolbar-clear {
   flex: 0 0 auto;
-}
-/* The date button holds a date RANGE, so give it a fixed, slightly wider box: "Created Date"
-   AND the selected range (e.g. 01 Jul → 29 Jul) both fit, and the fixed width means picking a
-   date never truncates the label, widens the button, or reflows the row. */
-.toolbar-top .date-range-trigger {
-  flex: 0 0 168px;
-  min-width: 168px;
-  max-width: 168px;
-}
-.toolbar-top .date-range-trigger .date-range-btn {
-  overflow: hidden;
-}
-.toolbar-top .date-range-label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 /* Selected date range on its own full-width line below the toolbar rows. */
 .toolbar-active-date {
@@ -1855,87 +1832,6 @@ tbody tr.bulk-email-ticket:hover {
 }
 
 /* Created-date range filter: single button → popover with from/to inputs. */
-.date-range-trigger {
-  position: relative;
-  display: inline-flex;
-}
-
-.date-range-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 14px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 120ms ease, background 120ms ease;
-}
-
-.date-range-btn:hover {
-  border-color: #c7d2fe;
-}
-
-.date-range-btn.has-value {
-  border-color: #6366f1;
-  background: var(--accent-soft, #eef2ff);
-  color: #3730a3;
-  font-weight: 600;
-}
-
-.date-range-icon {
-  font-size: 14px;
-  line-height: 1;
-}
-
-.date-range-pop {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 20;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.15);
-  padding: 14px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  min-width: 320px;
-}
-
-.date-range-pop-row {
-  display: flex;
-  gap: 10px;
-}
-
-.date-range-field {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.date-range-field input[type="date"] {
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 14px;
-  min-width: 0;
-}
-
-.date-range-pop-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
 
 /* Mail Body preview cell — shows the first ~140 chars of the customer's
    primary message. Wider column with a small italic preview look. Hovering
@@ -3226,7 +3122,15 @@ th:hover .col-remove-btn { display: inline; }
   position: relative;
   display: inline-flex;
 }
-.toolbar-sort {
+/* Filter button lives in the FILTER row (row 1), immediately before Apply, so it
+   reads as part of the same commit — unlike Sort, which acts instantly from row 2.
+   position: relative is what the popover's absolute positioning anchors to. */
+.filter-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.toolbar-sort,
+.toolbar-filter {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -3311,6 +3215,117 @@ th:hover .col-remove-btn { display: inline; }
 .sort-pop-clear {
   flex: 0 0 auto;
 }
+/* Generic filter popover. Same shell as .sort-pop (position/shadow/border) but
+   wider, because a row is field + operator + value rather than field +
+   direction. Kept as its own rule set rather than shared classes so the two can
+   diverge without one breaking the other. */
+.filter-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 20;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.15);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 520px;
+  max-width: min(640px, calc(100vw - 32px));
+}
+.filter-pop-empty {
+  font-size: 12px;
+  color: var(--muted);
+}
+.filter-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.filter-pop-row select,
+.filter-pop-row input,
+.filter-pop-add {
+  font-size: 12px;
+  padding: 4px 6px;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: #fff;
+  min-width: 0;
+}
+.filter-pop-field {
+  flex: 1 1 34%;
+}
+.filter-pop-op {
+  flex: 0 0 116px;
+}
+/* The value cell holds 1-2 controls (between takes two), so it lays them out
+   itself instead of participating directly in the row flex. */
+.filter-pop-value {
+  flex: 1 1 38%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.filter-pop-value > * {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.filter-pop-novalue {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+.filter-pop-multi {
+  max-height: 110px;
+}
+.filter-pop-remove {
+  flex: 0 0 auto;
+  background: none;
+  border: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+.filter-pop-remove:hover {
+  background: #fee2e2;
+}
+.filter-pop-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.filter-pop-add {
+  flex: 1 1 auto;
+}
+.filter-pop-clear {
+  flex: 0 0 auto;
+}
+@media (max-width: 640px) {
+  .filter-pop {
+    min-width: 0;
+    width: calc(100vw - 32px);
+    right: auto;
+    left: 0;
+  }
+  /* Stack the three controls; side by side they'd each be ~60px wide. */
+  .filter-pop-row {
+    flex-wrap: wrap;
+  }
+  .filter-pop-field,
+  .filter-pop-op,
+  .filter-pop-value {
+    flex: 1 1 100%;
+  }
+}
+
 .sort-truncation-note {
   margin: 0 0 10px;
   padding: 7px 11px;
@@ -3922,89 +3937,6 @@ body.col-resizing .ticket-table * {
 
 /* Searchable "Created By" filter dropdown — trigger matches the filter selects, panel
    matches the assignee popover. */
-.filter-searchselect {
-  position: relative;
-  display: inline-block;
-}
-.filter-searchselect-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
-  max-width: 200px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--panel);
-  color: var(--text);
-  font-size: 14px;
-  cursor: pointer;
-  white-space: nowrap;
-  transition: border-color 120ms ease;
-}
-.filter-searchselect-trigger:hover {
-  border-color: #6366f1;
-}
-.filter-searchselect-value {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.filter-searchselect-caret {
-  color: var(--muted);
-  font-size: 11px;
-  margin-left: auto;
-}
-.filter-searchselect-panel {
-  position: absolute;
-  z-index: 60;
-  top: calc(100% + 4px);
-  left: 0;
-  display: flex;
-  flex-direction: column;
-  min-width: 230px;
-  max-height: 320px;
-  padding: 6px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.18);
-}
-.filter-searchselect-search {
-  flex: 0 0 auto;
-  width: 100%;
-  margin-bottom: 6px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 13px;
-}
-.filter-searchselect-options {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  overflow-y: auto;
-}
-.filter-searchselect-option {
-  padding: 8px 10px;
-  border-radius: 6px;
-  font-size: 13px;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.filter-searchselect-option:hover {
-  background: var(--surface-2, #f3f4f6);
-}
-.filter-searchselect-option.active {
-  background: rgba(99, 102, 241, 0.12);
-  color: #4f46e5;
-  font-weight: 600;
-}
-.filter-searchselect-option.disabled {
-  color: var(--muted);
-  cursor: default;
-}
 
 /* Global non-blocking notice (toast) shown above everything while a send runs. */
 .global-notice {
@@ -4234,13 +4166,9 @@ body.col-resizing .ticket-table * {
   .filter-group.open {
     display: flex;
   }
-  /* Every filter control (incl. the searchable Created By dropdown) fills the width.
-     flex: none resets the desktop flex-basis so nothing gets a 140px HEIGHT in this column. */
-  .filter-group select,
-  .filter-group .date-range-trigger,
-  .filter-group .date-range-btn,
-  .filter-group .filter-searchselect,
-  .filter-group .filter-searchselect-trigger {
+  /* Every primary filter dropdown fills the width. flex: none resets the desktop
+     flex-basis so nothing gets a 140px HEIGHT in this column. */
+  .filter-group select {
     width: 100%;
     max-width: none;
     flex: none;

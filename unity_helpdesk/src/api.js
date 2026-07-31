@@ -442,6 +442,18 @@ export async function listAgentGroups() {
   return rows || [];
 }
 
+// Priorities for the generic filter popover. Read live rather than hardcoded so
+// a priority added in Desk shows up without a rebuild.
+export async function listTicketPriorities() {
+  const rows = await call("frappe.client.get_list", {
+    doctype: "HD Ticket Priority",
+    fields: ["name"],
+    page_length: 50,
+    order_by: "integer_value asc",
+  });
+  return rows || [];
+}
+
 // Fetch a single template with its full body (the list endpoint only returns a preview)
 export async function getReplyTemplateDoc(name) {
   return call("frappe.client.get", {
