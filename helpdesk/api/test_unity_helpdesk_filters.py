@@ -8,8 +8,8 @@ locking down hard:
 
   1. Only registry fields and registry operators ever reach SQL. Unity refuses
      anything else rather than dropping it — a dropped filter silently returns
-     MORE rows than the user asked for, which is both a UX lie and, once the
-     team restriction is a filter too, a disclosure risk.
+     MORE rows than the user asked for, and since the same filter list also
+     carries the view scoping, a drop can widen past what the user may see.
   2. Every field x operator pairing the picker can offer must actually execute.
      A typo'd column or an operator the dialect rejects is a 500 in production
      and no amount of string assertion would find it.
@@ -313,10 +313,11 @@ class TestFilterExecution(FrappeTestCase):
 		self.assertEqual(mismatches, [], "dashboard cards disagree with the ticket list")
 
 	def test_blank_in_value_matches_untagged_rows(self):
-		"""`in [..., ""]` must match NULL — the team restriction depends on it.
+		"""`in [..., ""]` must match NULL rows.
 
 		frappe.get_list renders that as ifnull(col, '') IN (...); a bare pypika
-		isin() does not, which is why _qb_in_condition exists.
+		isin() does not, which is why _qb_in_condition exists. Without the mirror
+		the cards would count a different set than the list displays.
 		"""
 		with_blank = [[TICKET_DOCTYPE, "agent_group", "in", ["__nope__", ""]]]
 		without_blank = [[TICKET_DOCTYPE, "agent_group", "in", ["__nope__"]]]

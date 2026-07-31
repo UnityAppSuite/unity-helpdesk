@@ -2917,8 +2917,8 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 	# operator _build_filters can emit: unlike the other candidate probes, this
 	# one never re-queries through frappe.get_list, so an operator dropped here
 	# silently WIDENS the result set — the user gets rows their filter excluded,
-	# and (since the team restriction is one of these filters) rows they may not
-	# be allowed to see. Hence: fold it, or raise; never skip.
+	# and base_filters also carries the view scoping (My Tickets / assigned-agent),
+	# so a drop can leak another agent's tickets. Hence: fold it, or raise; never skip.
 	for filt in base_filters or []:
 		if not isinstance(filt, (list, tuple)) or len(filt) < 3:
 			continue
@@ -3388,103 +3388,9 @@ def _apply_assignee_filter(res, user):
 	res.append([TICKET_DOCTYPE, "name", "in", list(names)])
 
 
-def _user_teams(user=None):
-	"""[(team_name, ignore_restrictions)] for the given user, from HD Team.users.
-
-	HD Team.autoname is `field:team_name`, so a team's `name` IS the string stored
-	in HD Ticket.agent_group — no second lookup needed.
-
-	Reads HD Team Member (the `users` Table MultiSelect on HD Team), NOT
-	HD Agent.groups. Both exist and nothing keeps them in sync; HD Team.users is
-	the one upstream's own restriction query uses, and the one the desk Team
-	screen edits.
-	"""
-	user = user or _session_user()
-	cache = _request_cache().setdefault("_user_teams", {})
-	if user in cache:
-		return cache[user]
-	try:
-		rows = frappe.db.sql(
-			"""SELECT t.name AS team, t.ignore_restrictions AS ignore_restrictions
-			   FROM `tabHD Team Member` m
-			   JOIN `tabHD Team` t ON t.name = m.parent
-			   WHERE m.user = %s AND m.parenttype = 'HD Team'""",
-			(user,),
-			as_dict=True,
-		)
-	except Exception:
-		# A site without the Helpdesk team tables is not a reason to 500 the list.
-		# Falling back to "no teams" is the safe direction: with restrictions off
-		# (the default) it changes nothing, and with them on it under-shares
-		# rather than over-shares.
-		frappe.log_error(frappe.get_traceback(), "Unity Helpdesk _user_teams")
-		rows = []
-	cache[user] = rows
-	return rows
-
-
-def _team_restriction_settings():
-	"""(restrict_by_team, allow_untagged) from HD Settings — the SAME two
-	switches upstream's own restriction reads, so Desk and Unity can't disagree.
-	Both default off, so this whole feature is inert until someone turns it on.
-	"""
-	row = frappe.db.get_value(
-		"HD Settings",
-		"HD Settings",
-		["restrict_tickets_by_agent_group", "do_not_restrict_tickets_without_an_agent_group"],
-	)
-	if not row:
-		return (0, 0)
-	return (row[0] or 0, row[1] or 0)
-
-
-def _team_restriction_filters():
-	"""Scope the ticket list to the current user's teams, or [] when unrestricted.
-
-	Semantics mirror HDTicket.get_list_filters (hd_ticket.py) so Unity and the
-	legacy desk agree, and reuse the SAME switches — HD Settings
-	`restrict_tickets_by_agent_group` plus the per-team `ignore_restrictions`
-	escape hatch — so this ships OFF and is enabled deliberately. Upstream's
-	version is unreachable from Unity: it only runs through
-	helpdesk.extends.client.get_list, which the Unity API never calls.
-
-	One quirk worth knowing: `agent_group in [..., ""]` is not a typo. Frappe's
-	DatabaseQuery keeps `can_be_null` true when an `in` list contains "" and
-	renders `ifnull(col, '') in (...)` (frappe/model/db_query.py), so the single
-	tuple means "one of my teams OR untagged". That's why this needs no
-	or_filters and no second query path — it stays an AND-able tuple and rides
-	the existing _build_filters choke point into the list, both search branches,
-	the cards aggregate and _summary_cache_key.
-	"""
-	restrict, allow_untagged = _team_restriction_settings()
-	if not int(restrict or 0):
-		return []
-	# Whoever administers the system must keep full visibility, or enabling this
-	# locks them out of tickets they're responsible for.
-	if _is_super_admin():
-		return []
-
-	teams = _user_teams()
-	if any(int(t.get("ignore_restrictions") or 0) for t in teams):
-		return []
-
-	allowed = [cstr(t.get("team")) for t in teams if cstr(t.get("team") or "").strip()]
-	if int(allow_untagged or 0):
-		# "" matches NULL/blank agent_group via the ifnull() rendering above.
-		allowed.append("")
-	if not allowed:
-		# In no team and untagged tickets are restricted too: match nothing,
-		# explicitly. Upstream builds Criterion.any([]) here, which is a latent
-		# bug — an empty OR is not "deny", and we don't want to find out which.
-		return [[TICKET_DOCTYPE, "name", "in", ["__unity_no_teams__"]]]
-	return [[TICKET_DOCTYPE, "agent_group", "in", allowed]]
-
-
 def _build_filters(view="all", filters=None, assigned_agent=None):
 	filters = frappe._dict(_parse_json(filters, {}) or {})
-	# Team scoping first: it is a permission boundary, not a user preference, so
-	# it must be present on every filter list this function can return.
-	res = list(_team_restriction_filters())
+	res = []
 
 	if assigned_agent:
 		_apply_assignee_filter(res, assigned_agent)
@@ -3510,9 +3416,7 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 			_apply_assignee_filter(res, filters.assigned_to)
 
 	# Agent Group = HD Ticket.agent_group (Link -> HD Team). A primary toolbar
-	# dropdown; `agent_group_unity_idx` makes the equality cheap. Independent of
-	# _team_restriction_filters above — that one bounds what you MAY see, this one
-	# narrows within it.
+	# dropdown; `agent_group_unity_idx` makes the equality cheap.
 	if filters.get("agent_group"):
 		res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
 
@@ -3624,8 +3528,9 @@ def _qb_in_condition(col, field, values, negate=False):
 	"""`col in (...)` / `not in (...)` with frappe's NULL semantics.
 
 	Frappe renders `ifnull(col, '') in (...)` whenever the list can involve a
-	blank, which is what makes `agent_group in ["Support", ""]` match untagged
-	tickets — the whole basis of the team restriction's "my teams OR untagged".
+	blank, so `agent_group in ["Support", ""]` matches untagged tickets too. A
+	bare pypika isin() does not, and the cards aggregate would then disagree with
+	the list it sits above.
 	"""
 	values = list(values if isinstance(values, (list, tuple)) else [values])
 	target = _qb_filter_target(col, field, "not in" if negate else "in", values)
