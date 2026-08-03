@@ -57,6 +57,7 @@ def ensure_unity_custom_fields():
 		unity_helpdesk_portal_origin_fields,
 		unity_helpdesk_student_search_fields,
 		unity_reply_link_field,
+		unity_team_color_field,
 		unity_ticket_message_search_fields,
 		unity_ticket_sort_indexes,
 		unity_ticket_type_color_field,
@@ -69,6 +70,7 @@ def ensure_unity_custom_fields():
 	unity_reply_link_field.execute()
 	unity_bulk_email_recipients_field.execute()
 	unity_ticket_type_color_field.execute()
+	unity_team_color_field.execute()
 	unity_canned_response_extension.execute()
 	unity_ticket_type_index.execute()
 	# Sort indexes last: they only need the columns above to exist.

@@ -833,7 +833,12 @@
                   <button
                     type="button"
                     class="select-chip assign-trigger"
-                    :class="assignmentClass(editState[ticket.name].assignee)"
+                    :class="
+                      !assignTeamStyle(ticket) &&
+                      assignmentClass(editState[ticket.name].assignee)
+                    "
+                    :style="assignTeamStyle(ticket) || null"
+                    :title="assignTeamTitle(ticket)"
                     :disabled="isSaving(ticket.name)"
                     @click.stop="openAssign(ticket, $event)"
                   >
@@ -2040,8 +2045,9 @@ async function loadLookups() {
   // Agent Group is a PRIMARY dropdown now, so its options have to be there on
   // first paint — unlike the Filter popover's link choices, which can stay lazy.
   // Fired unconditionally (and not awaited below) because the parent never
-  // provides teams, only agents and ticket types.
-  loadAgentGroups();
+  // provides teams, only agents and ticket types. force=true so a team colour
+  // changed in Settings is picked up rather than served from a stale list.
+  loadAgentGroups(true);
   // If the parent already provided lookups, we're already in sync via the
   // watchers above — no need to round-trip the network again.
   if (
@@ -2200,6 +2206,13 @@ async function applyBulkUpdate() {
                 email: assignAgent.email,
               }
             : null;
+          // The server-side ToDo hook may have moved agent_group to the new
+          // assignee's team, and this optimistic patch can't know which. Drop
+          // the stale value rather than leave the chip tinted with the OLD
+          // team's colour — untinted-until-refresh is honest, wrong-colour is
+          // not. The inline (non-bulk) path doesn't need this: quickUpdate
+          // replaces the row with the server's response.
+          delete row.agent_group;
         } else {
           row[bulkField.value] = bulkValue.value;
         }
@@ -2342,12 +2355,17 @@ function setConditions(rows) {
 // Teams back both the primary Agent Group dropdown and the popover's link
 // choices, so this is fetched on mount. Idempotent and never throws — an empty
 // list just means the dropdown has only "All".
-async function loadAgentGroups() {
-  if (agentGroups.value.length) return;
+// `force` refetches even when we already have teams. Used on mount and on
+// Refresh, because this list now carries the per-team COLOUR that tints the
+// Assigned To chip — an admin changing a colour in Settings must not be stuck
+// looking at the old one (e.g. with the list open in a second tab). It's four
+// rows; the guard only exists to spare the lazy callers a duplicate fetch.
+async function loadAgentGroups(force = false) {
+  if (!force && agentGroups.value.length) return;
   try {
     agentGroups.value = (await listAgentGroups()) || [];
   } catch {
-    agentGroups.value = [];
+    if (!agentGroups.value.length) agentGroups.value = [];
   }
 }
 
@@ -2525,6 +2543,10 @@ async function clearSearch() {
 }
 
 function refreshList() {
+  // Also re-pull teams: they carry the colour that tints the Assigned To chip,
+  // so Refresh is the obvious way for an admin to see a colour they just
+  // changed in Settings without reloading the whole page.
+  loadAgentGroups(true);
   reload();
 }
 
@@ -2952,6 +2974,41 @@ function openTicket(name, event) {
 
 function assignmentClass(assignee) {
   return assignee ? "blue" : "pink";
+}
+
+// Inline tint for the Assigned To chip, from the colour picked against the
+// ticket's TEAM in Settings > Team Settings. Same shape and "+1a" (~10%)
+// background wash as ticketTypeStyle, so the two read as one system.
+//
+// Keyed on ticket.agent_group rather than resolving assignee -> team: the group
+// is already on every row, and it is the exact value the Agent Group column and
+// filter show, so the chip can never disagree with the column beside it.
+function teamStyle(agentGroup) {
+  if (!agentGroup) return null;
+  const match = (agentGroups.value || []).find(
+    (t) => t && t.name === agentGroup
+  );
+  const color = match?.custom_color;
+  if (!color || !/^#[0-9a-fA-F]{6}$/.test(color)) return null;
+  return {
+    color: color,
+    background: color + "1a",
+    borderColor: color,
+  };
+}
+
+// Precedence, deliberately: an UNASSIGNED ticket stays pink even when it still
+// carries a team, because the chip is about who holds it, not which queue it
+// sits in. Returning null is what hands control back to assignmentClass.
+function assignTeamStyle(ticket) {
+  if (!editState[ticket.name]?.assignee) return null;
+  return teamStyle(ticket.agent_group);
+}
+
+function assignTeamTitle(ticket) {
+  const who = assigneeLabel(editState[ticket.name]?.assignee);
+  if (!who) return "Unassigned";
+  return ticket.agent_group ? `${who} — ${ticket.agent_group}` : who;
 }
 
 // --- Searchable "Assigned To" cell ---

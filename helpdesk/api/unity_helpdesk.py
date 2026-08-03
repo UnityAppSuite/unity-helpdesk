@@ -300,7 +300,10 @@ AVAILABLE_TICKET_COLUMNS = [
 	{"key": "custom_is_on_hold", "label": "Issues On Hold", "default": True, "fixed": False, "width": 140},
 	{"key": "custom_hold_reason", "label": "Reason Of Hold", "default": True, "fixed": False, "width": 200},
 	{"key": "raised_by", "label": "Raised By", "default": False, "fixed": False, "width": 220},
-	{"key": "agent_group", "label": "Agent Group", "default": False, "fixed": False, "width": 150},
+	# Default-on: it now tracks the assignee automatically (see
+	# helpdesk/api/unity_agent_group.py), so it has to be visible for that to
+	# mean anything.
+	{"key": "agent_group", "label": "Agent Group", "default": True, "fixed": False, "width": 150},
 	{"key": "modified", "label": "Last Updated", "default": False, "fixed": False, "width": 130},
 	# Relative-time twin of "Last Updated" — `modified` is likewise always fetched.
 	{"key": "modified_age", "label": "Last Modified", "default": True, "fixed": False, "width": 130, "virtual": True},
@@ -324,7 +327,7 @@ COLUMN_PREFS_MAX_ITEMS = 100
 # without their manual action — while still letting them hide it afterwards (the
 # flag stops us re-adding it on every load). Users with no saved prefs already get
 # these via _default_column_preferences() since they're marked default:True.
-NEWLY_DEFAULTED_COLUMNS = ["owner", "creation_age", "modified_age"]
+NEWLY_DEFAULTED_COLUMNS = ["owner", "creation_age", "modified_age", "agent_group"]
 COLUMN_AUTOADD_DEFAULT_KEY = "unity_helpdesk_columns_autoadded"
 
 DEFAULT_TICKET_ORDER_BY = "modified desc"
@@ -783,10 +786,14 @@ DEFAULT_COLUMN_ORDER = [
 	"custom_hold_reason",  # Reason Of Hold
 	"creation",  # Created On (exact datetime)
 	# Not in the requested sequence, so they follow it rather than disappearing
-	# from anyone's default view.
+	# from anyone's default view. `agent_group` is here rather than next to
+	# _assign (where it reads better) precisely because the first nine above are
+	# a layout the user specified exactly — see
+	# test_default_view_uses_the_requested_sequence.
 	"status",
 	"owner",
 	"custom_is_on_hold",
+	"agent_group",
 ]
 
 
@@ -2917,8 +2924,8 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 	# operator _build_filters can emit: unlike the other candidate probes, this
 	# one never re-queries through frappe.get_list, so an operator dropped here
 	# silently WIDENS the result set — the user gets rows their filter excluded,
-	# and base_filters also carries the view scoping (My Tickets / assigned-agent),
-	# so a drop can leak another agent's tickets. Hence: fold it, or raise; never skip.
+	# and (since the team restriction is one of these filters) rows they may not
+	# be allowed to see. Hence: fold it, or raise; never skip.
 	for filt in base_filters or []:
 		if not isinstance(filt, (list, tuple)) or len(filt) < 3:
 			continue
@@ -3388,9 +3395,117 @@ def _apply_assignee_filter(res, user):
 	res.append([TICKET_DOCTYPE, "name", "in", list(names)])
 
 
+def _user_teams(user=None):
+	"""[(team_name, ignore_restrictions)] for the given user, from HD Team.users.
+
+	HD Team.autoname is `field:team_name`, so a team's `name` IS the string stored
+	in HD Ticket.agent_group — no second lookup needed.
+
+	Reads HD Team Member (the `users` Table MultiSelect on HD Team), NOT
+	HD Agent.groups. Both exist and nothing keeps them in sync; HD Team.users is
+	the one upstream's own restriction query uses, and the one the desk Team
+	screen edits. (On this site HD Agent.groups holds 4 rows, all orphaned — the
+	parent HD Agent records don't exist — so it resolves nobody.)
+
+	ORDER BY is load-bearing, not tidiness: helpdesk.api.unity_agent_group picks
+	`[0]` as "the assignee's team" when stamping HD Ticket.agent_group, so an
+	unordered result would let a multi-team agent's tickets flap between teams
+	on successive assignments.
+	"""
+	user = user or _session_user()
+	cache = _request_cache().setdefault("_user_teams", {})
+	if user in cache:
+		return cache[user]
+	try:
+		rows = frappe.db.sql(
+			"""SELECT t.name AS team, t.ignore_restrictions AS ignore_restrictions
+			   FROM `tabHD Team Member` m
+			   JOIN `tabHD Team` t ON t.name = m.parent
+			   WHERE m.user = %s AND m.parenttype = 'HD Team'
+			   ORDER BY t.name""",
+			(user,),
+			as_dict=True,
+		)
+	except Exception:
+		# A site without the Helpdesk team tables is not a reason to 500 the list.
+		# Falling back to "no teams" is the safe direction: with restrictions off
+		# (the default) it changes nothing, and with them on it under-shares
+		# rather than over-shares.
+		frappe.log_error(frappe.get_traceback(), "Unity Helpdesk _user_teams")
+		rows = []
+	cache[user] = rows
+	return rows
+
+
+def _team_restriction_settings():
+	"""(restrict_by_team, allow_untagged) from HD Settings — the SAME two
+	switches upstream's own restriction reads, so Desk and Unity can't disagree.
+	Both default off, so this whole feature is inert until someone turns it on.
+	"""
+	row = frappe.db.get_value(
+		"HD Settings",
+		"HD Settings",
+		["restrict_tickets_by_agent_group", "do_not_restrict_tickets_without_an_agent_group"],
+	)
+	if not row:
+		return (0, 0)
+	return (row[0] or 0, row[1] or 0)
+
+
+def _team_restriction_filters():
+	"""Scope the ticket list to the current user's teams, or [] when unrestricted.
+
+	Semantics mirror HDTicket.get_list_filters (hd_ticket.py) so Unity and the
+	legacy desk agree, and reuse the SAME switches — HD Settings
+	`restrict_tickets_by_agent_group` plus the per-team `ignore_restrictions`
+	escape hatch — so this ships OFF and is enabled deliberately. Upstream's
+	version is unreachable from Unity: it only runs through
+	helpdesk.extends.client.get_list, which the Unity API never calls.
+
+	One quirk worth knowing: `agent_group in [..., ""]` is not a typo. Frappe's
+	DatabaseQuery keeps `can_be_null` true when an `in` list contains "" and
+	renders `ifnull(col, '') in (...)` (frappe/model/db_query.py), so the single
+	tuple means "one of my teams OR untagged". That's why this needs no
+	or_filters and no second query path — it stays an AND-able tuple and rides
+	the existing _build_filters choke point into the list, both search branches,
+	the cards aggregate and _summary_cache_key.
+	"""
+	restrict, allow_untagged = _team_restriction_settings()
+	if not int(restrict or 0):
+		return []
+	# Whoever administers the system must keep full visibility, or enabling this
+	# locks them out of tickets they're responsible for.
+	if _is_super_admin():
+		return []
+
+	teams = _user_teams()
+	if any(int(t.get("ignore_restrictions") or 0) for t in teams):
+		return []
+
+	allowed = [cstr(t.get("team")) for t in teams if cstr(t.get("team") or "").strip()]
+	if int(allow_untagged or 0):
+		# "" matches NULL/blank agent_group via the ifnull() rendering above.
+		allowed.append("")
+	if not allowed:
+		# In no team and untagged tickets are restricted too: match nothing,
+		# explicitly. Upstream builds Criterion.any([]) here, which is a latent
+		# bug — an empty OR is not "deny", and we don't want to find out which.
+		return [[TICKET_DOCTYPE, "name", "in", ["__unity_no_teams__"]]]
+	return [[TICKET_DOCTYPE, "agent_group", "in", allowed]]
+
+
 def _build_filters(view="all", filters=None, assigned_agent=None):
 	filters = frappe._dict(_parse_json(filters, {}) or {})
-	res = []
+	# Team scoping narrows the ALL-tickets view, and ONLY that view.
+	#
+	# It must never narrow a user's own assigned tickets: a ticket assigned to
+	# you has to be visible to you. Otherwise the two halves of this feature
+	# fight — assignment stamps agent_group with the assignee's team, but an
+	# assignee who is in NO team (52 of the 61 agents here) leaves the group
+	# alone, and the restriction would then hide the ticket from the very person
+	# it was just handed to. An already-assignee-scoped query is also narrower
+	# than any team filter could make it, so there is nothing to gain.
+	res = [] if (assigned_agent or view == "my") else list(_team_restriction_filters())
 
 	if assigned_agent:
 		_apply_assignee_filter(res, assigned_agent)
@@ -3416,7 +3531,9 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 			_apply_assignee_filter(res, filters.assigned_to)
 
 	# Agent Group = HD Ticket.agent_group (Link -> HD Team). A primary toolbar
-	# dropdown; `agent_group_unity_idx` makes the equality cheap.
+	# dropdown; `agent_group_unity_idx` makes the equality cheap. Independent of
+	# _team_restriction_filters above — that one bounds what you MAY see, this one
+	# narrows within it.
 	if filters.get("agent_group"):
 		res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
 
@@ -3528,9 +3645,8 @@ def _qb_in_condition(col, field, values, negate=False):
 	"""`col in (...)` / `not in (...)` with frappe's NULL semantics.
 
 	Frappe renders `ifnull(col, '') in (...)` whenever the list can involve a
-	blank, so `agent_group in ["Support", ""]` matches untagged tickets too. A
-	bare pypika isin() does not, and the cards aggregate would then disagree with
-	the list it sits above.
+	blank, which is what makes `agent_group in ["Support", ""]` match untagged
+	tickets — the whole basis of the team restriction's "my teams OR untagged".
 	"""
 	values = list(values if isinstance(values, (list, tuple)) else [values])
 	target = _qb_filter_target(col, field, "not in" if negate else "in", values)
@@ -4724,6 +4840,163 @@ def update_ticket_type_keywords(name, keywords=None):
 	frappe.db.set_value("HD Ticket Type", name, "keywords", joined)
 	frappe.cache().delete_value(_TICKET_TYPE_KEYWORD_CACHE_KEY)
 	return {"name": name, "keywords": cleaned}
+
+
+def _agent_group_options():
+	"""Teams + their colour for the ticket list, feature-detect style.
+
+	`custom_color` is appended ONLY when the column exists, exactly like
+	_ticket_type_options(). This is why the SPA calls a Unity endpoint instead
+	of a generic frappe.client.get_list: a client that names `custom_color`
+	itself gets "Unknown column" on a site that hasn't run the schema patch,
+	which would take out the Agent Group FILTER and the bulk-edit dialog, not
+	just the colour. Letting the server decide the field list keeps a
+	half-migrated site fully functional, minus the tint.
+	"""
+	fields = ["name"]
+	if frappe.db.has_column("HD Team", "custom_color"):
+		fields.append("custom_color")
+	return frappe.get_all("HD Team", fields=fields, order_by="name asc", page_length=0)
+
+
+@frappe.whitelist()
+def get_agent_groups():
+	"""Team list for the SPA (filter dropdown, bulk edit, chip colour)."""
+	_require_unity_access()
+	return _agent_group_options()
+
+
+def _normalize_hex_color(value):
+	"""'' -> None; #abc -> #aabbcc; anything else validated loosely.
+
+	The 3-char expansion is not cosmetic. The renderer only honours
+	/^#[0-9a-fA-F]{6}$/, so a saved `#abc` would be accepted here, stored
+	happily, and then silently never render — with no error anywhere. The
+	ticket-type colour endpoint has exactly that trap; don't reproduce it.
+	"""
+	color_value = cstr(value or "").strip()
+	if not color_value:
+		return None
+	if not (color_value.startswith("#") and 4 <= len(color_value) <= 9):
+		frappe.throw(_("Color must be a hex string like #3b82f6 (got {0})").format(color_value))
+	body = color_value[1:]
+	if len(body) == 3 and all(c in "0123456789abcdefABCDEF" for c in body):
+		return "#" + "".join(c * 2 for c in body).lower()
+	return color_value
+
+
+def _require_team_admin():
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage teams"), frappe.PermissionError)
+	return capabilities
+
+
+def _require_team(name):
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("Team name is required"))
+	if not frappe.db.exists("HD Team", name):
+		frappe.throw(_("Team {0} not found").format(name), frappe.DoesNotExistError)
+	return name
+
+
+@frappe.whitelist()
+def list_teams():
+	"""Teams with their colour and members, for the Settings page.
+
+	`custom_color` is appended ONLY when the column exists — the same
+	feature-detect contract `_ticket_type_options()` uses. The SPA checks for
+	the key's presence and hides the whole Color column when it's absent, so a
+	site that hasn't run the schema patch degrades quietly instead of erroring.
+	"""
+	_require_team_admin()
+	fields = ["name", "ignore_restrictions"]
+	has_color = frappe.db.has_column("HD Team", "custom_color")
+	if has_color:
+		fields.append("custom_color")
+	teams = frappe.get_all("HD Team", fields=fields, order_by="name asc", page_length=0)
+
+	# One query for every membership row rather than N child-table loads.
+	members = frappe.get_all(
+		"HD Team Member",
+		filters={"parenttype": "HD Team"},
+		fields=["parent", "user"],
+		order_by="parent asc, idx asc",
+		page_length=0,
+	)
+	by_team = {}
+	for row in members:
+		by_team.setdefault(row.parent, []).append(row.user)
+
+	for team in teams:
+		team["users"] = by_team.get(team["name"], [])
+	return teams
+
+
+@frappe.whitelist()
+def update_team_color(name, color=None):
+	"""Set the SPA-displayed colour on an HD Team; empty string clears it.
+
+	The Unity ticket list tints the Assigned To chip with the colour of the
+	ticket's `agent_group`, which IS this team's name (HD Team.autoname is
+	`field:team_name`). Admins only — same gate as the ticket-type colour.
+	"""
+	_require_team_admin()
+	name = _require_team(name)
+	color_value = _normalize_hex_color(color)
+	if not frappe.db.has_column("HD Team", "custom_color"):
+		# Silent no-op when the schema patch hasn't applied on this site — the
+		# SPA hides the Color column anyway (see list_teams), so surfacing a
+		# 'run bench migrate' error to an end user would help nobody.
+		frappe.logger().warning(
+			"update_team_color: custom_color column missing on tabHD Team; "
+			"skipped colour update for %s",
+			name,
+		)
+		return {"name": name, "custom_color": None, "skipped": True}
+	frappe.db.set_value("HD Team", name, "custom_color", color_value)
+	return {"name": name, "custom_color": color_value}
+
+
+@frappe.whitelist()
+def update_team_members(name, users=None):
+	"""Replace a team's member list wholesale.
+
+	Whole-list replace rather than add/remove: it's one idempotent call, and it
+	matches how a Table MultiSelect is edited everywhere else.
+
+	This is NOT cosmetic. HD Team.users is what `_user_teams()` reads, so a
+	change here immediately affects (a) which team gets stamped on the member's
+	next ticket assignment, via unity_agent_group.sync_agent_group_for_ticket,
+	and (b) what they can see if the team visibility restriction is enabled.
+
+	Safe to save: hd_team.py defines only after_insert / after_rename /
+	on_trash — no validate or on_update — so this triggers no Assignment Rule
+	churn. Rotations are driven by HD Agent.groups, a different child table.
+	"""
+	_require_team_admin()
+	name = _require_team(name)
+
+	wanted = _parse_json(users, []) or []
+	if isinstance(wanted, str):
+		wanted = [wanted]
+	cleaned = []
+	for entry in wanted:
+		user = cstr(entry or "").strip()
+		if user and user not in cleaned:  # dedupe, preserve order
+			cleaned.append(user)
+
+	missing = [u for u in cleaned if not frappe.db.exists("User", u)]
+	if missing:
+		frappe.throw(_("Unknown user(s): {0}").format(", ".join(missing)))
+
+	doc = frappe.get_doc("HD Team", name)
+	doc.set("users", [{"user": u} for u in cleaned])
+	doc.save(ignore_permissions=True)
+	# _user_teams memoises per request on frappe.local; nothing to invalidate
+	# beyond this request, and the next one re-queries.
+	return {"name": name, "users": cleaned}
 
 
 @frappe.whitelist()

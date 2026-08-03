@@ -126,14 +126,21 @@ class TestBulkUpdateTickets(FrappeTestCase):
 			frappe.db.set_value("HD Ticket", name, "priority", "Medium", update_modified=False)
 		frappe.db.commit()
 
-	def test_bulk_assign_calls_assign_helper(self):
-		# Verify _assign routes through the assignment helper rather than writing
-		# the JSON field directly — keeps tabToDo / activity log in sync.
-		with patch("helpdesk.api.unity_helpdesk.assign_ticket_to_agent") as mock_assign:
+	def test_bulk_assign_goes_through_assign_to(self):
+		# Verify _assign creates real ToDos via frappe.desk.form.assign_to rather
+		# than writing the `_assign` JSON directly. That matters twice over:
+		# ToDo is the authoritative assignment record, AND it is the doc_event
+		# the agent_group sync hangs off (helpdesk/api/unity_agent_group.py) —
+		# writing `_assign` directly would assign the ticket but never move the
+		# Agent Group.
+		#
+		# NOTE: this used to patch `assign_ticket_to_agent` and had been failing
+		# since bulk_update_tickets was changed to call assign_to_add directly.
+		with patch("helpdesk.api.unity_helpdesk.assign_to_add") as mock_add:
 			res = bulk_update_tickets(self.tickets, "_assign", "agent@example.com")
 		self.assertEqual(set(res["updated"]), set(self.tickets))
-		self.assertEqual(mock_assign.call_count, len(self.tickets))
-		called_with = {call.args[0] for call in mock_assign.call_args_list}
+		self.assertEqual(mock_add.call_count, len(self.tickets))
+		called_with = {call.args[0]["name"] for call in mock_add.call_args_list}
 		self.assertEqual(called_with, set(self.tickets))
 
 	def test_bulk_clear_assignment(self):

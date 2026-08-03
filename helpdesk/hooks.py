@@ -60,6 +60,20 @@ doc_events = {
 		"after_insert": "helpdesk.helpdesk.hooks.search_index.on_comment_after_insert",
 		"on_update": "helpdesk.helpdesk.hooks.search_index.on_comment_on_update",
 	},
+	# Assignment fires NO event on HD Ticket — `_assign` is a denormalised cache
+	# that ToDo.update_in_reference() rewrites with a raw db.set_value. ToDo is
+	# the only hook point downstream of all five assignment writers (the two
+	# unity_helpdesk_ext endpoints, the bulk bar, Assignment Rules, and the Desk
+	# UI), which is why agent_group is synced from here. See
+	# helpdesk/api/unity_agent_group.py.
+	# `on_update` ONLY — do not add after_insert. Document.run_post_save_methods()
+	# runs on_update for inserts too, so after_insert would double-fire; worse, it
+	# runs BEFORE ToDo.update_in_reference() takes its `tabToDo … FOR UPDATE`,
+	# giving us the reverse lock order (HD Ticket then ToDo) against every
+	# concurrent assignment.
+	"ToDo": {
+		"on_update": "helpdesk.api.unity_agent_group.on_todo_change",
+	},
 }
 
 has_permission = {

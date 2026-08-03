@@ -44,3 +44,4 @@ helpdesk.patches.unity_ticket_raised_by_modified_index
 helpdesk.patches.unity_bulk_email_batch_id_field
 helpdesk.patches.unity_search_field_widths
 helpdesk.patches.unity_ticket_sort_indexes
+helpdesk.patches.unity_team_color_field

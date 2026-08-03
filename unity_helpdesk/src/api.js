@@ -372,6 +372,29 @@ export async function updateTicketTypeColor(name, color) {
   });
 }
 
+// --- Team Settings (admin only; all three gate on can_manage_unity_settings) ---
+
+export async function listTeams() {
+  return (await call("helpdesk.api.unity_helpdesk.list_teams")) || [];
+}
+
+export async function updateTeamColor(name, color) {
+  return call("helpdesk.api.unity_helpdesk.update_team_color", {
+    name,
+    color: color || "",
+  });
+}
+
+// Replaces the whole member list. NOT cosmetic — membership drives which team
+// gets stamped on that person's next assignment, and what they can see if the
+// team visibility restriction is switched on.
+export async function updateTeamMembers(name, users) {
+  return call("helpdesk.api.unity_helpdesk.update_team_members", {
+    name,
+    users: users || [],
+  });
+}
+
 export async function updateUnitySettings(params) {
   return call("helpdesk.api.unity_helpdesk.update_unity_settings", params);
 }
@@ -433,13 +456,12 @@ export async function bulkUpdateTickets(names, field, value) {
 }
 
 export async function listAgentGroups() {
-  const rows = await call("frappe.client.get_list", {
-    doctype: "HD Team",
-    fields: ["name"],
-    page_length: 200,
-    order_by: "name asc",
-  });
-  return rows || [];
+  // A Unity endpoint rather than a generic frappe.client.get_list: it decides
+  // whether to include `custom_color` based on whether the column exists. If
+  // the CLIENT named that field, a site that hasn't run the schema patch would
+  // get "Unknown column" and lose the Agent Group filter and bulk-edit dialog
+  // along with the colour.
+  return (await call("helpdesk.api.unity_helpdesk.get_agent_groups")) || [];
 }
 
 // Priorities for the generic filter popover. Read live rather than hardcoded so

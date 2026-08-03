@@ -2384,6 +2384,80 @@ tbody tr.bulk-email-ticket:hover {
   background: transparent;
 }
 
+/* Team Settings member picker. Explicitly NOT a native <select multiple>: in
+   that control a plain click discards the entire existing selection, which
+   silently wiped team members. Here each row toggles. */
+.member-picker {
+  min-width: 260px;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.member-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.member-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #f8fafc;
+  font-size: 12px;
+}
+.member-chip-remove {
+  border: none;
+  background: none;
+  color: #ef4444;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.member-search {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  font-size: 13px;
+}
+.member-options {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 190px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.member-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.member-option:hover {
+  background: #f1f5f9;
+}
+.member-option.selected {
+  background: #eef2ff;
+  font-weight: 600;
+}
+.member-option.disabled {
+  color: var(--muted);
+  cursor: default;
+}
+.member-option input[type="checkbox"] {
+  pointer-events: none; /* the whole row is the hit target */
+}
+
 .ticket-origin-tag {
   display: inline-block;
   margin-left: 6px;
