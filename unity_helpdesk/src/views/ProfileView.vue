@@ -194,6 +194,166 @@
           </div>
         </SettingsCard>
 
+        <!-- ============================== TEAMS ============================== -->
+        <SettingsCard
+          v-if="canManageUnitySettings"
+          title="Team Settings"
+          subtitle="Give each team a colour — the Assigned To chip in the ticket list is tinted with the colour of the ticket's Agent Group. Members are not cosmetic: adding someone changes which team is stamped on their next assignment."
+          :model-value="sections.teams"
+          @update:model-value="(v) => (sections.teams = v)"
+        >
+          <p v-if="teamError" class="error">{{ teamError }}</p>
+          <div class="scroll-x">
+            <table>
+              <thead>
+                <tr>
+                  <th>Team</th>
+                  <th v-if="teamColorAvailable" style="width: 90px">Color</th>
+                  <th>
+                    Members
+                    <small class="muted" style="font-weight: normal">
+                      — a ticket assigned to a member gets stamped with this
+                      team.
+                    </small>
+                  </th>
+                  <th style="width: 150px">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="team in teams" :key="team.name">
+                  <td>{{ team.name }}</td>
+                  <td v-if="teamColorAvailable">
+                    <template v-if="editingTeam.name === team.name">
+                      <input
+                        v-model="editingTeam.colorInput"
+                        type="color"
+                        class="ticket-type-color-input"
+                        title="Pick color for this team"
+                      />
+                    </template>
+                    <template v-else>
+                      <span class="ticket-type-pill">
+                        <span
+                          class="ticket-type-dot"
+                          :style="{
+                            background: team.custom_color || '#94a3b8',
+                          }"
+                        ></span>
+                        <span v-if="!team.custom_color" class="muted"
+                          >none</span
+                        >
+                      </span>
+                    </template>
+                  </td>
+                  <td>
+                    <template v-if="editingTeam.name === team.name">
+                      <!-- Deliberately NOT a native <select multiple>: there a
+                           plain click REPLACES the whole selection, which
+                           silently wiped members. Click here toggles. -->
+                      <div class="member-picker">
+                        <div
+                          v-if="editingTeam.members.length"
+                          class="member-chips"
+                        >
+                          <span
+                            v-for="user in editingTeam.members"
+                            :key="user"
+                            class="member-chip"
+                          >
+                            {{ agentLabel(user) }}
+                            <button
+                              type="button"
+                              class="member-chip-remove"
+                              :title="`Remove ${agentLabel(user)}`"
+                              @click="toggleMember(user)"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        </div>
+                        <input
+                          v-model="memberSearch"
+                          type="text"
+                          class="member-search"
+                          placeholder="Search agents to add…"
+                        />
+                        <ul class="member-options">
+                          <li
+                            v-for="agent in memberCandidates"
+                            :key="agent.name"
+                            class="member-option"
+                            :class="{
+                              selected: editingTeam.members.includes(
+                                agent.name
+                              ),
+                            }"
+                            @click="toggleMember(agent.name)"
+                          >
+                            <input
+                              type="checkbox"
+                              :checked="
+                                editingTeam.members.includes(agent.name)
+                              "
+                              tabindex="-1"
+                            />
+                            <span>{{ agent.full_name || agent.name }}</span>
+                          </li>
+                          <li
+                            v-if="!memberCandidates.length"
+                            class="member-option disabled"
+                          >
+                            No match
+                          </li>
+                        </ul>
+                        <small class="muted">
+                          {{ editingTeam.members.length }} selected — click to
+                          add or remove.
+                        </small>
+                      </div>
+                    </template>
+                    <template v-else>
+                      <span v-if="!team.users?.length" class="muted"
+                        >No members</span
+                      >
+                      <span v-else>{{ teamMemberLabels(team) }}</span>
+                    </template>
+                  </td>
+                  <td>
+                    <template v-if="editingTeam.name === team.name">
+                      <button
+                        class="btn"
+                        :disabled="savingTeam"
+                        @click="saveTeamEdit"
+                      >
+                        {{ savingTeam ? "Saving..." : "Save" }}
+                      </button>
+                      <button
+                        class="btn secondary"
+                        :disabled="savingTeam"
+                        @click="cancelTeamEdit"
+                      >
+                        Cancel
+                      </button>
+                    </template>
+                    <button
+                      v-else
+                      class="btn secondary"
+                      @click="startTeamEdit(team)"
+                    >
+                      Edit
+                    </button>
+                  </td>
+                </tr>
+                <tr v-if="!teams.length">
+                  <td :colspan="teamColorAvailable ? 4 : 3" class="empty">
+                    No teams found.
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </SettingsCard>
+
         <!-- ============================ CATEGORIES ============================ -->
         <SettingsCard
           v-if="canManageUnitySettings"
@@ -590,9 +750,12 @@ import {
   getTicketTypes,
   listReplyTemplateCategoriesAdmin,
   listReplyTemplatesAdmin,
+  listTeams,
   listTicketTypesWithKeywords,
   updateReplyTemplate,
   updateReplyTemplateCategory,
+  updateTeamColor,
+  updateTeamMembers,
   updateTicketTypeColor,
   updateTicketTypeKeywords,
   updateUnitySettings,
@@ -662,6 +825,7 @@ const sections = reactive({
   profile: false,
   unity: false,
   ticketTypes: false,
+  teams: false,
   categories: false,
   templates: false,
   agents: false,
@@ -704,12 +868,51 @@ const colorColumnAvailable = computed(() =>
     Object.prototype.hasOwnProperty.call(t, "custom_color")
   )
 );
+// --- Team settings state ---
+// <input type="color"> refuses a blank value, so "no colour" has to be
+// represented by a real hex in the picker. Named so the "did the admin
+// actually choose this?" check below can reference it.
+const NEUTRAL_SWATCH = "#94a3b8";
+const teams = ref([]);
+const teamError = ref("");
+const savingTeam = ref(false);
+// Same feature-detect as colorColumnAvailable: list_teams omits the key
+// entirely when the schema patch hasn't run, so the Color column hides itself
+// rather than offering a picker whose saves silently no-op.
+const teamColorAvailable = computed(() =>
+  teams.value.some((t) =>
+    Object.prototype.hasOwnProperty.call(t, "custom_color")
+  )
+);
+const editingTeam = reactive({
+  name: "",
+  colorInput: NEUTRAL_SWATCH,
+  originalColor: "",
+  members: [],
+  originalMembers: [],
+});
+const memberSearch = ref("");
+const memberCandidates = computed(() => {
+  const q = memberSearch.value.trim().toLowerCase();
+  const list = agents.value || [];
+  if (!q) return list;
+  return list.filter(
+    (a) =>
+      String(a.full_name || "")
+        .toLowerCase()
+        .includes(q) ||
+      String(a.name || "")
+        .toLowerCase()
+        .includes(q)
+  );
+});
+
 const savingTicketType = ref(false);
 const newTicketType = reactive({ name: "", description: "", priority: "" });
 const editingTicketType = reactive({
   name: "",
   keywordsInput: "",
-  colorInput: "#94a3b8",
+  colorInput: NEUTRAL_SWATCH,
   originalColor: "",
 });
 
@@ -834,6 +1037,7 @@ onMounted(async () => {
   if (canManageUnitySettings.value) {
     loadCategories();
     loadTemplates();
+    loadTeams();
   }
   if (canManageAgents.value) {
     loadAgents();
@@ -853,6 +1057,7 @@ watch(canManageUnitySettings, (value) => {
   if (value) {
     loadCategories();
     loadTemplates();
+    loadTeams();
   }
 });
 
@@ -928,6 +1133,86 @@ function cancelTicketTypeEdit() {
   editingTicketType.keywordsInput = "";
   editingTicketType.colorInput = "#94a3b8";
   editingTicketType.originalColor = "";
+}
+
+// --- Team settings ---
+
+async function loadTeams() {
+  try {
+    teams.value = await listTeams();
+  } catch {
+    teams.value = [];
+  }
+}
+
+function agentLabel(user) {
+  return agents.value.find((a) => a.name === user)?.full_name || user;
+}
+
+function teamMemberLabels(team) {
+  return (team.users || []).map(agentLabel).join(", ");
+}
+
+// Add/remove one person at a time. The whole point of replacing the native
+// <select multiple>: there, a plain click discards every other selection.
+function toggleMember(user) {
+  const i = editingTeam.members.indexOf(user);
+  if (i === -1) editingTeam.members.push(user);
+  else editingTeam.members.splice(i, 1);
+}
+
+function startTeamEdit(team) {
+  editingTeam.name = team.name;
+  // <input type="color"> refuses anything but a valid hex, so an unset colour
+  // has to seed with the neutral swatch rather than "".
+  editingTeam.colorInput = team.custom_color || NEUTRAL_SWATCH;
+  editingTeam.originalColor = team.custom_color || "";
+  editingTeam.members = [...(team.users || [])];
+  editingTeam.originalMembers = [...(team.users || [])];
+  memberSearch.value = "";
+}
+
+function cancelTeamEdit() {
+  editingTeam.name = "";
+  editingTeam.colorInput = NEUTRAL_SWATCH;
+  editingTeam.originalColor = "";
+  editingTeam.members = [];
+  editingTeam.originalMembers = [];
+  memberSearch.value = "";
+}
+
+async function saveTeamEdit() {
+  if (!editingTeam.name) return;
+  savingTeam.value = true;
+  teamError.value = "";
+  try {
+    // Each half is saved only when it actually changed, so tweaking a colour
+    // doesn't rewrite the membership child table (and vice versa).
+    const promises = [];
+    const newColor = editingTeam.colorInput || "";
+    // The picker has to be seeded with a valid hex, so an untouched colourless
+    // team reads back as the neutral swatch. Saving that would silently give
+    // every edited team a grey colour nobody chose.
+    const colorTouched =
+      newColor !== editingTeam.originalColor &&
+      !(!editingTeam.originalColor && newColor === NEUTRAL_SWATCH);
+    if (colorTouched) {
+      promises.push(updateTeamColor(editingTeam.name, newColor));
+    }
+    const before = [...editingTeam.originalMembers].sort().join("|");
+    const after = [...editingTeam.members].sort().join("|");
+    if (before !== after) {
+      promises.push(updateTeamMembers(editingTeam.name, editingTeam.members));
+    }
+    if (promises.length) await Promise.all(promises);
+
+    cancelTeamEdit();
+    await loadTeams();
+  } catch (err) {
+    teamError.value = err.message;
+  } finally {
+    savingTeam.value = false;
+  }
 }
 
 async function saveTicketTypeEdit() {

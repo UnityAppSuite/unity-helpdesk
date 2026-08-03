@@ -4842,6 +4842,163 @@ def update_ticket_type_keywords(name, keywords=None):
 	return {"name": name, "keywords": cleaned}
 
 
+def _agent_group_options():
+	"""Teams + their colour for the ticket list, feature-detect style.
+
+	`custom_color` is appended ONLY when the column exists, exactly like
+	_ticket_type_options(). This is why the SPA calls a Unity endpoint instead
+	of a generic frappe.client.get_list: a client that names `custom_color`
+	itself gets "Unknown column" on a site that hasn't run the schema patch,
+	which would take out the Agent Group FILTER and the bulk-edit dialog, not
+	just the colour. Letting the server decide the field list keeps a
+	half-migrated site fully functional, minus the tint.
+	"""
+	fields = ["name"]
+	if frappe.db.has_column("HD Team", "custom_color"):
+		fields.append("custom_color")
+	return frappe.get_all("HD Team", fields=fields, order_by="name asc", page_length=0)
+
+
+@frappe.whitelist()
+def get_agent_groups():
+	"""Team list for the SPA (filter dropdown, bulk edit, chip colour)."""
+	_require_unity_access()
+	return _agent_group_options()
+
+
+def _normalize_hex_color(value):
+	"""'' -> None; #abc -> #aabbcc; anything else validated loosely.
+
+	The 3-char expansion is not cosmetic. The renderer only honours
+	/^#[0-9a-fA-F]{6}$/, so a saved `#abc` would be accepted here, stored
+	happily, and then silently never render — with no error anywhere. The
+	ticket-type colour endpoint has exactly that trap; don't reproduce it.
+	"""
+	color_value = cstr(value or "").strip()
+	if not color_value:
+		return None
+	if not (color_value.startswith("#") and 4 <= len(color_value) <= 9):
+		frappe.throw(_("Color must be a hex string like #3b82f6 (got {0})").format(color_value))
+	body = color_value[1:]
+	if len(body) == 3 and all(c in "0123456789abcdefABCDEF" for c in body):
+		return "#" + "".join(c * 2 for c in body).lower()
+	return color_value
+
+
+def _require_team_admin():
+	capabilities = _require_unity_access()
+	if not capabilities.can_manage_unity_settings:
+		frappe.throw(_("You are not allowed to manage teams"), frappe.PermissionError)
+	return capabilities
+
+
+def _require_team(name):
+	name = cstr(name or "").strip()
+	if not name:
+		frappe.throw(_("Team name is required"))
+	if not frappe.db.exists("HD Team", name):
+		frappe.throw(_("Team {0} not found").format(name), frappe.DoesNotExistError)
+	return name
+
+
+@frappe.whitelist()
+def list_teams():
+	"""Teams with their colour and members, for the Settings page.
+
+	`custom_color` is appended ONLY when the column exists — the same
+	feature-detect contract `_ticket_type_options()` uses. The SPA checks for
+	the key's presence and hides the whole Color column when it's absent, so a
+	site that hasn't run the schema patch degrades quietly instead of erroring.
+	"""
+	_require_team_admin()
+	fields = ["name", "ignore_restrictions"]
+	has_color = frappe.db.has_column("HD Team", "custom_color")
+	if has_color:
+		fields.append("custom_color")
+	teams = frappe.get_all("HD Team", fields=fields, order_by="name asc", page_length=0)
+
+	# One query for every membership row rather than N child-table loads.
+	members = frappe.get_all(
+		"HD Team Member",
+		filters={"parenttype": "HD Team"},
+		fields=["parent", "user"],
+		order_by="parent asc, idx asc",
+		page_length=0,
+	)
+	by_team = {}
+	for row in members:
+		by_team.setdefault(row.parent, []).append(row.user)
+
+	for team in teams:
+		team["users"] = by_team.get(team["name"], [])
+	return teams
+
+
+@frappe.whitelist()
+def update_team_color(name, color=None):
+	"""Set the SPA-displayed colour on an HD Team; empty string clears it.
+
+	The Unity ticket list tints the Assigned To chip with the colour of the
+	ticket's `agent_group`, which IS this team's name (HD Team.autoname is
+	`field:team_name`). Admins only — same gate as the ticket-type colour.
+	"""
+	_require_team_admin()
+	name = _require_team(name)
+	color_value = _normalize_hex_color(color)
+	if not frappe.db.has_column("HD Team", "custom_color"):
+		# Silent no-op when the schema patch hasn't applied on this site — the
+		# SPA hides the Color column anyway (see list_teams), so surfacing a
+		# 'run bench migrate' error to an end user would help nobody.
+		frappe.logger().warning(
+			"update_team_color: custom_color column missing on tabHD Team; "
+			"skipped colour update for %s",
+			name,
+		)
+		return {"name": name, "custom_color": None, "skipped": True}
+	frappe.db.set_value("HD Team", name, "custom_color", color_value)
+	return {"name": name, "custom_color": color_value}
+
+
+@frappe.whitelist()
+def update_team_members(name, users=None):
+	"""Replace a team's member list wholesale.
+
+	Whole-list replace rather than add/remove: it's one idempotent call, and it
+	matches how a Table MultiSelect is edited everywhere else.
+
+	This is NOT cosmetic. HD Team.users is what `_user_teams()` reads, so a
+	change here immediately affects (a) which team gets stamped on the member's
+	next ticket assignment, via unity_agent_group.sync_agent_group_for_ticket,
+	and (b) what they can see if the team visibility restriction is enabled.
+
+	Safe to save: hd_team.py defines only after_insert / after_rename /
+	on_trash — no validate or on_update — so this triggers no Assignment Rule
+	churn. Rotations are driven by HD Agent.groups, a different child table.
+	"""
+	_require_team_admin()
+	name = _require_team(name)
+
+	wanted = _parse_json(users, []) or []
+	if isinstance(wanted, str):
+		wanted = [wanted]
+	cleaned = []
+	for entry in wanted:
+		user = cstr(entry or "").strip()
+		if user and user not in cleaned:  # dedupe, preserve order
+			cleaned.append(user)
+
+	missing = [u for u in cleaned if not frappe.db.exists("User", u)]
+	if missing:
+		frappe.throw(_("Unknown user(s): {0}").format(", ".join(missing)))
+
+	doc = frappe.get_doc("HD Team", name)
+	doc.set("users", [{"user": u} for u in cleaned])
+	doc.save(ignore_permissions=True)
+	# _user_teams memoises per request on frappe.local; nothing to invalidate
+	# beyond this request, and the next one re-queries.
+	return {"name": name, "users": cleaned}
+
+
 @frappe.whitelist()
 def get_agent_candidates(search=None, limit=AGENT_CANDIDATE_LIMIT):
 	capabilities = _require_unity_access()
