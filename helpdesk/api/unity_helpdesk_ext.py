@@ -303,6 +303,15 @@ def update_ticket(
                 frappe.log_error(frappe.get_traceback(), "Unity Helpdesk update_ticket assign_agent")
         else:
             clear_all_assignments(TICKET_DOCTYPE, name)
+        # LOST-UPDATE GUARD. `ticket` was loaded above, before the assignment.
+        # Assigning fires the ToDo hook that rewrites HD Ticket.agent_group
+        # (helpdesk/api/unity_agent_group.py) with a raw db.set_value — invisible
+        # to this in-memory doc. `ticket.save()` below issues a FULL-column
+        # UPDATE from get_valid_dict(), so without this reload it would write the
+        # STALE agent_group straight back over the hook's value, and the row this
+        # endpoint returns would show the old team. Nothing has been set() on
+        # `ticket` yet, so reloading here loses no pending edit.
+        ticket.reload()
 
     if status:
         if not on_hold_selected and status not in STATUS_OPTIONS:

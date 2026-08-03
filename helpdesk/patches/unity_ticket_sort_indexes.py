@@ -46,6 +46,11 @@ _INDEXES = (
 	(["resolution_by"], "resolution_by_unity_idx"),
 	(["first_responded_on"], "first_responded_on_unity_idx"),
 	(["resolution_date"], "resolution_date_unity_idx"),
+	# Not a sort index — agent_group backs the Agent Group toolbar filter and the
+	# team visibility restriction (`agent_group in (...)` on every list query when
+	# that setting is on). It exists on the dev site but was never in this tuple,
+	# so a fresh UAT/prod site would full-scan both.
+	(["agent_group"], "agent_group_unity_idx"),
 )
 
 
