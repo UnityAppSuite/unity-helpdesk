@@ -11,7 +11,7 @@ from frappe import _
 from frappe.desk.form.assign_to import add as assign_to_add, clear as clear_all_assignments
 from frappe.query_builder import Case, Order
 from frappe.query_builder.functions import Coalesce, Count, Sum
-from frappe.utils import add_days, add_months, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
+from frappe.utils import add_days, add_months, cint, cstr, get_datetime, get_first_day, get_last_day, get_url, getdate, nowdate
 
 from helpdesk.api.ticket import assign_ticket_to_agent
 from helpdesk.helpdesk.doctype.hd_ticket.api import (
@@ -35,7 +35,7 @@ PRIORITY_TARGETS = {
 # Candidate ticket rows fetched and ranked per search. Raised from 400 → 1000 so
 # broad/common queries are far less likely to silently drop the target ticket
 # below the cap. Ranking happens in Python over this bounded set, so the cost is
-# one indexed fetch + an O(n log n) sort — still fast at 1000.
+# one indexed fetch + an O(n log n) sort still fast at 1000.
 MAX_SEARCH_CANDIDATES = 1000
 # Top-N most-recently-assigned tickets we resolve via ToDo for the "My
 # Tickets" / "Assigned: X" filters. Set high enough that no real human
@@ -46,7 +46,7 @@ MAX_SEARCH_CANDIDATES = 1000
 # `_assign LIKE '%user%'` full-table scan, which is what made the SPA's
 # first paint hit 20–30 s.
 MAX_ASSIGNED_LOOKUP = 25000
-# Hard cap on rows returned by the ticket list endpoints — matches the largest
+# Hard cap on rows returned by the ticket list endpoints matches the largest
 # page-size option in the SPA and protects the query from unbounded fetches.
 MAX_TICKET_PAGE_LENGTH = 500
 UNITY_TICKET_FIELDS = [
@@ -63,7 +63,7 @@ UNITY_TICKET_FIELDS = [
 	# `description` is the full ticket HTML (often tens of KB of student/fee
 	# tables). It's fetched because the single-ticket / detail callers of
 	# _ticket_fields() (TicketDetailView renders it for bulk-email tickets) need
-	# it — but it's stripped from the *list* response via
+	# it but it's stripped from the *list* response via
 	# LIST_RESPONSE_EXCLUDED_FIELDS, since the ticket list never renders it and
 	# shipping it per row made a guardian-email search return ~1 MB/page and blow
 	# the SPA's 20 s search timeout.
@@ -93,20 +93,20 @@ OPTIONAL_TICKET_FIELDS = [
 	"custom_via_unity_portal",
 	"custom_is_bulk_email",
 	# Set by helpdesk.helpdesk.hooks.reply_link when an inbound reply chain
-	# resolves back to a bulk audit ticket — used by SPA for color + banner.
+	# resolves back to a bulk audit ticket used by SPA for color + banner.
 	"custom_replied_to_ticket",
 ]
 
 # Fields fetched for the candidate set because search ranking reads them
 # (`legacy_content_fields` in _ticket_search_documents) or because they are the
-# raw/HTML twin of a lighter field the SPA does use — but which the ticket *list*
+# raw/HTML twin of a lighter field the SPA does use but which the ticket *list*
 # never renders. They are stripped from the page response, after ranking has
 # already consumed them, so a search matching hundreds of tickets doesn't ship
 # megabytes of unused HTML to the browser (the root cause of the search timeout).
 # The detail view fetches its own copy of these via the single-ticket endpoint.
 # Anything here MUST stay out of AVAILABLE_TICKET_COLUMNS (none are user columns).
 LIST_RESPONSE_EXCLUDED_FIELDS = (
-	# Full ticket HTML — only the detail view (_decorate_ticket, singular) renders
+	# Full ticket HTML only the detail view (_decorate_ticket, singular) renders
 	# it; the list never does. Biggest single contributor to the search payload.
 	"description",
 	"custom_list_of_student",
@@ -131,7 +131,7 @@ def _session_user():
 def _request_cache():
 	"""Per-request scratch dict on frappe.local, cleared automatically between
 	requests. Used to memoize helpers (capabilities, roles, has-field checks)
-	that get called 3–8 times per `get_tickets` request — each individually
+	that get called 3–8 times per `get_tickets` request each individually
 	cheap, but together a measurable fraction of cold first-paint latency.
 	"""
 	cache = getattr(frappe.local, "_unity_request_cache", None)
@@ -251,7 +251,7 @@ def _parse_json(value, fallback):
 
 @functools.lru_cache(maxsize=256)
 def _has_field(doctype, fieldname):
-	# Schema doesn't change within a process — safe to cache forever.
+	# Schema doesn't change within a process safe to cache forever.
 	# `bench migrate` reloads the worker, so the cache is fresh after deploys.
 	return frappe.get_meta(doctype).has_field(fieldname)
 
@@ -290,7 +290,7 @@ AVAILABLE_TICKET_COLUMNS = [
 	# Relative-time twin of the column above ("2 months ago"), worded like the
 	# upstream Helpdesk list. Virtual: it's rendered client-side from `creation`,
 	# which is always fetched (UNITY_TICKET_FIELDS), so `virtual` keeps it out of
-	# _selected_column_fields() and — the reason it matters — out of the SPA's
+	# _selected_column_fields() and the reason it matters out of the SPA's
 	# columnNeedsFetch() reload path. There's no HD Ticket field to backfill, so
 	# adding this column must never trigger a refetch. Same for `modified_age`.
 	{"key": "creation_age", "label": "Created", "default": True, "fixed": False, "width": 130, "virtual": True},
@@ -305,7 +305,7 @@ AVAILABLE_TICKET_COLUMNS = [
 	# mean anything.
 	{"key": "agent_group", "label": "Agent Group", "default": True, "fixed": False, "width": 150},
 	{"key": "modified", "label": "Last Updated", "default": False, "fixed": False, "width": 130},
-	# Relative-time twin of "Last Updated" — `modified` is likewise always fetched.
+	# Relative-time twin of "Last Updated" `modified` is likewise always fetched.
 	{"key": "modified_age", "label": "Last Modified", "default": True, "fixed": False, "width": 130, "virtual": True},
 	{"key": "response_by", "label": "Response Due", "default": False, "fixed": False, "width": 140},
 	{"key": "resolution_by", "label": "Resolution Due", "default": False, "fixed": False, "width": 150},
@@ -324,7 +324,7 @@ COLUMN_PREFS_MAX_ITEMS = 100
 
 # Default columns introduced AFTER users already had saved column preferences. We
 # inject each ONCE (guarded by a per-user flag) so it appears for existing users
-# without their manual action — while still letting them hide it afterwards (the
+# without their manual action while still letting them hide it afterwards (the
 # flag stops us re-adding it on every load). Users with no saved prefs already get
 # these via _default_column_preferences() since they're marked default:True.
 NEWLY_DEFAULTED_COLUMNS = ["owner", "creation_age", "modified_age", "agent_group"]
@@ -380,7 +380,7 @@ TICKET_SORT_FIELDS = [
 ]
 # Deliberately EXCLUDED, and why:
 #   summary, hold_summary        virtual composites with no single backing column
-#   _assign                      a JSON blob — '["a@x.com"]' sorts by the bracket
+#   _assign                      a JSON blob '["a@x.com"]' sorts by the bracket
 #   custom_hold_reason           Small Text; free-form, and a filesort on TEXT
 #                                truncates at max_sort_length
 #   custom_primary_message_text  Long Text; same but far worse (whole mail bodies)
@@ -392,7 +392,7 @@ MAX_FILTER_IN_VALUES = 50
 # Generic ("add a filter on any field") conditions, the Unity answer to upstream
 # Helpdesk's Filter button. These sit ALONGSIDE the fixed toolbar dropdowns
 # (status/priority/ticket_type/assigned_to/created_by/date-range), which are
-# untouched — see _build_filters.
+# untouched see _build_filters.
 #
 # operator key (what the SPA sends) -> how it becomes a frappe.get_list filter.
 #   sql    the operator handed to frappe.get_list
@@ -479,7 +479,7 @@ TICKET_FILTER_FIELDS = [
 #                                leading-wildcard LIKE (full scan). The fixed
 #                                "Assigned To" dropdown already covers it via the
 #                                indexed ToDo lookup in _apply_assignee_filter.
-#   custom_primary_message_text  Long Text — whole mail bodies. That's what the
+#   custom_primary_message_text  Long Text whole mail bodies. That's what the
 #   custom_search_*              search box is for; a LIKE here full-scans ~67k rows.
 #   summary, hold_summary        virtual composites with no single backing column.
 #
@@ -502,7 +502,7 @@ def _localized_available_columns():
 def _localized_filter_fields():
 	"""Registry shipped to the SPA. Mirrors _localized_sort_fields(): the client
 	needs `type` to pick a value control, `operators` to populate the operator
-	dropdown, and `options`/`doctype` to fill the value control — and it filters
+	dropdown, and `options`/`doctype` to fill the value control and it filters
 	its own persisted/URL state against this list before sending, which is what
 	makes it safe for _parse_filter_conditions to throw on anything unknown.
 
@@ -557,7 +557,7 @@ def _parse_filter_conditions(conditions):
 	    [{"key": "agent_group", "operator": "in", "value": ["Team A", "Team B"]}]
 
 	Throws on anything outside the curated registry rather than silently dropping
-	it — for the same reason _parse_sort_terms does. A dropped filter is worse
+	it for the same reason _parse_sort_terms does. A dropped filter is worse
 	than a rejected one: the user gets a wider result set than they asked for and
 	has no way to tell. The stale-preference risk that throwing creates is closed
 	on the client, which filters its persisted/URL state against the registry
@@ -587,7 +587,7 @@ def _parse_filter_conditions(conditions):
 			frappe.throw(
 				_("{0} cannot be filtered with '{1}'").format(_(spec["label"]), operator_key)
 			)
-		# A custom field the site never got (patch not run) — skip rather than
+		# A custom field the site never got (patch not run) skip rather than
 		# hand frappe.get_list a column that doesn't exist.
 		if spec["field"].startswith("custom_") and not _has_field(TICKET_DOCTYPE, spec["field"]):
 			continue
@@ -631,7 +631,7 @@ def _parse_filter_conditions(conditions):
 
 def _localized_sort_fields():
 	# Same shape as _localized_available_columns(). Keeps `field`, `type` and
-	# `rank` — the SPA needs all three to reorder rows optimistically in a way
+	# `rank` the SPA needs all three to reorder rows optimistically in a way
 	# that matches what the server is about to return.
 	return [{**f, "label": _(f["label"])} for f in TICKET_SORT_FIELDS]
 
@@ -641,7 +641,7 @@ def _parse_sort_terms(order_by):
 	[(key, direction)] list.
 
 	Throws on anything outside the curated registry rather than silently falling
-	back to the default — a silent fallback makes a real UI bug invisible (the
+	back to the default a silent fallback makes a real UI bug invisible (the
 	user clicks "Subject", gets modified-desc rows, and concludes sorting is
 	broken). The stale-preference risk that throwing would otherwise create is
 	closed on the client, which filters its persisted sort against the registry
@@ -676,7 +676,7 @@ def _parse_sort_terms(order_by):
 
 
 def _rank_order_term(field, ranked_values, direction):
-	"""ORDER BY FIELD(col, 'Urgent', 'High', ...) — sorts a Select by meaning.
+	"""ORDER BY FIELD(col, 'Urgent', 'High', ...) sorts a Select by meaning.
 
 	FIELD() returns 0 for NULL/unrecognised values, so unknowns sort FIRST in asc
 	and LAST in desc. That matches both MariaDB's NULL handling on plain columns
@@ -692,7 +692,7 @@ def _ticket_order_by(order_by):
 
 	ALWAYS terminated with a `name` tiebreaker. Offset pagination over a sort
 	with ties silently duplicates and drops rows between "Load more" pages
-	without a deterministic total order — and status/priority/ticket_type have
+	without a deterministic total order and status/priority/ticket_type have
 	only a handful of distinct values across ~67k rows, so ties are the norm,
 	not the exception. `name` is the bigint PRIMARY, so it costs nothing.
 
@@ -704,8 +704,8 @@ def _ticket_order_by(order_by):
 	    ORDER BY subject ASC, name DESC  ->  rows 37631, Using index; Using filesort
 	    ORDER BY subject ASC, name ASC   ->  rows 20,    Using index
 
-	`name` is unique either way, so the total order — and therefore pagination
-	safety — is identical. Only the plan changes.
+	`name` is unique either way, so the total order and therefore pagination
+	safety is identical. Only the plan changes.
 	"""
 	terms = _parse_sort_terms(order_by)
 	table = f"`tab{TICKET_DOCTYPE}`"
@@ -749,7 +749,7 @@ def _apply_sort_to_ranked_ids(ranked_ids, candidate_rows, sort_terms):
 
 	An explicit sort overrides relevance ORDERING but must never touch relevance
 	MEMBERSHIP: _ranked_ticket_ids both filters (rank is None -> dropped) and
-	orders. So we reorder the ids it kept and never go back to candidate_rows —
+	orders. So we reorder the ids it kept and never go back to candidate_rows
 	doing that would resurrect tickets the ranker judged non-matching.
 	"""
 	if not sort_terms:
@@ -757,7 +757,7 @@ def _apply_sort_to_ranked_ids(ranked_ids, candidate_rows, sort_terms):
 	row_map = {row.name: row for row in candidate_rows}
 	rows = [row_map[name] for name in ranked_ids if name in row_map]
 	# Seed the `name` tiebreaker first, then apply each sort key from last to
-	# first — Python's stable sort then yields the same precedence as SQL's
+	# first Python's stable sort then yields the same precedence as SQL's
 	# "a asc, b desc, name <dir>". Direction mirrors _ticket_order_by().
 	rows.sort(key=lambda r: int(r.name), reverse=(sort_terms[-1][1] == "desc"))
 	for key, direction in reversed(sort_terms):
@@ -767,8 +767,8 @@ def _apply_sort_to_ranked_ids(ranked_ids, candidate_rows, sort_terms):
 
 
 # Left-to-right order a brand-new user sees. Kept separate from
-# AVAILABLE_TICKET_COLUMNS because that list is a catalogue — it also drives the
-# "+ Add column" menu, where fields are grouped by topic — and the default VIEW
+# AVAILABLE_TICKET_COLUMNS because that list is a catalogue it also drives the
+# "+ Add column" menu, where fields are grouped by topic and the default VIEW
 # wants a different, workflow-driven order. Any default column missing from this
 # list is appended in catalogue order, so adding a new default can't silently
 # drop it. Fixed columns must come first; _load_column_preferences() re-inserts
@@ -779,7 +779,7 @@ DEFAULT_COLUMN_ORDER = [
 	"priority",  # Priority
 	"ticket_type",  # Ticket Type
 	"_assign",  # Assigned To
-	# The two relative-time columns stay adjacent — "raised a day ago, touched
+	# The two relative-time columns stay adjacent "raised a day ago, touched
 	# 20 days ago" only reads as a pair.
 	"creation_age",  # Created
 	"modified_age",  # Last Modified
@@ -788,7 +788,7 @@ DEFAULT_COLUMN_ORDER = [
 	# Not in the requested sequence, so they follow it rather than disappearing
 	# from anyone's default view. `agent_group` is here rather than next to
 	# _assign (where it reads better) precisely because the first nine above are
-	# a layout the user specified exactly — see
+	# a layout the user specified exactly see
 	# test_default_view_uses_the_requested_sequence.
 	"status",
 	"owner",
@@ -809,7 +809,7 @@ def _load_column_preferences():
 	raw = frappe.db.get_default(COLUMN_PREFS_DEFAULT_KEY, frappe.session.user)
 	if not raw:
 		return _default_column_preferences()
-	# Older Frappe versions can wrap a single value in a 1-element list — unwrap.
+	# Older Frappe versions can wrap a single value in a 1-element list unwrap.
 	if isinstance(raw, list | tuple) and len(raw) == 1:
 		raw = raw[0]
 	try:
@@ -889,7 +889,7 @@ def _inject_new_default_columns(cleaned, seen):
 def _selected_column_fields():
 	# Returns the HD Ticket fieldnames a user's column choice depends on, so
 	# get_tickets() can fetch them. Virtual keys (e.g. "summary") are composed by
-	# the SPA from already-fetched fields, so they're skipped here — passing them as
+	# the SPA from already-fetched fields, so they're skipped here passing them as
 	# fields would make frappe.get_list throw on an unknown column.
 	virtual = {c["key"] for c in AVAILABLE_TICKET_COLUMNS if c.get("virtual")}
 	return [pref["key"] for pref in _load_column_preferences() if pref["key"] not in virtual]
@@ -945,7 +945,7 @@ def _decorate_ticket(row):
 
 def _decorate_ticket_rows(rows):
 	# Page-wide bulk fetch: collapses N+1 User lookups (and the ToDo fallback
-	# for empty _assign) into one SELECT each. Used by the list endpoint —
+	# for empty _assign) into one SELECT each. Used by the list endpoint
 	# single-row callers stay on _decorate_ticket().
 	if not rows:
 		return []
@@ -1016,7 +1016,7 @@ def _decorate_ticket_rows(rows):
 		row_dict.priority_target = PRIORITY_TARGETS.get(row_dict.get("priority"), "")
 		# Drop the heavy ranking-only / HTML fields before they hit the wire.
 		# Ranking already ran on the candidate rows (search path) and the
-		# non-search path never needed them — see LIST_RESPONSE_EXCLUDED_FIELDS.
+		# non-search path never needed them see LIST_RESPONSE_EXCLUDED_FIELDS.
 		for excluded in LIST_RESPONSE_EXCLUDED_FIELDS:
 			row_dict.pop(excluded, None)
 		decorated.append(row_dict)
@@ -1034,7 +1034,7 @@ def _normalize_search_text(value):
 def _search_tokens(value):
 	# `\w` matches Unicode word characters, so accented names (e.g. "José",
 	# "Bhavnâ") tokenize as ONE whole word instead of being split/truncated at
-	# the accent the way the old [a-z0-9...] class did. Query-side only — the
+	# the accent the way the old [a-z0-9...] class did. Query-side only the
 	# stored search index is unchanged, so no re-backfill is needed. `@ . -` are
 	# kept so emails and refs (ta-16@x.edu) stay intact.
 	return [token for token in re.findall(r"[\w@.-]+", _normalize_search_text(value)) if token]
@@ -1113,7 +1113,7 @@ def _group_by(items, key):
 
 def _parse_class_number(program):
 	# Program names follow "<class>-<school descriptor>", e.g. "4-Walnut School at Shivane"
-	# or "PG-1-Walnut" — the class segment itself may contain hyphens. rsplit
+	# or "PG-1-Walnut" the class segment itself may contain hyphens. rsplit
 	# strips only the final descriptor and preserves multi-segment class labels.
 	raw = cstr(program or "").strip()
 	if not raw:
@@ -1168,7 +1168,7 @@ def _pick_program_enrollment(rows, current_year=None):
 	# Prefer the current academic year when the student has a NON-CANCELLED row this
 	# year (the normal current-student case). Alumni / left / cancelled / not-yet-
 	# re-enrolled students have no usable current-year row, so fall back to their
-	# LATEST academic year — a cancelled (docstatus=2) current-year row must NOT
+	# LATEST academic year a cancelled (docstatus=2) current-year row must NOT
 	# pin the card to the current year.
 	if current_year:
 		current_pool = [
@@ -1181,7 +1181,7 @@ def _pick_program_enrollment(rows, current_year=None):
 			selected, has_submitted = _select(current_pool)
 			return selected, ([] if has_submitted else ["Current-year enrollment is not submitted yet"])
 
-	# Fallback: the student's most-recent enrolled YEAR — cancelled or not (the
+	# Fallback: the student's most-recent enrolled YEAR cancelled or not (the
 	# Status column separately shows Alumni/Cancelled). Rank by latest academic year
 	# first, then a submitted row within that year, then most-recently modified. Using
 	# the latest YEAR (not the latest-modified row) means an older year re-saved
@@ -1646,7 +1646,7 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"guardian_emails": sorted(set(guardian_emails)),
 				"guardians": guardian_cards,
 				"reference_number": student.get("reference_number"),
-				# The academic year this student is actually shown for — the current
+				# The academic year this student is actually shown for the current
 				# year for current students, else their latest enrolled year (Alumni/
 				# Cancelled). The SPA shows this per student instead of the global year.
 				"academic_year": (
@@ -1721,11 +1721,11 @@ def _search_column_limit(column, default=140):
 	"""Character capacity of an HD Ticket search column, read from the DB itself.
 
 	These fields were declared as Frappe `Data` with no explicit `length`, so the
-	column is VARCHAR(140) — NOT the 255 this writer used to assume. Overflowing it
+	column is VARCHAR(140) NOT the 255 this writer used to assume. Overflowing it
 	raised MySQL 1406, and because every search field is written in ONE set_value,
 	that one oversized value failed the whole update: the ticket kept NULL search
 	fields and became invisible to search (~97K tickets on UAT). Truncating to the
-	column's real width makes the write impossible to overflow on any schema — so
+	column's real width makes the write impossible to overflow on any schema so
 	this stays correct whether or not the widening patch has run on a given site.
 	"""
 	cache = _request_cache().setdefault("_search_column_limit", {})
@@ -1741,7 +1741,7 @@ def _search_column_limit(column, default=140):
 			if rows and rows[0][0]:
 				limit = int(rows[0][0])
 		except Exception:
-			# Never let a schema probe break indexing — fall back to the safe minimum.
+			# Never let a schema probe break indexing fall back to the safe minimum.
 			pass
 		cache[column] = limit
 	return cache[column]
@@ -1901,7 +1901,7 @@ def _primary_message_values(ticket_name, ticket_doc=None, communication_rows=Non
 
 # Max chars stored in custom_search_recipient_emails (a Small Text field). Caps
 # the comma-joined recipient set so the per-row LIKE recipient probe stays cheap
-# and the column never bloats — ~60+ emails, far beyond any real ticket.
+# and the column never bloats ~60+ emails, far beyond any real ticket.
 RECIPIENT_EMAILS_MAX = 2000
 _EMAIL_EXTRACT_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
@@ -1910,7 +1910,7 @@ _EMAIL_EXTRACT_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 def _support_inbox_emails():
 	"""Lowercased set of the helpdesk's own mailbox addresses (every Email Account
 	email_id, e.g. feedback@walnutedu.in). Stripped from the denormalised recipient
-	set so a support inbox — a recipient on essentially every ticket — doesn't make
+	set so a support inbox a recipient on essentially every ticket doesn't make
 	every ticket match. Cached for the worker's lifetime (Email Accounts are stable;
 	a migrate/worker restart refreshes it)."""
 	emails = set()
@@ -1926,7 +1926,7 @@ def _support_inbox_emails():
 
 def _build_ticket_recipient_emails(communication_rows):
 	"""Comma-joined, deduped external recipient/cc emails across a ticket's
-	communications — the people a mail was *sent to* (case 2/3 "send to this mail").
+	communications the people a mail was *sent to* (case 2/3 "send to this mail").
 	The helpdesk's own inboxes are stripped so they don't match every ticket."""
 	inboxes = _support_inbox_emails()
 	emails = []
@@ -2278,8 +2278,8 @@ def _rank_ticket_document(document, query, tokens, family_terms=None):
 
 	# Family-aware match: when the user searched a guardian email, accept any
 	# ticket whose identity links to the same family (even if the literal
-	# query string isn't anywhere on the ticket). Treated as Tier-2 — same
-	# tier as a direct email match — so it ranks above content matches.
+	# query string isn't anywhere on the ticket). Treated as Tier-2 same
+	# tier as a direct email match so it ranks above content matches.
 	if family_terms:
 		doc_emails_lc = {e.lower() for e in identity_emails if e}
 		fam_emails_lc = {e.lower() for e in family_terms.get("emails") or []}
@@ -2564,7 +2564,7 @@ def _expand_email_to_family_search_terms(email):
 		guardian_ids.add(row.name)
 	student_ids = _student_ids_for_guardian_ids(guardian_ids)
 
-	# 2) email belongs to a student directly (Student.user) — a student-raised
+	# 2) email belongs to a student directly (Student.user) a student-raised
 	#    ticket. Fan out to the SAME family so a student email surfaces siblings +
 	#    guardians, symmetric with the guardian path.
 	if _has_doctype("Student") and frappe.db.has_column("Student", "user"):
@@ -2576,7 +2576,7 @@ def _expand_email_to_family_search_terms(email):
 
 
 def _expand_email_to_family_emails(email):
-	"""Backward-compat shim — kept so external callers still work."""
+	"""Backward-compat shim kept so external callers still work."""
 	return _expand_email_to_family_search_terms(email)["emails"]
 
 
@@ -2601,7 +2601,7 @@ def _expand_phone_to_family_search_terms(phone):
 	"""Resolve a guardian phone number to the whole family's search terms (same
 	shape as _expand_email_to_family_search_terms). Matches Guardian.mobile_number /
 	alternate_number on the last 10 digits (resilient to +91 / spacing), takes that
-	guardian's email, and reuses the email family-walk — so a phone search surfaces
+	guardian's email, and reuses the email family-walk so a phone search surfaces
 	every sibling's tickets. Returns empty terms (caller falls through to normal
 	search) when no guardian matches or the matched guardian has no email."""
 	empty = {"emails": set(), "student_refs": set(), "student_names": set(), "student_ids": set()}
@@ -2632,7 +2632,7 @@ def _expand_phone_to_family_search_terms(phone):
 # Student identity codes. Live data: Student.name = <2-letter branch><reference>
 # e.g. "BFOA01"; reference_number = the trailing part e.g. "OA01". The mandatory
 # trailing digits reliably separate these from ordinary words ("fees", "ledger").
-# The DB lookup is the real gate — the regex is only a cheap pre-filter so plain
+# The DB lookup is the real gate the regex is only a cheap pre-filter so plain
 # words never hit the Student table.
 _STUDENT_CODE_RE = re.compile(r"^[A-Za-z]{2,6}\d{1,4}$")
 
@@ -2642,15 +2642,15 @@ def _looks_like_student_code(value):
 
 
 def _expand_student_code_to_family_search_terms(code):
-	"""Resolve a student identity code — the student name (e.g. ``BFOA01``) or the
-	reference number (e.g. ``OA01``) — to the whole family's search terms, reusing
+	"""Resolve a student identity code the student name (e.g. ``BFOA01``) or the
+	reference number (e.g. ``OA01``) to the whole family's search terms, reusing
 	the same student->family walk as the email path. Returns empty terms (caller
 	falls through) when nothing resolves."""
 	code = cstr(code or "").strip()
 	if not code or not _has_doctype("Student"):
 		return _empty_family_terms()
 	student_ids = set()
-	# Exact student name (the PK) — instant; collation makes it case-insensitive.
+	# Exact student name (the PK) instant; collation makes it case-insensitive.
 	if frappe.db.exists("Student", code):
 		student_ids.add(code)
 	# Reference number (e.g. "OA01").
@@ -2685,7 +2685,7 @@ CANDIDATE_STATEMENT_TIMEOUT_SEC = 4
 @contextlib.contextmanager
 def _statement_timeout(seconds):
 	"""Bound queries in this block via MariaDB session max_statement_time, then
-	restore unlimited. Best-effort — a backend without support runs unguarded."""
+	restore unlimited. Best-effort a backend without support runs unguarded."""
 	applied = False
 	try:
 		try:
@@ -2723,21 +2723,21 @@ def _guarded_get_list(doctype, **kwargs):
 def _family_candidate_names(terms, base_filters, match_recipients=False):
 	"""Resolve a family's tickets fast, safe and PRECISE.
 
-	Primary probe (always): a single index-backed raised_by probe — equality on
+	Primary probe (always): a single index-backed raised_by probe equality on
 	every family email (guardians + student `user` logins) plus an
 	indexed prefix range on each student id (BFOA01 -> 'bfoa01@%'). All conditions
 	are on the one raised_by_unity_idx column, so MariaDB index-merges instead of
 	full-scanning. Statement-guarded.
 
-	Recipient probe (``match_recipients``, for the email/phone paths — case 2/3
+	Recipient probe (``match_recipients``, for the email/phone paths case 2/3
 	"send to this mail"): tickets where a family email is a To/CC recipient, via the
-	dedicated recipient FULLTEXT index (see _recipient_candidates) — index-backed,
+	dedicated recipient FULLTEXT index (see _recipient_candidates) index-backed,
 	not a %LIKE% scan. No-op until that index + backfill land.
 
 	Note: we deliberately do NOT match the denormalised student refs/names.
 	populate_ticket_student_search_fields derives a ticket's refs from its OWN
 	raised_by, so those fields never point to a student outside the raiser's family
-	— matching them adds zero recall over the raised_by equality while a short ref
+	matching them adds zero recall over the raised_by equality while a short ref
 	like "AA01" over-matches (prefix + body tokens) and inflates results."""
 	names = set()
 
@@ -2793,7 +2793,7 @@ def _search_candidate_ticket_names(base_filters, search):
 	# Indexed Data fields only for the LIKE path. The 12KB custom_search_message_body
 	# is deliberately NOT here: a leading-wildcard `%tok%` scan over it could not
 	# short-circuit the LIMIT and full-scanned all ~93K rows whenever a token was
-	# sparse/absent — the primary search timeout. FULLTEXT now owns all body/content
+	# sparse/absent the primary search timeout. FULLTEXT now owns all body/content
 	# matching; LIKE only covers the short, index-friendly identity Data fields.
 	search_fields = ["name", "subject", "raised_by"]
 	for field in [
@@ -2845,7 +2845,7 @@ def _search_candidate_ticket_names(base_filters, search):
 	# Pasting the entire customer mail used to fail because LIKE %<200 chars>%
 	# could not span the indexed/normalized whitespace boundaries.
 	tokens = _search_tokens(query)
-	# Drop very short tokens (1-2 chars) — they explode candidate sets and rarely help.
+	# Drop very short tokens (1-2 chars) they explode candidate sets and rarely help.
 	# Keep "to", "of"-length only when the *entire* query is short, so single-letter
 	# searches like "AC" still work.
 	if len(tokens) > 1:
@@ -2878,7 +2878,7 @@ def _search_candidate_ticket_names(base_filters, search):
 
 	# FULLTEXT is authoritative for content: it covers body/subject/refs/names/
 	# guardian-emails (all indexed). For any query with an indexable (>=3-char)
-	# token, return its result DIRECTLY — even when empty. We deliberately do NOT
+	# token, return its result DIRECTLY even when empty. We deliberately do NOT
 	# fall through to a full %LIKE% scan on no match: that just full-scans 93K rows
 	# to the same empty answer (the old 4s "no results" cost) and the FT index
 	# already covers every column a content search needs. BOOLEAN MODE, no relevance
@@ -2894,7 +2894,7 @@ def _search_candidate_ticket_names(base_filters, search):
 
 def _multi_token_candidates(tokens, search_fields, base_filters):
 	"""Return ticket names matching ALL tokens across ANY of search_fields,
-	ordered by modified desc and capped at MAX_SEARCH_CANDIDATES — in a single
+	ordered by modified desc and capped at MAX_SEARCH_CANDIDATES in a single
 	SQL so the LIMIT doesn't truncate older candidates per token."""
 	from pypika.terms import Criterion
 
@@ -2919,11 +2919,11 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 		.where(Criterion.all(and_groups))
 	)
 
-	# base_filters is the same shape as the list passed to frappe.get_list — fold
+	# base_filters is the same shape as the list passed to frappe.get_list fold
 	# them into the qb query as additional WHERE clauses. This must cover EVERY
 	# operator _build_filters can emit: unlike the other candidate probes, this
 	# one never re-queries through frappe.get_list, so an operator dropped here
-	# silently WIDENS the result set — the user gets rows their filter excluded,
+	# silently WIDENS the result set the user gets rows their filter excluded,
 	# and (since the team restriction is one of these filters) rows they may not
 	# be allowed to see. Hence: fold it, or raise; never skip.
 	for filt in base_filters or []:
@@ -2964,7 +2964,7 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 				frappe.throw(_("Invalid range filter on {0}").format(field))
 			query = query.where(col.between(pair[0], pair[1]))
 		elif op_norm in ("is", "is not"):
-			# "is", "set" / "is", "not set" — "" counts as unset, as in get_list.
+			# "is", "set" / "is", "not set" "" counts as unset, as in get_list.
 			if cstr(value).strip().lower() == "set":
 				query = query.where(Coalesce(col, "") != "")
 			else:
@@ -2974,7 +2974,7 @@ def _multi_token_candidates(tokens, search_fields, base_filters):
 
 	query = query.orderby(QBTicket.modified, order=Order.desc).limit(MAX_SEARCH_CANDIDATES)
 	# Statement-time guarded: the Data-field LIKEs are small but a cold buffer pool
-	# can still make a 93K scan slow — degrade to empty rather than pin a worker.
+	# can still make a 93K scan slow degrade to empty rather than pin a worker.
 	try:
 		with _statement_timeout(CANDIDATE_STATEMENT_TIMEOUT_SEC):
 			rows = query.run(as_dict=True)
@@ -3002,7 +3002,7 @@ _FULLTEXT_INDEX_NAME = "search_body_ft_idx"
 @functools.lru_cache(maxsize=1)
 def _fulltext_index_available():
 	"""One-shot check: does the search_body_ft_idx FULLTEXT INDEX exist on
-	tabHD Ticket? Cached for the worker's lifetime — schema doesn't change
+	tabHD Ticket? Cached for the worker's lifetime schema doesn't change
 	without a migrate + worker restart, and the cache avoids a per-query
 	"try MATCH AGAINST → catch 1191 → log_error" overhead when the index
 	isn't there (older deploys, fresh installs before the patch runs,
@@ -3026,7 +3026,7 @@ def _fulltext_index_available():
 # query if it runs longer (raising 1969, which we catch + degrade). Set to 5 so a
 # COLD broad single-common-word search ("fee" ~4s cold: reading a posting list
 # present in 40K+ docs) still COMPLETES and returns results, rather than being
-# killed to empty — while staying far under the old 30s+ hang and bounding any
+# killed to empty while staying far under the old 30s+ hang and bounding any
 # worker-hold. Warm (the production norm) these are 150ms-2.5s.
 FULLTEXT_STATEMENT_TIMEOUT_SEC = 5
 # InnoDB indexes tokens >= innodb_ft_min_token_size (3 on this deploy). Lowered
@@ -3042,7 +3042,7 @@ def _fulltext_boolean_query(query):
 	  characters ``@ . -`` (which appear in emails/refs) can never reach the
 	  parser and flip a token into an exclude/phrase. Identity lookups
 	  (email / phone / student-code) own those punctuated queries anyway.
-	- Drop tokens shorter than the InnoDB min token size (3) — they aren't in
+	- Drop tokens shorter than the InnoDB min token size (3) they aren't in
 	  the index and a 1-2 char stem with ``*`` explodes the match set.
 	- A single token is prefix-matched (``+tok*``) so "transp" finds "transport"
 	  and as-you-type stays useful.
@@ -3064,8 +3064,8 @@ def _fulltext_boolean_query(query):
 	by_rarity = sorted(unique, key=len, reverse=True)[:_FULLTEXT_MAX_TOKENS]
 	# Multi-token content search: REQUIRE the top 2-3 most distinctive tokens
 	# (longest = rarest), matched EXACTLY, and drop the rest. Optional (non-`+`)
-	# tokens don't restrict a BOOLEAN match set, and because we rank in Python — not
-	# by FT relevance — they add only cold posting-list cost for zero gain. Exact
+	# tokens don't restrict a BOOLEAN match set, and because we rank in Python not
+	# by FT relevance they add only cold posting-list cost for zero gain. Exact
 	# (no `*`) avoids prefix-expanding a common word, which was the ~3s cold cost.
 	# The required set stays a superset of the Python ranker's all-tokens result, so
 	# nothing rankable is lost; the ranker enforces the full token set on content.
@@ -3074,15 +3074,15 @@ def _fulltext_boolean_query(query):
 
 
 def _fulltext_candidates(query, base_filters):
-	"""Candidate set via the MariaDB FULLTEXT index — the primary path for any
+	"""Candidate set via the MariaDB FULLTEXT index the primary path for any
 	content/subject query that has a >=3-char word. BOOLEAN MODE with NO relevance
 	``ORDER BY``: the Python ranker (`_ranked_ticket_ids`) re-orders the bounded
 	set anyway, and scoring the whole match set with ``ORDER BY MATCH()`` was the
 	>30s timeout. Statement-time guarded so it can never hang a worker. Returns
 	empty on a missing index / timeout / no usable tokens and the caller falls
-	through to the body-less LIKE path — never a dead end.
+	through to the body-less LIKE path never a dead end.
 	"""
-	# Skip entirely if the FULLTEXT index isn't on this site — saves the
+	# Skip entirely if the FULLTEXT index isn't on this site saves the
 	# round-trip + 1191 exception cost on every query.
 	if not _fulltext_index_available():
 		return set()
@@ -3103,7 +3103,7 @@ def _fulltext_candidates(query, base_filters):
 		rows = frappe.db.sql(sql, (boolean_query, MAX_SEARCH_CANDIDATES))
 	except Exception as exc:
 		msg = cstr(exc)
-		# 1969 = query interrupted (hit the statement timeout) — the expected
+		# 1969 = query interrupted (hit the statement timeout) the expected
 		# backstop under pathological load; degrade quietly to the LIKE fallback.
 		# Log anything else once (e.g. 1191 missing index on an un-migrated site).
 		if "1969" not in msg and "max_statement_time" not in msg.lower():
@@ -3113,7 +3113,7 @@ def _fulltext_candidates(query, base_filters):
 			)
 		return set()
 
-	# cstr — HD Ticket names are integers (autoincrement naming); keep the whole
+	# cstr HD Ticket names are integers (autoincrement naming); keep the whole
 	# candidate pipeline string-typed so set-union/dedup with the other probes
 	# (which go through _append_ticket_names) never splits "105" from 105.
 	candidate_names = {cstr(row[0]) for row in rows if row and row[0]}
@@ -3121,7 +3121,7 @@ def _fulltext_candidates(query, base_filters):
 		return candidate_names
 
 	# Re-apply base_filters (view + permission_query scope) via a narrow
-	# IN(...) query — the raw SQL above bypassed Frappe's permission layer.
+	# IN(...) query the raw SQL above bypassed Frappe's permission layer.
 	filtered = frappe.get_list(
 		TICKET_DOCTYPE,
 		fields=["name"],
@@ -3156,14 +3156,14 @@ def _recipient_ft_index_available():
 
 
 def _recipient_candidates(emails, base_filters):
-	"""Tickets where any of ``emails`` is a To/CC recipient — "sent to this mail"
+	"""Tickets where any of ``emails`` is a To/CC recipient "sent to this mail"
 	(cases 2 & 3). Matched via the dedicated recipient FULLTEXT index (NOT a
 	leading-wildcard %LIKE% scan, which was a ~3s full scan). Each email's
 	distinctive tokens (local part + domain labels >= the InnoDB min size) are a
 	required ``(+a +b +c)`` group; groups are OR'd so any family member as a
 	recipient is a hit. NO relevance ORDER BY (Python ranker orders), statement
 	guarded, permissions re-applied. Empty when the index/field is absent
-	(un-migrated / un-backfilled site) — the caller still has the raised_by probe."""
+	(un-migrated / un-backfilled site) the caller still has the raised_by probe."""
 	if not (
 		_has_field(TICKET_DOCTYPE, "custom_search_recipient_emails")
 		and _recipient_ft_index_available()
@@ -3320,10 +3320,10 @@ def _assigned_ticket_names(user):
 	The old LIKE filter was a guaranteed full-table scan on a 90K-row HD Ticket
 	table (leading-wildcard means no B-tree index can be used). ToDo has
 	composite indexes on (reference_type, reference_name) and on (owner), so
-	this lookup is O(matched-rows) — milliseconds even for the heaviest-loaded
+	this lookup is O(matched-rows) milliseconds even for the heaviest-loaded
 	agent.
 
-	Truncated to the most-recently-assigned MAX_ASSIGNED_LOOKUP names — well
+	Truncated to the most-recently-assigned MAX_ASSIGNED_LOOKUP names well
 	above any realistic per-user assignment count. We deliberately don't fall
 	back to the LIKE filter when over the cap, because the LIKE is exactly
 	the regression this whole rewrite eliminates.
@@ -3334,7 +3334,7 @@ def _assigned_ticket_names(user):
 	if user in cache:
 		return cache[user]
 	# Candidate set: every ticket EVER assigned to the user (ANY ToDo status),
-	# resolved via the indexed ToDo table — never an `_assign LIKE` scan. The
+	# resolved via the indexed ToDo table never an `_assign LIKE` scan. The
 	# assignee is `allocated_to` (the `owner` is whoever DID the assigning, e.g. the
 	# funnel bot), with `owner` kept as a fallback for legacy rows. Newest first so
 	# the MAX cap keeps the rows a user would actually look at.
@@ -3356,7 +3356,7 @@ def _assigned_ticket_names(user):
 
 	# Keep only tickets where the user is the CURRENT assignee per HD Ticket._assign.
 	# This makes a CLOSED ticket the user was last assigned still appear under them,
-	# and drops a ticket that was reassigned away — both regardless of ToDo status
+	# and drops a ticket that was reassigned away both regardless of ToDo status
 	# (closing/reassigning moves the ToDo out of "Open"). Chunked IN on the indexed
 	# `name` PK keeps it fast.
 	names = set()
@@ -3387,7 +3387,7 @@ def _apply_assignee_filter(res, user):
 	"""
 	names = _assigned_ticket_names(user)
 	if not names:
-		# Sentinel that can't be a valid ticket name — short-circuits to an
+		# Sentinel that can't be a valid ticket name short-circuits to an
 		# empty result without touching tabHD Ticket. Cheaper than running the
 		# query and getting 0 rows back.
 		res.append([TICKET_DOCTYPE, "name", "in", ["__unity_no_assignments__"]])
@@ -3399,13 +3399,13 @@ def _user_teams(user=None):
 	"""[(team_name, ignore_restrictions)] for the given user, from HD Team.users.
 
 	HD Team.autoname is `field:team_name`, so a team's `name` IS the string stored
-	in HD Ticket.agent_group — no second lookup needed.
+	in HD Ticket.agent_group no second lookup needed.
 
 	Reads HD Team Member (the `users` Table MultiSelect on HD Team), NOT
 	HD Agent.groups. Both exist and nothing keeps them in sync; HD Team.users is
 	the one upstream's own restriction query uses, and the one the desk Team
-	screen edits. (On this site HD Agent.groups holds 4 rows, all orphaned — the
-	parent HD Agent records don't exist — so it resolves nobody.)
+	screen edits. (On this site HD Agent.groups holds 4 rows, all orphaned the
+	parent HD Agent records don't exist so it resolves nobody.)
 
 	ORDER BY is load-bearing, not tidiness: helpdesk.api.unity_agent_group picks
 	`[0]` as "the assignee's team" when stamping HD Ticket.agent_group, so an
@@ -3438,7 +3438,7 @@ def _user_teams(user=None):
 
 
 def _team_restriction_settings():
-	"""(restrict_by_team, allow_untagged) from HD Settings — the SAME two
+	"""(restrict_by_team, allow_untagged) from HD Settings the SAME two
 	switches upstream's own restriction reads, so Desk and Unity can't disagree.
 	Both default off, so this whole feature is inert until someone turns it on.
 	"""
@@ -3456,9 +3456,9 @@ def _team_restriction_filters():
 	"""Scope the ticket list to the current user's teams, or [] when unrestricted.
 
 	Semantics mirror HDTicket.get_list_filters (hd_ticket.py) so Unity and the
-	legacy desk agree, and reuse the SAME switches — HD Settings
+	legacy desk agree, and reuse the SAME switches HD Settings
 	`restrict_tickets_by_agent_group` plus the per-team `ignore_restrictions`
-	escape hatch — so this ships OFF and is enabled deliberately. Upstream's
+	escape hatch so this ships OFF and is enabled deliberately. Upstream's
 	version is unreachable from Unity: it only runs through
 	helpdesk.extends.client.get_list, which the Unity API never calls.
 
@@ -3466,7 +3466,7 @@ def _team_restriction_filters():
 	DatabaseQuery keeps `can_be_null` true when an `in` list contains "" and
 	renders `ifnull(col, '') in (...)` (frappe/model/db_query.py), so the single
 	tuple means "one of my teams OR untagged". That's why this needs no
-	or_filters and no second query path — it stays an AND-able tuple and rides
+	or_filters and no second query path it stays an AND-able tuple and rides
 	the existing _build_filters choke point into the list, both search branches,
 	the cards aggregate and _summary_cache_key.
 	"""
@@ -3489,7 +3489,7 @@ def _team_restriction_filters():
 	if not allowed:
 		# In no team and untagged tickets are restricted too: match nothing,
 		# explicitly. Upstream builds Criterion.any([]) here, which is a latent
-		# bug — an empty OR is not "deny", and we don't want to find out which.
+		# bug an empty OR is not "deny", and we don't want to find out which.
 		return [[TICKET_DOCTYPE, "name", "in", ["__unity_no_teams__"]]]
 	return [[TICKET_DOCTYPE, "agent_group", "in", allowed]]
 
@@ -3500,7 +3500,7 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 	#
 	# It must never narrow a user's own assigned tickets: a ticket assigned to
 	# you has to be visible to you. Otherwise the two halves of this feature
-	# fight — assignment stamps agent_group with the assignee's team, but an
+	# fight assignment stamps agent_group with the assignee's team, but an
 	# assignee who is in NO team (52 of the 61 agents here) leaves the group
 	# alone, and the restriction would then hide the ticket from the very person
 	# it was just handed to. An already-assignee-scoped query is also narrower
@@ -3532,14 +3532,14 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 
 	# Agent Group = HD Ticket.agent_group (Link -> HD Team). A primary toolbar
 	# dropdown; `agent_group_unity_idx` makes the equality cheap. Independent of
-	# _team_restriction_filters above — that one bounds what you MAY see, this one
+	# _team_restriction_filters above that one bounds what you MAY see, this one
 	# narrows within it.
 	if filters.get("agent_group"):
 		res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
 
 	# "Created By" = the ticket's owner (creator). owner is an indexed column, so a plain
-	# equality filter is cheap even over the full table. No longer a toolbar dropdown —
-	# it moved into the generic Filter popover as the `owner` registry field — but the
+	# equality filter is cheap even over the full table. No longer a toolbar dropdown
+	# it moved into the generic Filter popover as the `owner` registry field but the
 	# key is kept so older shared links and any API caller keep working.
 	if filters.get("created_by"):
 		res.append([TICKET_DOCTYPE, "owner", "=", filters.created_by])
@@ -3580,7 +3580,7 @@ def _count(filters=None, or_filters=None):
 
 
 _QB_NUMERIC_FIELDTYPES = ("Check", "Float", "Int", "Currency", "Percent")
-# frappe.database.utils.FallBackDateTimeStr — inlined rather than imported so a
+# frappe.database.utils.FallBackDateTimeStr inlined rather than imported so a
 # rename upstream surfaces here as a failing count test, not a hard ImportError
 # on every list load.
 _QB_DATETIME_FALLBACK = "0001-01-01 00:00:00.000000"
@@ -3595,14 +3595,14 @@ def _qb_filter_target(col, field, op_norm, value):
 	`ifnull(col, <fallback>)` for most operators (frappe/model/db_query.py), which
 	means NULL rows genuinely MATCH `!=`, `not like`, `not in` and `<`/`<=`. Bare
 	pypika compares against NULL, which is never true, so those rows silently
-	vanish from the count while staying in the list — measured on this site:
+	vanish from the count while staying in the list measured on this site:
 	`agent_group != x` gave 67,279 rows but 57,443 in the cards.
 
 	Frappe skips the wrapper in exactly these cases, and so do we:
 	  * numeric fieldtypes (never null-compared)
-	  * `>` / `>=` on a Date/Datetime — NULL can't exceed a real value anyway
-	  * `between` — both bounds are non-null, so the wrapper only costs an index
-	  * `=` / `like` with a truthy value — the common path, kept index-friendly
+	  * `>` / `>=` on a Date/Datetime NULL can't exceed a real value anyway
+	  * `between` both bounds are non-null, so the wrapper only costs an index
+	  * `=` / `like` with a truthy value the common path, kept index-friendly
 	"""
 	if field in _qb_numeric_fields():
 		return col
@@ -3618,7 +3618,7 @@ def _qb_filter_target(col, field, op_norm, value):
 	return Coalesce(col, "")
 
 
-# These three read the schema, which doesn't change within a process — cached
+# These three read the schema, which doesn't change within a process cached
 # forever for the same reason (and with the same deploy caveat) as _has_field:
 # `bench migrate` reloads the worker, so they're fresh after a deploy.
 @functools.lru_cache(maxsize=1)
@@ -3646,7 +3646,7 @@ def _qb_in_condition(col, field, values, negate=False):
 
 	Frappe renders `ifnull(col, '') in (...)` whenever the list can involve a
 	blank, which is what makes `agent_group in ["Support", ""]` match untagged
-	tickets — the whole basis of the team restriction's "my teams OR untagged".
+	tickets the whole basis of the team restriction's "my teams OR untagged".
 	"""
 	values = list(values if isinstance(values, (list, tuple)) else [values])
 	target = _qb_filter_target(col, field, "not in" if negate else "in", values)
@@ -3658,8 +3658,8 @@ def _apply_ticket_filters_to_query(query, doctype_ref, filters_list):
 	to a `frappe.qb` SELECT query.
 
 	This backs the dashboard-cards aggregate, which is a SEPARATE query from the
-	`frappe.get_list` the rows come from. Any operator this handles differently —
-	or doesn't handle at all — shows up as KPI counts that disagree with the list
+	`frappe.get_list` the rows come from. Any operator this handles differently
+	or doesn't handle at all shows up as KPI counts that disagree with the list
 	below them, which reads as a data bug rather than a filter bug. So it covers
 	the full set _build_filters can emit (see FILTER_OPERATORS) and RAISES on
 	anything else rather than degrading to equality.
@@ -3738,7 +3738,7 @@ def _dashboard_cards_for_filters(filters=None):
 	has_on_hold = _has_field(TICKET_DOCTYPE, "custom_is_on_hold")
 
 	if not filters:
-		# Fast path — leverage the per-status / per-on_hold composite
+		# Fast path leverage the per-status / per-on_hold composite
 		# indexes added by unity_ticket_list_indexes for index-only scans.
 		sql = frappe.db.sql
 		try:
@@ -3780,7 +3780,7 @@ def _dashboard_cards_for_filters(filters=None):
 			"replied": replied,
 		}
 
-	# Filtered path — single SUM(CASE) aggregate as before.
+	# Filtered path single SUM(CASE) aggregate as before.
 	HDT = frappe.qb.DocType(TICKET_DOCTYPE)
 	q = frappe.qb.from_(HDT).select(
 		Count(HDT.name).as_("total"),
@@ -3915,8 +3915,8 @@ def _agent_candidates(search=None, limit=AGENT_CANDIDATE_LIMIT):
 
 	This used to load the first 200 users by `full_name` and let the SPA filter
 	them client-side. With ~8k enabled System Users that window ended inside the
-	"Aa..." names, so every user sorting after it — including any newly created
-	one — was unreachable: typing their name simply returned "no match".
+	"Aa..." names, so every user sorting after it including any newly created
+	one was unreachable: typing their name simply returned "no match".
 
 	So search happens in SQL over the whole table instead. Users who are already
 	agents are returned too (flagged `is_agent`, ranked last) rather than filtered
@@ -3999,7 +3999,7 @@ def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
 
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
 	list_filters = _build_filters(
-		"all",  # search reach mirrors get_tickets — permission is enforced via assigned_agent
+		"all",  # search reach mirrors get_tickets permission is enforced via assigned_agent
 		None,
 		assigned_agent=_session_user() if not capabilities.can_view_all_tickets else None,
 	)
@@ -4016,7 +4016,7 @@ def get_ticket_suggestions(search=None, view="all", limit=SUGGESTION_LIMIT):
 		page_length=SUGGESTION_CANDIDATE_CAP,
 	)
 
-	# Cheap in-Python rank — no full ranker call.
+	# Cheap in-Python rank no full ranker call.
 	q_lower = query.lower()
 	tokens = _search_tokens(query)
 
@@ -4040,7 +4040,7 @@ def benchmark_ticket_search(queries=None, view="all", repeat=1):
 	"""Admin-only, read-only search timing harness. Runs the candidate resolver for
 	each query and reports candidate count + wall-ms, so every query shape can be
 	verified to resolve in milliseconds and never approach the API timeout.
-	SELECT-only — safe to run on production.
+	SELECT-only safe to run on production.
 
 	Usage:
 	  bench --site <site> execute helpdesk.api.unity_helpdesk.benchmark_ticket_search \\
@@ -4102,7 +4102,7 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	both need: capabilities, effective view, base filter list, cleaned search
 	text, and (when searching) the candidate-name set + family expansion. The
 	result is cached on `frappe.local` so the two parallel endpoints don't
-	repeat the work twice within a single request — only relevant for the
+	repeat the work twice within a single request only relevant for the
 	back-compat `get_tickets` wrapper, but harmless otherwise.
 	"""
 	# Clamp pagination defensively: a missing/zero value falls back to 20, and a
@@ -4115,7 +4115,7 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	order_by_sql = _ticket_order_by(order_by)
 
 	# Cache key embeds the inputs so different filter combinations don't
-	# collide within the same request. Sort is deliberately NOT part of it —
+	# collide within the same request. Sort is deliberately NOT part of it
 	# see the note where it's patched on below.
 	cache_key = (
 		"_ticket_context",
@@ -4134,7 +4134,7 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 		cached["start"] = start
 		# Sort is patched on like pagination, NOT baked into the cache key.
 		# Nothing the context computes (capabilities, filters, fields, candidate
-		# names) depends on ordering — and keying on it would split the contexts
+		# names) depends on ordering and keying on it would split the contexts
 		# of get_tickets_page (which sends order_by) and get_tickets_summary
 		# (which doesn't), costing a second _fetch_candidate_rows on the search
 		# path: the slowest path there is.
@@ -4145,11 +4145,11 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 	capabilities = _require_unity_access()
 	search = cstr(search or message_body or "").strip()
 	effective_view = "all" if view == "all" and capabilities.can_view_all_tickets else "my"
-	# Always scope the base filters by the effective view — including during search.
+	# Always scope the base filters by the effective view including during search.
 	# The My-Tickets view must stay assigned-to-me whether or not a query is present;
 	# widening to "all" while searching leaked every matching ticket into My Tickets
 	# for admins (who have no assigned_agent fallback). Non-admins were already scoped
-	# via assigned_agent, but admins on the My tab were not — hence the leak.
+	# via assigned_agent, but admins on the My tab were not hence the leak.
 	list_filters = _build_filters(
 		effective_view,
 		filters,
@@ -4181,7 +4181,7 @@ def _resolve_ticket_context(view, filters, search, message_body, page_length, st
 				search_family_terms = expanded
 		elif _looks_like_student_code(search):
 			# Student name code / reference ("SHOB76", "OB76"): same as the email/phone
-			# paths — pass the family expansion to the ranker so EVERY family ticket
+			# paths pass the family expansion to the ranker so EVERY family ticket
 			# is a Tier-2 hit (whether raised by the student login or a guardian email),
 			# instead of scattering them across relevance tiers. With one tier, the
 			# tiebreaker (modified desc) takes over → newest ticket first.
@@ -4236,7 +4236,7 @@ def _fetch_candidate_rows(context):
 
 def _compute_tickets_page(context):
 	"""Return just the paginated rows for the current view + filters. Drops
-	the cards/total_count which the summary endpoint is responsible for —
+	the cards/total_count which the summary endpoint is responsible for
 	keeps this endpoint's response small and its work minimal so the SPA
 	can paint the list as soon as it lands.
 	"""
@@ -4265,7 +4265,7 @@ def _compute_tickets_page(context):
 			]
 		)
 		# An explicit user sort overrides relevance ORDERING but never relevance
-		# MEMBERSHIP — see _apply_sort_to_ranked_ids.
+		# MEMBERSHIP see _apply_sort_to_ranked_ids.
 		ranked_ids = _apply_sort_to_ranked_ids(
 			ranked_ids, candidate_rows, context.get("sort_terms") or []
 		)
@@ -4275,7 +4275,7 @@ def _compute_tickets_page(context):
 		search_truncated = len(candidate_rows) >= MAX_SEARCH_CANDIDATES
 		paginated_ids = ranked_ids[start : start + page_length]
 		# `candidate_rows` already holds every candidate with the same `fields`,
-		# and `paginated_ids` is a slice of names ranked *from* candidate_rows —
+		# and `paginated_ids` is a slice of names ranked *from* candidate_rows
 		# so the page is already in memory. Slice it directly instead of paying a
 		# second DB round-trip (and an extra `IN (...)` scan) for rows we just
 		# fetched. row_map is keyed by name; we re-order it to the ranked slice.
@@ -4308,7 +4308,7 @@ _SUMMARY_CACHE_PREFIX = "unity:tickets:summary"
 
 def _summary_cache_key(context):
 	"""Per-(user, view, filters) cache key for the dashboard cards.
-	Search-path summaries (where candidate_names is set) are not cached —
+	Search-path summaries (where candidate_names is set) are not cached
 	they'd diverge per keystroke and the cache would churn. Only the
 	empty-search list-page summary is keyed reliably.
 	"""
@@ -4333,7 +4333,7 @@ def _compute_tickets_summary(context):
 	aggregate in _dashboard_cards_for_filters.
 
 	The empty-search result is Redis-cached for _SUMMARY_CACHE_TTL_SECS
-	seconds — the aggregate is a full-table scan on a 90K-row HD Ticket
+	seconds the aggregate is a full-table scan on a 90K-row HD Ticket
 	table, which is the dominant cost of the list-page first paint when
 	the InnoDB buffer pool is cold. KPI cards don't need real-time
 	freshness; 30 s of staleness is acceptable, and the first visitor
@@ -4394,7 +4394,7 @@ def _compute_tickets_summary(context):
 				expires_in_sec=_SUMMARY_CACHE_TTL_SECS,
 			)
 		except Exception:
-			# Cache write failures are non-fatal — the response is correct,
+			# Cache write failures are non-fatal the response is correct,
 			# we just lose the speed-up on the next call.
 			pass
 	return result
@@ -4406,8 +4406,8 @@ def get_tickets_page(
 ):
 	"""Paginated ticket rows for the current view + filters. Companion to
 	`get_tickets_summary`. The Unity SPA fires both in parallel so the list
-	paints as soon as the page response lands — typically tens of
-	milliseconds — without waiting for the dashboard-cards aggregate.
+	paints as soon as the page response lands typically tens of
+	milliseconds without waiting for the dashboard-cards aggregate.
 
 	`order_by` is the curated sort string ("status asc, creation desc"); see
 	_parse_sort_terms for the allowlist."""
@@ -4439,7 +4439,7 @@ def get_tickets(
 	view="all", filters=None, search=None, message_body=None, page_length=20, start=0, order_by=None
 ):
 	"""Back-compat wrapper that returns the same shape the previous monolithic
-	endpoint did — `{data, total_count, cards, row_count, start, page_length, view}`.
+	endpoint did `{data, total_count, cards, row_count, start, page_length, view}`.
 	Internally calls the same helpers as `get_tickets_page` and
 	`get_tickets_summary`, sharing the candidate-rows fetch via the
 	per-request cache so no extra DB work is paid for back-compat.
@@ -4489,7 +4489,7 @@ def _dashboard_rows(from_date, to_date, assigned_agent=None):
 		[TICKET_DOCTYPE, "creation", "<=", f"{to_date} 23:59:59"],
 	]
 	if assigned_agent:
-		# Same ToDo-based fast path the list page uses — avoids the
+		# Same ToDo-based fast path the list page uses avoids the
 		# `_assign LIKE '%user%'` full-table scan that previously dominated
 		# the dashboard query budget for filtered-by-agent views.
 		_apply_assignee_filter(filters, assigned_agent)
@@ -4729,7 +4729,7 @@ def create_ticket_type(name, description=None, priority=None):
 	return doc.as_dict()
 
 
-# Keep in sync with hd_ticket._KEYWORD_CACHE_KEY — the matcher reads the cached
+# Keep in sync with hd_ticket._KEYWORD_CACHE_KEY the matcher reads the cached
 # list and we have to invalidate it when admins edit keywords from the SPA.
 _TICKET_TYPE_KEYWORD_CACHE_KEY = "hd_ticket_type_keywords"
 _MAX_KEYWORDS_PER_TYPE = 50
@@ -4791,7 +4791,7 @@ def list_ticket_types_with_keywords():
 def update_ticket_type_color(name, color=None):
 	"""Set the SPA-displayed colour on an HD Ticket Type. Accepts any value
 	that the Frappe Color field accepts (e.g. '#3b82f6'); pass empty string
-	to clear. Admins only — same gate as update_ticket_type_keywords.
+	to clear. Admins only same gate as update_ticket_type_keywords.
 	"""
 	capabilities = _require_unity_access()
 	if not capabilities.can_manage_unity_settings:
@@ -4803,7 +4803,7 @@ def update_ticket_type_color(name, color=None):
 		frappe.throw(_("Ticket type {0} not found").format(name), frappe.DoesNotExistError)
 	color_value = cstr(color or "").strip()
 	# Basic shape check; the Frappe Color field stores hex strings.
-	# Don't be strict — admins may paste a 3-char or 8-char hex.
+	# Don't be strict admins may paste a 3-char or 8-char hex.
 	if color_value and not (color_value.startswith("#") and 4 <= len(color_value) <= 9):
 		frappe.throw(_("Color must be a hex string like #3b82f6 (got {0})").format(color_value))
 	if not frappe.db.has_column("HD Ticket Type", "custom_color"):
@@ -4835,7 +4835,7 @@ def update_ticket_type_keywords(name, keywords=None):
 		frappe.throw(_("Ticket type {0} not found").format(name), frappe.DoesNotExistError)
 	cleaned = _parse_keyword_input(keywords)
 	joined = ", ".join(cleaned)
-	# set_value bypasses HDTicketType.on_update — invalidate the matcher cache
+	# set_value bypasses HDTicketType.on_update invalidate the matcher cache
 	# directly so the next ticket pickup sees the new mapping.
 	frappe.db.set_value("HD Ticket Type", name, "keywords", joined)
 	frappe.cache().delete_value(_TICKET_TYPE_KEYWORD_CACHE_KEY)
@@ -4871,7 +4871,7 @@ def _normalize_hex_color(value):
 
 	The 3-char expansion is not cosmetic. The renderer only honours
 	/^#[0-9a-fA-F]{6}$/, so a saved `#abc` would be accepted here, stored
-	happily, and then silently never render — with no error anywhere. The
+	happily, and then silently never render with no error anywhere. The
 	ticket-type colour endpoint has exactly that trap; don't reproduce it.
 	"""
 	color_value = cstr(value or "").strip()
@@ -4901,11 +4901,55 @@ def _require_team(name):
 	return name
 
 
+def _clean_team_users(users):
+	"""Normalise a member payload into a validated list of User ids.
+
+	Shared by create_team and update_team_members so the two can never drift.
+	Accepts a JSON string, a list, or a bare string; drops blanks; dedupes
+	while PRESERVING ORDER; rejects unknown users before anything is written.
+
+	Order and uniqueness are not tidiness. unity_agent_group stamps
+	HD Ticket.agent_group from `_user_teams(user)[0]`, so a duplicate row would
+	make a multi-team agent's tickets flap between teams on successive
+	assignments.
+	"""
+	if users in (None, ""):
+		wanted = []
+	elif isinstance(users, str):
+		# The SPA posts a JSON array, but a direct API call can pass one bare
+		# user id. _parse_json would hand that straight to json.loads and blow
+		# up with a raw JSONDecodeError, so decode defensively and fall back to
+		# treating the value as a single id.
+		stripped = users.strip()
+		try:
+			wanted = frappe.parse_json(stripped) if stripped else []
+		except (ValueError, TypeError):
+			wanted = stripped
+	else:
+		wanted = users
+
+	if isinstance(wanted, str):
+		wanted = [wanted]  # JSON that decoded to a plain string
+	elif not isinstance(wanted, (list, tuple)):
+		wanted = [wanted]
+
+	cleaned = []
+	for entry in wanted:
+		user = cstr(entry or "").strip()
+		if user and user not in cleaned:  # dedupe, preserve order
+			cleaned.append(user)
+
+	missing = [u for u in cleaned if not frappe.db.exists("User", u)]
+	if missing:
+		frappe.throw(_("Unknown user(s): {0}").format(", ".join(missing)))
+	return cleaned
+
+
 @frappe.whitelist()
 def list_teams():
 	"""Teams with their colour and members, for the Settings page.
 
-	`custom_color` is appended ONLY when the column exists — the same
+	`custom_color` is appended ONLY when the column exists the same
 	feature-detect contract `_ticket_type_options()` uses. The SPA checks for
 	the key's presence and hides the whole Color column when it's absent, so a
 	site that hasn't run the schema patch degrades quietly instead of erroring.
@@ -4934,19 +4978,110 @@ def list_teams():
 	return teams
 
 
+# `tabHD Team`.name and .team_name are both varchar(140); past that MySQL
+# raises a raw "Data too long for column 'name'".
+_TEAM_NAME_MAX_LEN = 140
+
+
+@frappe.whitelist()
+def create_team(name, color=None, users=None):
+	"""Create an HD Team, optionally with a colour and an initial member list.
+
+	Returns ONE row in exactly the shape list_teams() emits,
+	{name, ignore_restrictions, users, [custom_color]}, so the SPA never has to
+	special-case the created row. (It re-fetches the list anyway, which keeps
+	the name ordering right.)
+
+	SIDE EFFECT, read before touching this. HDTeam.after_insert calls
+	create_assignment_rule(), which inserts an `Assignment Rule` named
+	"<team> - Support Rotation" (document_type=HD Ticket, assign_condition
+	"status == 'Open' and agent_group == '<team>'"), seven Assignment Rule Day
+	rows, and then re-saves the team to store the link. That rule is created
+	DISABLED (hd_team.py) and must stay that way: an enabled rotation on this
+	site auto-assigned every open ticket and produced a 653-email blowup.
+	Creating a team from here is therefore inert until somebody deliberately
+	enables the rule in desk. hd_team.py has no validate and no on_update, so
+	there is no other hidden write.
+
+	Everything is validated BEFORE the insert precisely because that insert is
+	not one row: a late failure would leave a team, a rule and seven child rows
+	behind.
+	"""
+	_require_team_admin()
+
+	name = cstr(name or "").strip()
+	if not name:
+		# Not a courtesy check. HD Team.autoname is `field:team_name` and
+		# team_name is NOT reqd, so a blank insert does not fail: set_new_name
+		# falls through to make_autoname("hash") and you get a team called
+		# something like `a1b2c3d4e5`, which is then the literal string stamped
+		# into every HD Ticket.agent_group for that team, forever (we offer no
+		# rename).
+		frappe.throw(_("Please enter a team name"))
+	if len(name) > _TEAM_NAME_MAX_LEN:
+		frappe.throw(
+			_("Team name must be {0} characters or fewer (got {1})").format(
+				_TEAM_NAME_MAX_LEN, len(name)
+			)
+		)
+	if "<" in name or ">" in name:
+		# frappe.model.naming.validate_name rejects these too, but with
+		# frappe.NameError, which is NOT a ValidationError subclass, so it
+		# reaches the SPA as an unhandled 500 instead of a readable message.
+		frappe.throw(_("Team name cannot contain '<' or '>'"))
+
+	# Deliberately NOT the idempotent early-return create_ticket_type uses.
+	# Silently returning the existing team would drop the members and colour
+	# the admin just picked and quietly hand them somebody else's team. The
+	# name column is utf8mb4_unicode_ci, so this also catches "tech" vs "Tech"
+	# (a duplicate the unique index would otherwise reject with a raw
+	# DuplicateEntryError), and exists() gives back the stored spelling.
+	existing = frappe.db.exists("HD Team", name)
+	if existing:
+		frappe.throw(_("A team named {0} already exists").format(existing))
+
+	members = _clean_team_users(users)
+	color_value = _normalize_hex_color(color)
+	# Same feature-detect contract as list_teams and update_team_color: on a
+	# site that has not run the unity_team_color_field patch the column is
+	# absent, so the colour is dropped silently rather than erroring (the SPA
+	# hides its colour input there anyway).
+	has_color = frappe.db.has_column("HD Team", "custom_color")
+
+	doc = frappe.get_doc(
+		{
+			"doctype": "HD Team",
+			"team_name": name,
+			"users": [{"user": u} for u in members],
+		}
+	)
+	if has_color and color_value:
+		doc.custom_color = color_value
+	doc.insert(ignore_permissions=True)
+
+	row = {
+		"name": doc.name,
+		"ignore_restrictions": cint(doc.ignore_restrictions),
+		"users": members,
+	}
+	if has_color:
+		row["custom_color"] = color_value
+	return row
+
+
 @frappe.whitelist()
 def update_team_color(name, color=None):
 	"""Set the SPA-displayed colour on an HD Team; empty string clears it.
 
 	The Unity ticket list tints the Assigned To chip with the colour of the
 	ticket's `agent_group`, which IS this team's name (HD Team.autoname is
-	`field:team_name`). Admins only — same gate as the ticket-type colour.
+	`field:team_name`). Admins only same gate as the ticket-type colour.
 	"""
 	_require_team_admin()
 	name = _require_team(name)
 	color_value = _normalize_hex_color(color)
 	if not frappe.db.has_column("HD Team", "custom_color"):
-		# Silent no-op when the schema patch hasn't applied on this site — the
+		# Silent no-op when the schema patch hasn't applied on this site the
 		# SPA hides the Color column anyway (see list_teams), so surfacing a
 		# 'run bench migrate' error to an end user would help nobody.
 		frappe.logger().warning(
@@ -4972,24 +5107,13 @@ def update_team_members(name, users=None):
 	and (b) what they can see if the team visibility restriction is enabled.
 
 	Safe to save: hd_team.py defines only after_insert / after_rename /
-	on_trash — no validate or on_update — so this triggers no Assignment Rule
+	on_trash no validate or on_update so this triggers no Assignment Rule
 	churn. Rotations are driven by HD Agent.groups, a different child table.
 	"""
 	_require_team_admin()
 	name = _require_team(name)
 
-	wanted = _parse_json(users, []) or []
-	if isinstance(wanted, str):
-		wanted = [wanted]
-	cleaned = []
-	for entry in wanted:
-		user = cstr(entry or "").strip()
-		if user and user not in cleaned:  # dedupe, preserve order
-			cleaned.append(user)
-
-	missing = [u for u in cleaned if not frappe.db.exists("User", u)]
-	if missing:
-		frappe.throw(_("Unknown user(s): {0}").format(", ".join(missing)))
+	cleaned = _clean_team_users(users)
 
 	doc = frappe.get_doc("HD Team", name)
 	doc.set("users", [{"user": u} for u in cleaned])
@@ -5073,7 +5197,7 @@ def get_bulk_emails_received_by(email):
 	if not email or not _has_field(TICKET_DOCTYPE, "custom_bulk_email_recipients"):
 		return []
 	# LIKE %email% is a full table scan on the Long Text. For the volumes this
-	# handles (a parent's history surface — never more than a handful of bulk
+	# handles (a parent's history surface never more than a handful of bulk
 	# emails per recipient) the cost is acceptable. If it grows hot we can move
 	# to a join table.
 	rows = frappe.get_all(
@@ -5246,7 +5370,7 @@ def update_ticket(
 		ticket.custom_hold_to = hold_to
 	if hold_reason is not None and _has_field(TICKET_DOCTYPE, "custom_hold_reason"):
 		ticket.custom_hold_reason = hold_reason
-		# A non-empty hold reason implies the ticket is On Hold — unless the caller
+		# A non-empty hold reason implies the ticket is On Hold unless the caller
 		# explicitly cleared the flag (is_on_hold == 0) in the same request. Keeps the
 		# reason and the "Issues On Hold" indicator consistent (e.g. a reason typed
 		# from the list must reflect as On Hold, not silently do nothing).
@@ -5285,13 +5409,13 @@ def update_ticket(
 ALLOWED_BULK_FIELDS = {"status", "priority", "_assign", "ticket_type", "agent_group"}
 # Fields whose changes don't trigger controller side effects (activity log,
 # search index rebuild, SLA recalculation). We can skip `doc.save()` for these
-# and do a raw column update — orders of magnitude faster at bulk scale.
+# and do a raw column update orders of magnitude faster at bulk scale.
 BULK_FAST_PATH_FIELDS = {"priority", "ticket_type", "agent_group"}
 BULK_UPDATE_MAX = 500
 
 
 def _status_field_updates(value, current_status):
-	"""The core field writes for a status change — shared by the inline
+	"""The core field writes for a status change shared by the inline
 	`update_ticket` save path (helpdesk.api.unity_helpdesk_ext) and the bulk
 	fast-path below, so the two always agree.
 
@@ -5321,7 +5445,7 @@ def bulk_update_tickets(names, field, value=None):
 	leaving the user with a `msgprint`.
 
 	For fields in `BULK_FAST_PATH_FIELDS` we issue a raw `db.set_value` per
-	ticket — skipping `doc.save()` avoids the per-row search-index rebuild
+	ticket skipping `doc.save()` avoids the per-row search-index rebuild
 	(see `HDTicket.on_update`), which is the dominant cost at 500-row scale."""
 	capabilities = _require_unity_access()
 	field_name = cstr(field or "").strip()
@@ -5335,7 +5459,7 @@ def bulk_update_tickets(names, field, value=None):
 		frappe.throw(_("Bulk edit supports up to {0} tickets at a time").format(BULK_UPDATE_MAX))
 
 	if field_name == "status":
-		# Allow "On Hold" as a virtual status — mirrors `update_ticket`.
+		# Allow "On Hold" as a virtual status mirrors `update_ticket`.
 		if value and value not in STATUS_OPTIONS and value != "On Hold":
 			frappe.throw(_("Invalid ticket status"))
 
@@ -5366,7 +5490,7 @@ def bulk_update_tickets(names, field, value=None):
 					)
 			elif field_name == "status":
 				# Fast path: write the same status fields the inline update_ticket
-				# save would, but via a raw db.set_value — skipping the full doc
+				# save would, but via a raw db.set_value skipping the full doc
 				# lifecycle (SLA recompute / Activity / Version / search-index /
 				# realtime). The accepted bulk trade-off. Fetch only the current
 				# status for the On-Hold decision.
@@ -5379,7 +5503,7 @@ def bulk_update_tickets(names, field, value=None):
 						updates["resolution_date"] = frappe.utils.now_datetime()
 				frappe.db.set_value(TICKET_DOCTYPE, name, updates)
 			elif field_name in BULK_FAST_PATH_FIELDS:
-				# Raw column update — bypasses `on_update` which rebuilds the
+				# Raw column update bypasses `on_update` which rebuilds the
 				# search index on every save. None of these fields participate
 				# in search/SLA, so it's safe to skip the controller.
 				frappe.db.set_value(TICKET_DOCTYPE, name, field_name, clean_value)
@@ -5475,7 +5599,7 @@ def _default_bulk_recipients():
 	"""
 	# Guard against the field not yet existing on this site (it ships as an
 	# hd_settings docfield that lands on `bench migrate`). A missing OPTIONAL
-	# setting must never raise — get_profile() also carries available_columns /
+	# setting must never raise get_profile() also carries available_columns /
 	# column_preferences, so a throw here blanks the entire ticket list.
 	if not frappe.get_meta("HD Settings").has_field("unity_bulk_email_default_recipients"):
 		return []
@@ -5595,7 +5719,7 @@ def search_contacts(query):
 			row = {"email": e, "name": name or e}
 			# Student hits carry their identity so the composer can add the recipient by
 			# STUDENT ID (not by email). A guardian email shared by two siblings resolves
-			# ambiguously by email — keying the picked token on the student id keeps each
+			# ambiguously by email keying the picked token on the student id keeps each
 			# sibling distinct (the "clicking a name removes a selected student" bug).
 			if student:
 				row["student"] = student
@@ -5603,7 +5727,7 @@ def search_contacts(query):
 				row["reference"] = reference
 			results.append(row)
 
-	# Search Student by id / reference number / name / email — return the student's
+	# Search Student by id / reference number / name / email return the student's
 	# OWN email (the `user` login email) so the BCC picker resolves students by
 	# reference number or name, not only guardians/contacts. Listed first so a
 	# code/ref search surfaces the student.
@@ -5688,7 +5812,7 @@ def _guardian_emails_for_student_ids(student_ids):
 	over the denormalized Student Guardian.email row. Per-student dedupe + lowercase;
 	guardians with no email are skipped. Cross-student dedupe is the caller's job.
 
-	Per-request cached on `frappe.local` — the bulk-email composer triggers
+	Per-request cached on `frappe.local` the bulk-email composer triggers
 	this on every BCC keystroke for repeated student id sets; the cache
 	collapses N consecutive identical lookups into one DB round-trip.
 	"""
@@ -5811,7 +5935,7 @@ def get_student_guardian_emails(student_emails):
 	if not normalized:
 		return _empty()
 
-	# Match each input email against the Student's `user` email — the authoritative
+	# Match each input email against the Student's `user` email the authoritative
 	# student address. student_email_id is deliberately NOT used (often blank/stale).
 	students = frappe.get_all(
 		"Student",

@@ -35,7 +35,7 @@ export function redirectToLogin() {
 }
 
 // Match Frappe's many shapes of "you are not authenticated / authorised".
-// Trigger only on signals strong enough to mean a guest / expired session —
+// Trigger only on signals strong enough to mean a guest / expired session
 // not on every PermissionError (which can also mean "role missing for THIS doc").
 const AUTH_MESSAGE_RE =
   /not permitted|not whitelisted|login to access|guest cannot access|authentication failed|session expired|please login|please log in/i;
@@ -108,7 +108,7 @@ export async function call(method, params = {}, options = {}) {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || payload.exc || payload._server_messages) {
-      // CSRF token expired — fetch a fresh one and retry exactly once
+      // CSRF token expired fetch a fresh one and retry exactly once
       if (response.status === 403 && payload?.exc_type === "CSRFTokenError") {
         const refreshed = await _refreshCsrfToken();
         if (refreshed) {
@@ -136,7 +136,7 @@ export async function call(method, params = {}, options = {}) {
           }
           return retryPayload.message;
         }
-        // CSRF refresh failed — assume session is gone, go to login
+        // CSRF refresh failed assume session is gone, go to login
         redirectToLogin();
         throw new AuthRedirectError();
       }
@@ -177,13 +177,13 @@ export async function call(method, params = {}, options = {}) {
 }
 
 // Retry transient network/5xx failures up to 3 attempts with backoff (1s, 3s, 7s).
-// Application errors (PermissionError, ValidationError, etc — 4xx + payload.exc
+// Application errors (PermissionError, ValidationError, etc 4xx + payload.exc
 // from a 200 response) surface immediately. options.onAttempt(n) is invoked
 // before each retry so views can show a "Reloading…" indicator.
 //
 // SAFETY: retries can cause duplicate side-effects on POSTs that create or mutate
 // state (e.g. create_ticket, bulk_send_email). Callers MUST opt in by passing
-// { idempotent: true } — without that flag this behaves exactly like call().
+// { idempotent: true } without that flag this behaves exactly like call().
 export async function callWithRetry(method, params = {}, options = {}) {
   if (!options.idempotent) {
     return call(method, params, options);
@@ -333,7 +333,7 @@ export async function getSidebarProfile() {
 }
 
 export async function getAgentCandidates(search = "") {
-  // Searched server-side across every enabled System User — passing no `search`
+  // Searched server-side across every enabled System User passing no `search`
   // returns a short default browse list, not the whole table.
   return (
     (await call("helpdesk.api.unity_helpdesk.get_agent_candidates", {
@@ -372,10 +372,22 @@ export async function updateTicketTypeColor(name, color) {
   });
 }
 
-// --- Team Settings (admin only; all three gate on can_manage_unity_settings) ---
+// --- Team Settings (admin only; all four gate on can_manage_unity_settings) ---
 
 export async function listTeams() {
   return (await call("helpdesk.api.unity_helpdesk.list_teams")) || [];
+}
+
+// Create only. No rename, no delete: HD Team.name IS the agent_group string on
+// every ticket, so a rename rewrites tabHD Ticket and a delete leaves dangling
+// values. The backend REJECTS a duplicate name rather than returning the
+// existing team, because a silent match would drop the members just picked.
+export async function createTeam({ name, color, users }) {
+  return call("helpdesk.api.unity_helpdesk.create_team", {
+    name,
+    color: color || "",
+    users: users || [],
+  });
 }
 
 export async function updateTeamColor(name, color) {
@@ -385,7 +397,7 @@ export async function updateTeamColor(name, color) {
   });
 }
 
-// Replaces the whole member list. NOT cosmetic — membership drives which team
+// Replaces the whole member list. NOT cosmetic membership drives which team
 // gets stamped on that person's next assignment, and what they can see if the
 // team visibility restriction is switched on.
 export async function updateTeamMembers(name, users) {
