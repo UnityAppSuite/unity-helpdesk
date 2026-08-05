@@ -306,7 +306,7 @@ nav a.router-link-active {
   min-width: 500px; /* wrap the WHOLE group to row 2 rather than squeezing the buttons */
   justify-content: flex-end; /* search box + Search + Refresh + Columns as a right-aligned cluster */
 }
-/* Refresh + Columns never wrap into a jumpy 2-high stack — they keep their natural size. */
+/* Refresh + Columns never wrap into a jumpy 2-high stack they keep their natural size. */
 .toolbar-bottom .toolbar-actions {
   display: flex;
   flex-wrap: nowrap;
@@ -1181,7 +1181,7 @@ a.legend-row:hover {
   padding: 13px 18px;
   border-bottom: 1px solid var(--border);
   /* Four page-size pills + "Showing X of Y" + "Load more" overflow a narrow
-     phone otherwise — this row has no other wrapping mechanism. */
+     phone otherwise this row has no other wrapping mechanism. */
   flex-wrap: wrap;
 }
 
@@ -1262,7 +1262,7 @@ a.legend-row:hover {
   font-weight: 600;
   cursor: pointer;
   padding: 0;
-  text-decoration: none; /* also used on <a>/RouterLink now — no default underline */
+  text-decoration: none; /* also used on <a>/RouterLink now no default underline */
 }
 
 .link-btn:hover {
@@ -1338,7 +1338,7 @@ tbody tr.portal-ticket:hover {
   background-color: #d1fae5;
 }
 
-/* Bulk emails use the same green as portal/single emails — no blue distinction. */
+/* Bulk emails use the same green as portal/single emails no blue distinction. */
 tbody tr.bulk-email-ticket {
   background-color: #ecfdf5;
 }
@@ -1820,7 +1820,7 @@ tbody tr.bulk-email-ticket:hover {
   background: rgba(79, 70, 229, 0.2);
 }
 
-/* Count / annotation text in the right-chevron toggle header — sits between
+/* Count / annotation text in the right-chevron toggle header sits between
    the title and the chevron pill (e.g. "30 of 30 previous tickets"). */
 .section-toggle--right small {
   color: var(--muted, #6b7280);
@@ -1833,7 +1833,7 @@ tbody tr.bulk-email-ticket:hover {
 
 /* Created-date range filter: single button → popover with from/to inputs. */
 
-/* Mail Body preview cell — shows the first ~140 chars of the customer's
+/* Mail Body preview cell shows the first ~140 chars of the customer's
    primary message. Wider column with a small italic preview look. Hovering
    the cell reveals the full text via the native title tooltip. */
 .cell-mail-body {
@@ -1913,7 +1913,7 @@ tbody tr.bulk-email-ticket:hover {
   text-align: left;
 }
 
-/* Override the global .detail-section h3 banner-style — inside a settings
+/* Override the global .detail-section h3 banner-style inside a settings
    card the title should be inline-left, not a full-width underlined banner. */
 .settings-card .settings-card__heading h3 {
   margin: 0;
@@ -2130,7 +2130,7 @@ tbody tr.bulk-email-ticket:hover {
 }
 
 /* .student-context-table / __heading removed with the transposed student table
-   they styled — the card grid below replaces it. .compact-info-table's own
+   they styled the card grid below replaces it. .compact-info-table's own
    720px floor is intentionally left alone: the guardian, legacy-student and
    previous-ticket tables still use it. */
 
@@ -2220,7 +2220,7 @@ tbody tr.bulk-email-ticket:hover {
   gap: 12px;
   /* auto-fit + min(): once the available width drops below 240px the track
      collapses to 100% instead of overflowing. That's what makes "never scrolls
-     sideways" true at every viewport and every sibling count — no media query
+     sideways" true at every viewport and every sibling count no media query
      needed, and the existing max-width:980px rule already gives this section
      the full page width on smaller screens. */
   grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
@@ -2235,7 +2235,7 @@ tbody tr.bulk-email-ticket:hover {
 
 /* One field per row. The shared .field-grid is 2-up (ProfileView needs that),
    which left Status and "Confirm for Next Year" sharing a row while Class and
-   Payment Plan spanned the full width — an inconsistent, hard-to-scan mix.
+   Payment Plan spanned the full width an inconsistent, hard-to-scan mix.
    Every field reads down a single column here. */
 .student-context-card .field-grid {
   grid-template-columns: 1fr;
@@ -2329,7 +2329,7 @@ tbody tr.bulk-email-ticket:hover {
   min-width: 960px;
 }
 
-/* Whole-row stretched link — right/middle-click "open in new tab" works anywhere
+/* Whole-row stretched link right/middle-click "open in new tab" works anywhere
    on a previous-ticket row (read-only rows, so no controls to raise above it). */
 .previous-ticket-table tbody tr {
   position: relative;
@@ -2357,7 +2357,7 @@ tbody tr.bulk-email-ticket:hover {
   box-shadow: inset 3px 0 0 #16a34a;
 }
 
-/* Ticket-type pill rendering — circular color dot followed by the type
+/* Ticket-type pill rendering circular color dot followed by the type
    name. Used in the Previous Tickets panel of the ticket detail page and
    anywhere else we want a compact visual category cue. Color comes from
    HD Ticket Type.custom_color (admin-configurable via the Settings UI). */
@@ -2705,7 +2705,7 @@ tbody tr.bulk-email-ticket:hover {
   padding: 4px 0;
 }
 
-/* Agent (the support team — "us") sits on the right like sent messages;
+/* Agent (the support team "us") sits on the right like sent messages;
    the customer sits on the left. */
 .thread-layout-chat-based .chat-msg--customer {
   align-self: flex-start;
@@ -2717,7 +2717,7 @@ tbody tr.bulk-email-ticket:hover {
   border-bottom-right-radius: 6px;
 }
 
-/* Internal notes belong to the agent ("our") side — keep them on the right
+/* Internal notes belong to the agent ("our") side keep them on the right
    with the agent replies, WhatsApp-style. */
 .thread-layout-chat-based .chat-msg--comment {
   align-self: flex-end;
@@ -2864,7 +2864,7 @@ tbody tr.bulk-email-ticket:hover {
   padding: 12px 14px;
   border: 1px solid #fcd34d;
   border-radius: 12px;
-  background: #fef3c7; /* opaque amber shade — never see-through */
+  background: #fef3c7; /* opaque amber shade never see-through */
   color: #92400e;
   font-size: 13px;
   font-weight: 500;
@@ -2875,7 +2875,7 @@ tbody tr.bulk-email-ticket:hover {
   padding: 12px 14px;
   border: 1px solid #86efac;
   border-radius: 12px;
-  background: #dcfce7; /* opaque green shade — never see-through */
+  background: #dcfce7; /* opaque green shade never see-through */
   color: #166534;
   font-size: 13px;
   font-weight: 500;
@@ -3025,7 +3025,7 @@ tbody tr.bulk-email-ticket:hover {
   min-height: 360px;
 }
 
-/* List-page skeleton — five rows of varied-width shimmer blocks that match
+/* List-page skeleton five rows of varied-width shimmer blocks that match
    the cadence of the real ticket table. Used while the first page-load
    query is in flight, so the SPA never shows the bare "Searching…" text
    that previously stuck for the full 30 s timeout when the backend hung. */
@@ -3059,7 +3059,7 @@ tbody tr.bulk-email-ticket:hover {
   animation: skeleton-shimmer 1.25s linear infinite;
 }
 
-/* Stagger the shimmer phase so the rows don't pulse in unison — looks
+/* Stagger the shimmer phase so the rows don't pulse in unison looks
    livelier and less "loading bar"-like. */
 .skeleton-row:nth-child(2) > span { animation-delay: 0.08s; }
 .skeleton-row:nth-child(3) > span { animation-delay: 0.16s; }
@@ -3079,7 +3079,7 @@ tbody tr.bulk-email-ticket:hover {
   color: var(--danger);
 }
 
-/* Inline composer/bulk validation error — a SOLID (opaque) box, never see-through, so it
+/* Inline composer/bulk validation error a SOLID (opaque) box, never see-through, so it
    stays readable over whatever is behind it. */
 .error-box {
   padding: 10px 12px;
@@ -3161,7 +3161,7 @@ th.col-dragging { opacity: 0.45; background: #eef2ff; }
 th:hover .col-remove-btn { display: inline; }
 
 /* Sortable column header. `font/color: inherit` keeps it visually identical to
-   a plain header label — the surrounding th rule still supplies size/weight. */
+   a plain header label the surrounding th rule still supplies size/weight. */
 .col-sort-btn {
   display: inline-flex;
   align-items: center;
@@ -3197,7 +3197,7 @@ th:hover .col-remove-btn { display: inline; }
   display: inline-flex;
 }
 /* Filter button lives in the FILTER row (row 1), immediately before Apply, so it
-   reads as part of the same commit — unlike Sort, which acts instantly from row 2.
+   reads as part of the same commit unlike Sort, which acts instantly from row 2.
    position: relative is what the popover's absolute positioning anchors to. */
 .filter-wrap {
   position: relative;
@@ -4009,7 +4009,7 @@ body.col-resizing .ticket-table * {
   transition: color 150ms ease-out;
 }
 
-/* Searchable "Created By" filter dropdown — trigger matches the filter selects, panel
+/* Searchable "Created By" filter dropdown trigger matches the filter selects, panel
    matches the assignee popover. */
 
 /* Global non-blocking notice (toast) shown above everything while a send runs. */
@@ -4138,7 +4138,7 @@ body.col-resizing .ticket-table * {
   vertical-align: middle;
 }
 
-/* Mobile summary cards — hidden on desktop, shown ≤640px (table hidden then). */
+/* Mobile summary cards hidden on desktop, shown ≤640px (table hidden then). */
 .ticket-cards {
   display: none;
 }
@@ -4349,7 +4349,7 @@ body.col-resizing .ticket-table * {
 .bulk-send-progress-fill.has-errors {
   background: #d97706;
 }
-/* The delivery (Email Queue) bar — a lighter tone than the queueing bar. */
+/* The delivery (Email Queue) bar a lighter tone than the queueing bar. */
 .bulk-send-progress-fill.delivered {
   background: #0ea5e9;
 }
@@ -4426,7 +4426,7 @@ body.col-resizing .ticket-table * {
   color: #166534;
   font-weight: 600;
 }
-/* Minimized chip — a compact bar the user can click to re-expand. */
+/* Minimized chip a compact bar the user can click to re-expand. */
 .bulk-send-progress-chip {
   display: inline-flex;
   align-items: center;

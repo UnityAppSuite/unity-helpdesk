@@ -98,8 +98,8 @@
                   <th>
                     Keywords
                     <small class="muted" style="font-weight: normal">
-                      — incoming tickets auto-assign to the type whose keyword
-                      matches their subject/body.
+                      (incoming tickets auto-assign to the type whose keyword
+                      matches their subject/body)
                     </small>
                   </th>
                   <th>Actions</th>
@@ -154,7 +154,7 @@
                           {{ kw }}
                         </span>
                       </span>
-                      <span v-else class="muted">—</span>
+                      <span v-else class="muted"> </span>
                     </template>
                   </td>
                   <td class="actions-cell">
@@ -198,11 +198,78 @@
         <SettingsCard
           v-if="canManageUnitySettings"
           title="Team Settings"
-          subtitle="Give each team a colour — the Assigned To chip in the ticket list is tinted with the colour of the ticket's Agent Group. Members are not cosmetic: adding someone changes which team is stamped on their next assignment."
+          subtitle="Give each team a colour. The Assigned To chip in the ticket list is tinted with the colour of the ticket's Agent Group. Members are not cosmetic: adding someone changes which team is stamped on their next assignment."
           :model-value="sections.teams"
           @update:model-value="(v) => (sections.teams = v)"
         >
           <p v-if="teamError" class="error">{{ teamError }}</p>
+
+          <div class="inline-actions">
+            <button v-if="!teamFormOpen" class="btn" @click="openTeamForm">
+              + Add Team
+            </button>
+          </div>
+
+          <div v-if="teamFormOpen" class="template-form">
+            <h4 style="margin: 0">New team</h4>
+            <!-- Its own error, rendered next to the control that produced it.
+                 teamError sits at the top of the card and belongs to the edit
+                 row, and a create failure two screens up from the Create
+                 button reads as "nothing happened". -->
+            <p v-if="teamCreateError" class="error">{{ teamCreateError }}</p>
+            <label>
+              Team name
+              <input
+                v-model="newTeam.name"
+                type="text"
+                maxlength="140"
+                placeholder="e.g. Transport"
+              />
+              <small class="muted">
+                Permanent. This exact string is what gets stored in every
+                ticket's Agent Group, and renaming isn't offered here.
+              </small>
+            </label>
+            <!-- Hidden on a site with zero teams, because teamColorAvailable
+                 is feature-detected from the loaded rows. It reappears as soon
+                 as the first team exists; the colour is then settable via
+                 Edit. Not a bug: showing a picker whose save silently no-ops
+                 on an unpatched site is the failure this detect prevents. -->
+            <label v-if="teamColorAvailable">
+              Colour
+              <input
+                v-model="newTeam.colorInput"
+                type="color"
+                class="ticket-type-color-input"
+                title="Pick color for this team"
+              />
+              <small class="muted">
+                Leave the default grey to create the team without a colour.
+              </small>
+            </label>
+            <small class="muted">
+              Members (optional). A ticket assigned to a member gets stamped
+              with this team.
+            </small>
+            <MemberPicker v-model="newTeam.members" :agents="agents" />
+            <div class="inline-actions">
+              <button
+                class="btn"
+                :disabled="creatingTeam || !newTeam.name.trim()"
+                @click="handleCreateTeam"
+              >
+                {{ creatingTeam ? "Creating..." : "Create team" }}
+              </button>
+              <button
+                class="btn secondary"
+                :disabled="creatingTeam"
+                @click="closeTeamForm"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+
           <div class="scroll-x">
             <table>
               <thead>
@@ -212,8 +279,8 @@
                   <th>
                     Members
                     <small class="muted" style="font-weight: normal">
-                      — a ticket assigned to a member gets stamped with this
-                      team.
+                      (a ticket assigned to a member gets stamped with this
+                      team)
                     </small>
                   </th>
                   <th style="width: 150px">Actions</th>
@@ -247,69 +314,10 @@
                   </td>
                   <td>
                     <template v-if="editingTeam.name === team.name">
-                      <!-- Deliberately NOT a native <select multiple>: there a
-                           plain click REPLACES the whole selection, which
-                           silently wiped members. Click here toggles. -->
-                      <div class="member-picker">
-                        <div
-                          v-if="editingTeam.members.length"
-                          class="member-chips"
-                        >
-                          <span
-                            v-for="user in editingTeam.members"
-                            :key="user"
-                            class="member-chip"
-                          >
-                            {{ agentLabel(user) }}
-                            <button
-                              type="button"
-                              class="member-chip-remove"
-                              :title="`Remove ${agentLabel(user)}`"
-                              @click="toggleMember(user)"
-                            >
-                              ×
-                            </button>
-                          </span>
-                        </div>
-                        <input
-                          v-model="memberSearch"
-                          type="text"
-                          class="member-search"
-                          placeholder="Search agents to add…"
-                        />
-                        <ul class="member-options">
-                          <li
-                            v-for="agent in memberCandidates"
-                            :key="agent.name"
-                            class="member-option"
-                            :class="{
-                              selected: editingTeam.members.includes(
-                                agent.name
-                              ),
-                            }"
-                            @click="toggleMember(agent.name)"
-                          >
-                            <input
-                              type="checkbox"
-                              :checked="
-                                editingTeam.members.includes(agent.name)
-                              "
-                              tabindex="-1"
-                            />
-                            <span>{{ agent.full_name || agent.name }}</span>
-                          </li>
-                          <li
-                            v-if="!memberCandidates.length"
-                            class="member-option disabled"
-                          >
-                            No match
-                          </li>
-                        </ul>
-                        <small class="muted">
-                          {{ editingTeam.members.length }} selected — click to
-                          add or remove.
-                        </small>
-                      </div>
+                      <MemberPicker
+                        v-model="editingTeam.members"
+                        :agents="agents"
+                      />
                     </template>
                     <template v-else>
                       <span v-if="!team.users?.length" class="muted"
@@ -389,7 +397,7 @@
             <textarea
               v-model="newCategory.description"
               rows="2"
-              placeholder="Optional — what kind of replies live in this category?"
+              placeholder="Optional: what kind of replies live in this category?"
             ></textarea>
           </label>
 
@@ -424,7 +432,7 @@
                       type="color"
                       class="color-swatch-input"
                     />
-                    <span v-else class="muted">—</span>
+                    <span v-else class="muted"> </span>
                   </td>
                   <td>
                     <span
@@ -478,7 +486,7 @@
         <SettingsCard
           v-if="canManageUnitySettings"
           title="Reply Templates"
-          subtitle="Saved static replies agents can insert from the TinyMCE editor. Body and subject are inserted as-is — agents can edit after inserting."
+          subtitle="Saved static replies agents can insert from the TinyMCE editor. Body and subject are inserted as-is, and agents can edit after inserting."
           :model-value="sections.templates"
           @update:model-value="(v) => (sections.templates = v)"
         >
@@ -523,7 +531,7 @@
               <label class="grow">
                 Category
                 <select v-model="templateForm.category">
-                  <option value="">— select —</option>
+                  <option value="">select</option>
                   <option
                     v-for="cat in categories"
                     :key="cat.name"
@@ -741,6 +749,7 @@ import {
   createAgent,
   createReplyTemplate,
   createReplyTemplateCategory,
+  createTeam,
   createTicketType,
   deleteReplyTemplate,
   deleteReplyTemplateCategory,
@@ -760,9 +769,10 @@ import {
   updateTicketTypeKeywords,
   updateUnitySettings,
 } from "../api";
+import MemberPicker from "@/components/MemberPicker.vue";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
 
-// Local collapsible card — keeps the template uniform without a separate file.
+// Local collapsible card keeps the template uniform without a separate file.
 const SettingsCard = {
   name: "SettingsCard",
   props: {
@@ -820,7 +830,7 @@ const refreshUnitySession = inject("refreshUnitySession", () =>
   Promise.resolve()
 );
 
-// All sections collapsed by default — admin clicks to expand the one they need.
+// All sections collapsed by default admin clicks to expand the one they need.
 const sections = reactive({
   profile: false,
   unity: false,
@@ -861,7 +871,7 @@ const creatingTicketType = ref(false);
 // key on at least one row. The backend strips that key when the
 // HD Ticket Type table doesn't have the custom_color column yet (e.g.
 // the schema patch hasn't applied), so this flag also gates whether we
-// expose the Color column in the UI — no half-working pickers, no
+// expose the Color column in the UI no half-working pickers, no
 // developer-facing "run bench migrate" prompts.
 const colorColumnAvailable = computed(() =>
   ticketTypes.value.some((t) =>
@@ -891,21 +901,11 @@ const editingTeam = reactive({
   members: [],
   originalMembers: [],
 });
-const memberSearch = ref("");
-const memberCandidates = computed(() => {
-  const q = memberSearch.value.trim().toLowerCase();
-  const list = agents.value || [];
-  if (!q) return list;
-  return list.filter(
-    (a) =>
-      String(a.full_name || "")
-        .toLowerCase()
-        .includes(q) ||
-      String(a.name || "")
-        .toLowerCase()
-        .includes(q)
-  );
-});
+// --- New team (create only; no rename or delete is offered anywhere) ---
+const teamFormOpen = ref(false);
+const creatingTeam = ref(false);
+const teamCreateError = ref("");
+const newTeam = reactive({ name: "", colorInput: NEUTRAL_SWATCH, members: [] });
 
 const savingTicketType = ref(false);
 const newTicketType = reactive({ name: "", description: "", priority: "" });
@@ -973,7 +973,7 @@ const filteredAgents = computed(() => {
 // --- Searchable "Add Agent" candidate combobox ---
 // Searching happens on the server across every enabled System User. It used to
 // be a client-side filter over the first 200 users by name, which silently made
-// anyone sorting past that window — every newly created user included —
+// anyone sorting past that window every newly created user included
 // impossible to find.
 const CANDIDATE_DEBOUNCE_MS = 300;
 let candidateSearchTimer = null;
@@ -990,7 +990,7 @@ function candidateLabel(candidate) {
 }
 function onCandidateInput() {
   candidateOpen.value = true;
-  // Typing invalidates any previous pick — otherwise "Add Agent" stays enabled
+  // Typing invalidates any previous pick otherwise "Add Agent" stays enabled
   // and would add the old user while the box shows a different name.
   selectedUser.value = "";
   selectedCandidate.value = null;
@@ -1106,7 +1106,7 @@ async function loadCandidates(search = "") {
 async function loadTicketTypes() {
   try {
     if (canManageUnitySettings.value) {
-      // Admin view — also fetches keywords so the row can be edited inline.
+      // Admin view also fetches keywords so the row can be edited inline.
       ticketTypes.value = await listTicketTypesWithKeywords();
     } else {
       ticketTypes.value = await getTicketTypes();
@@ -1121,7 +1121,7 @@ function startTicketTypeEdit(type) {
   editingTicketType.keywordsInput = Array.isArray(type.keywords)
     ? type.keywords.join(", ")
     : "";
-  // <input type="color"> requires a valid hex string — fall back to a
+  // <input type="color"> requires a valid hex string, so fall back to a
   // neutral default when the type has no color set yet.
   editingTicketType.colorInput = type.custom_color || "#94a3b8";
   editingTicketType.originalColor = type.custom_color || "";
@@ -1153,14 +1153,6 @@ function teamMemberLabels(team) {
   return (team.users || []).map(agentLabel).join(", ");
 }
 
-// Add/remove one person at a time. The whole point of replacing the native
-// <select multiple>: there, a plain click discards every other selection.
-function toggleMember(user) {
-  const i = editingTeam.members.indexOf(user);
-  if (i === -1) editingTeam.members.push(user);
-  else editingTeam.members.splice(i, 1);
-}
-
 function startTeamEdit(team) {
   editingTeam.name = team.name;
   // <input type="color"> refuses anything but a valid hex, so an unset colour
@@ -1169,7 +1161,6 @@ function startTeamEdit(team) {
   editingTeam.originalColor = team.custom_color || "";
   editingTeam.members = [...(team.users || [])];
   editingTeam.originalMembers = [...(team.users || [])];
-  memberSearch.value = "";
 }
 
 function cancelTeamEdit() {
@@ -1178,7 +1169,6 @@ function cancelTeamEdit() {
   editingTeam.originalColor = "";
   editingTeam.members = [];
   editingTeam.originalMembers = [];
-  memberSearch.value = "";
 }
 
 async function saveTeamEdit() {
@@ -1215,6 +1205,43 @@ async function saveTeamEdit() {
   }
 }
 
+function openTeamForm() {
+  newTeam.name = "";
+  newTeam.colorInput = NEUTRAL_SWATCH;
+  newTeam.members = [];
+  teamCreateError.value = "";
+  teamFormOpen.value = true;
+}
+
+function closeTeamForm() {
+  teamFormOpen.value = false;
+  teamCreateError.value = "";
+}
+
+async function handleCreateTeam() {
+  const name = newTeam.name.trim();
+  if (!name) return;
+  creatingTeam.value = true;
+  teamCreateError.value = "";
+  try {
+    // Send a colour ONLY if the admin actually moved the picker. <input
+    // type="color"> can't hold a blank value, so an untouched picker reads
+    // back as NEUTRAL_SWATCH, and sending that would give every new team a
+    // grey nobody chose. Same sentinel rule as saveTeamEdit's colorTouched.
+    const color =
+      newTeam.colorInput && newTeam.colorInput !== NEUTRAL_SWATCH
+        ? newTeam.colorInput
+        : "";
+    await createTeam({ name, color, users: newTeam.members });
+    closeTeamForm();
+    await loadTeams();
+  } catch (err) {
+    teamCreateError.value = err.message;
+  } finally {
+    creatingTeam.value = false;
+  }
+}
+
 async function saveTicketTypeEdit() {
   if (!editingTicketType.name) return;
   savingTicketType.value = true;
@@ -1226,7 +1253,7 @@ async function saveTicketTypeEdit() {
       .filter(Boolean);
 
     // Fire both saves in parallel. The color endpoint only writes when the
-    // value changed — saves a needless round-trip when the admin just
+    // value changed saves a needless round-trip when the admin just
     // tweaked keywords.
     const promises = [
       updateTicketTypeKeywords(editingTicketType.name, keywords),
