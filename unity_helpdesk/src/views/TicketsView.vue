@@ -43,6 +43,9 @@
           <span v-else class="badge blue">Assigned to me</span>
           <select v-model="filterDraft.agent_group">
             <option value="">Agent Group: All</option>
+            <!-- Tickets with a blank group. "" is already spent on All, so the
+                 server takes a namespaced sentinel instead. -->
+            <option :value="UNSPECIFIED_AGENT_GROUP">Unspecified</option>
             <option
               v-for="grp in agentGroups"
               :key="grp.name"
@@ -1081,6 +1084,12 @@ import { useRoute, useRouter } from "vue-router";
 import { dayjs } from "@desk/dayjs";
 import FilterPopover from "@/components/FilterPopover.vue";
 import SortPopover from "@/components/SortPopover.vue";
+
+// Agent Group filter choice for "no team". Must match
+// helpdesk.api.unity_helpdesk.UNSPECIFIED_AGENT_GROUP. Namespaced rather than
+// the literal "Unspecified" so it can never collide with a real HD Team of that
+// name, and not "" because the dropdown already spends that on "All".
+const UNSPECIFIED_AGENT_GROUP = "__unspecified__";
 import {
   AuthRedirectError,
   bulkUpdateTickets,
@@ -1268,10 +1277,13 @@ const filterOptionsByKey = computed(() => ({
     value: t.name,
     label: t.name,
   })),
-  agent_group: agentGroups.value.map((g) => ({
-    value: g.name,
-    label: g.name,
-  })),
+  agent_group: [
+    { value: UNSPECIFIED_AGENT_GROUP, label: "Unspecified" },
+    ...agentGroups.value.map((g) => ({
+      value: g.name,
+      label: g.name,
+    })),
+  ],
   owner: agents.value.map((a) => ({
     value: a.name,
     label: a.full_name || a.name,
@@ -2900,7 +2912,14 @@ function truncateBody(text) {
 
 function formatCellValue(ticket, key) {
   const raw = ticket?.[key];
-  if (raw == null || raw === "") return "-";
+  if (raw == null || raw === "") {
+    // A blank agent_group is a real, deliberate state, not missing data:
+    // sync_agent_group_for_ticket clears it when the assignee belongs to no
+    // team, so the ticket stops advertising the "Calling Team" default nobody
+    // chose. A bare "-" would read as "unknown"; say what it means.
+    if (key === "agent_group") return "Unspecified";
+    return "-";
+  }
   if (DATE_COLUMN_KEYS.has(key)) return formatDate(raw);
   if (DATETIME_COLUMN_KEYS.has(key)) return formatDateTime(raw);
   if (key === "_assign") {

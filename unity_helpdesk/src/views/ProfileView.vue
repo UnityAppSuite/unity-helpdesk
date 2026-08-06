@@ -251,7 +251,11 @@
               Members (optional). A ticket assigned to a member gets stamped
               with this team.
             </small>
-            <MemberPicker v-model="newTeam.members" :agents="agents" />
+            <MemberPicker
+              v-model="newTeam.members"
+              :agents="agents"
+              :memberships="memberTeamMap"
+            />
             <div class="inline-actions">
               <button
                 class="btn"
@@ -317,6 +321,8 @@
                       <MemberPicker
                         v-model="editingTeam.members"
                         :agents="agents"
+                        :memberships="memberTeamMap"
+                        :current-team="editingTeam.name"
                       />
                     </template>
                     <template v-else>
@@ -901,6 +907,19 @@ const editingTeam = reactive({
   members: [],
   originalMembers: [],
 });
+// { userId: teamName } across every loaded team. Feeds MemberPicker so people
+// the HD Team validate hook would reject are greyed out at pick time rather
+// than failing the whole save. One agent belongs to at most one team, so a
+// flat map is enough; if data ever violates that, last team by name wins here
+// and the server still reports the real clash.
+const memberTeamMap = computed(() => {
+  const map = {};
+  for (const team of teams.value || []) {
+    for (const user of team.users || []) map[user] = team.name;
+  }
+  return map;
+});
+
 // --- New team (create only; no rename or delete is offered anywhere) ---
 const teamFormOpen = ref(false);
 const creatingTeam = ref(false);

@@ -58,16 +58,33 @@ _INACTIVE_TODO_STATUSES = ("Cancelled", "Closed")
 
 
 def sync_agent_group_for_ticket(ticket_name, user):
-	"""Point a ticket's agent_group at `user`'s team. Returns the team set, or None.
+	"""Point a ticket's agent_group at `user`'s team.
 
-	The rules, in order — every one of them is a deliberate no-op rather than a
-	write, because the failure mode we care about is *losing* a group that
-	someone set on purpose:
+	Returns the team it set, "" when it cleared the group, or None when it wrote
+	nothing.
 
-	1. User is in no team -> leave it alone. Not a corner case: 52 of the 61
+	The rules, in order. Rules 2 and 3 are shaped around not *losing* a group
+	that someone set on purpose; rule 1 deliberately does clear one, because the
+	group it would otherwise leave behind is a default nobody chose:
+
+	1. User is in no team -> CLEAR the group. Not a corner case: 45 of the 61
 	   agents on this site have no HD Team membership, so this is the common
-	   path. Blanking the group here would strip "Calling Team" off tickets as
-	   they get worked.
+	   path.
+
+	   This rule used to be a no-op, on the reasoning that blanking would strip
+	   "Calling Team" off tickets as they get worked. That turned out to be the
+	   wrong trade: every ticket is BORN "Calling Team" (edu_quality sets a
+	   Property Setter default on HD Ticket.agent_group), so leaving it alone
+	   meant a ticket owned by a teamless agent still advertised itself as the
+	   Calling Team's, on 319 open tickets at the time of the change. A group
+	   nobody owns is worse than no group: the SPA renders the blank as
+	   "Unspecified", which is the truth.
+
+	   Note the interaction with team restrictions, currently OFF. If
+	   `restrict_tickets_by_agent_group` is ever switched on while
+	   `do_not_restrict_tickets_without_an_agent_group` is 0, cleared tickets
+	   become invisible to non-super-admins. Turn the second setting on at the
+	   same time as the first.
 	2. The ticket's current group is already one of the user's teams -> leave it
 	   alone, so a deliberate manual choice survives reassignment within a team.
 	3. Otherwise stamp the user's first team. `_user_teams` is ORDER BY t.name,
@@ -84,10 +101,27 @@ def sync_agent_group_for_ticket(ticket_name, user):
 		for row in (_user_teams(user) or [])
 		if cstr(row.get("team") or "").strip()
 	]
-	if not teams:
-		return None  # rule 1
-
 	current = cstr(frappe.db.get_value(TICKET_DOCTYPE, ticket_name, "agent_group") or "").strip()
+
+	if not teams:  # rule 1
+		if not current:
+			return None  # already Unspecified, nothing to write
+		# NULL, not "". Every one of the 9.8k historically blank tickets here is
+		# NULL, and mixing the two representations splits the data for no gain.
+		# The "Unspecified" filter matches both either way (`is not set` emits
+		# `IS NULL OR = ''`), but a single representation keeps the index
+		# selective and the rows comparable.
+		frappe.db.set_value(
+			TICKET_DOCTYPE,
+			ticket_name,
+			"agent_group",
+			None,
+			update_modified=False,
+		)
+		# "" is the CALLER-facing signal for "cleared", distinct from None which
+		# this function uses for "wrote nothing". It is not what was stored.
+		return ""
+
 	if current in teams:
 		return None  # rule 2
 
@@ -114,7 +148,9 @@ def on_todo_change(doc, method=None):
 
 	The last event to do any work is always the freshly inserted Open ToDo, which
 	carries the NEW assignee in `allocated_to`. Un-assignment reaches us only as
-	Cancelled/Closed and is skipped — the group is never cleared, only moved.
+	Cancelled/Closed and is skipped, so un-assignment never touches the group.
+	(Assigning TO a teamless agent does clear it — that is rule 1, and it is
+	driven by the new assignee, not by the un-assignment.)
 
 	Nothing in here may raise. This runs inside the caller's transaction, so an
 	exception would fail the assignment itself; a ticket showing a stale team is

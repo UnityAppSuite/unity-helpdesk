@@ -21,6 +21,12 @@ from helpdesk.helpdesk.doctype.hd_ticket.api import (
 
 
 TICKET_DOCTYPE = "HD Ticket"
+
+# Wire value for the "Unspecified" choice in the Agent Group filter, i.e. tickets
+# whose agent_group is blank. Namespaced rather than the literal "Unspecified"
+# so it can never collide with a real HD Team of that name, and distinct from ""
+# which the dropdown already spends on "All".
+UNSPECIFIED_AGENT_GROUP = "__unspecified__"
 OPEN_STATUSES = ["Open", "Replied"]
 FINAL_STATUSES = ["Resolved", "Closed"]
 STATUS_OPTIONS = ["Open", "Replied", "Resolved", "Closed"]
@@ -3535,7 +3541,21 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 	# _team_restriction_filters above that one bounds what you MAY see, this one
 	# narrows within it.
 	if filters.get("agent_group"):
-		res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
+		if filters.agent_group == UNSPECIFIED_AGENT_GROUP:
+			# A blank group is a real state, not missing data: rule 1 of
+			# unity_agent_group clears it when the assignee is in no team.
+			#
+			# `is not set` rather than `in [""]`, and the difference is not
+			# cosmetic. An `in` list holding "" makes DatabaseQuery render
+			# `ifnull(agent_group, '') in (...)`, and wrapping the column in a
+			# function makes agent_group_unity_idx unusable: measured on this
+			# site (65k tickets, 9.8k of them blank) that cost 12.8s for one
+			# page of 20 plus 7.2s for the dashboard cards. `is not set` emits
+			# `(agent_group IS NULL OR agent_group = '')`, keeps the index, and
+			# returns the identical 9,839 rows in 2.5s + 3.8s.
+			res.append([TICKET_DOCTYPE, "agent_group", "is", "not set"])
+		else:
+			res.append([TICKET_DOCTYPE, "agent_group", "=", filters.agent_group])
 
 	# "Created By" = the ticket's owner (creator). owner is an indexed column, so a plain
 	# equality filter is cheap even over the full table. No longer a toolbar dropdown
@@ -4943,6 +4963,119 @@ def _clean_team_users(users):
 	if missing:
 		frappe.throw(_("Unknown user(s): {0}").format(", ".join(missing)))
 	return cleaned
+
+
+def _other_team_memberships(users, exclude_team=None):
+	"""{user: [other teams]} for every given user already in a team.
+
+	One bulk query rather than a lookup per user. `exclude_team` is the team
+	being written, so its own existing members are not reported against
+	themselves: re-saving a team must not fail on the people already in it.
+	"""
+	users = [u for u in (users or []) if u]
+	if not users:
+		return {}
+
+	rows = frappe.get_all(
+		"HD Team Member",
+		filters={"parenttype": "HD Team", "user": ("in", users)},
+		fields=["user", "parent"],
+		order_by="parent asc",
+		page_length=0,
+	)
+	clashes = {}
+	for row in rows:
+		if exclude_team and row.parent == exclude_team:
+			continue
+		clashes.setdefault(row.user, []).append(row.parent)
+	return clashes
+
+
+def validate_single_team_membership(doc, method=None):
+	"""One agent, one team. Registered as HD Team `validate` in hooks.py.
+
+	A hook rather than a check inside the Unity endpoints, because the invariant
+	has to hold whatever writes the child table: the Settings page, the desk
+	HD Team form, a data import, or a script. Enforcing it in create_team alone
+	would leave the desk form as a silent way around it.
+
+	Why the invariant matters, beyond tidiness. HD Team.users feeds
+	`_user_teams()`, and two things read it:
+
+	  1. unity_agent_group.sync_agent_group_for_ticket stamps `teams[0]`, which
+	     is ORDER BY t.name. For a two-team agent that means the alphabetically
+	     first team silently wins every assignment, which reads as a bug to
+	     whoever is watching the other team's queue.
+	  2. _team_restriction_filters() grants the UNION of a user's teams, and any
+	     single team carrying `ignore_restrictions` exempts that user from
+	     restrictions entirely. So a second membership is a quiet way to widen
+	     somebody's ticket visibility.
+
+	Only the rows a save INTRODUCES are policed, never the whole list. That is
+	load-bearing in three places:
+
+	  * HDTeam.on_trash calls self.save() (to clear assignment_rule before
+	    deleting the rule). Validating the whole list would make a team holding
+	    a pre-existing overlap impossible to DELETE, which is the one action
+	    that would have resolved it. frappe sets flags.in_delete AFTER on_trash
+	    runs, so there is no delete flag to test here.
+	  * create_assignment_rule() re-saves the team inside after_insert, and a
+	    colour-only edit saves it too. Neither should be refused over data that
+	    was already there.
+	  * It leaves the escape hatch open: an admin can still edit a team that
+	    already has an overlap, including to remove the person causing it.
+
+	Skipped during install/patch/migrate so a fixture or a data patch can never
+	be blocked halfway through a deploy.
+	"""
+	if frappe.flags.in_install or frappe.flags.in_patch or frappe.flags.in_migrate:
+		return
+
+	users = []
+	for row in doc.get("users") or []:
+		user = cstr(getattr(row, "user", None) or "").strip()
+		if user:
+			users.append(user)  # duplicates kept on purpose, see `added` below
+	if not users:
+		return
+
+	# What the child table holds right now. A new doc simply matches nothing,
+	# so this needs no is_new() branch.
+	previous = frappe.get_all(
+		"HD Team Member",
+		filters={"parenttype": "HD Team", "parent": doc.name},
+		pluck="user",
+		page_length=0,
+	)
+
+	remaining = list(previous)
+	added = []
+	for user in users:
+		if user in remaining:
+			remaining.remove(user)  # covered by a row that already exists
+		else:
+			added.append(user)
+	if not added:
+		return
+
+	# The same person twice in one save: the second copy lands in `added` on top
+	# of the first. A repeated row makes _user_teams return the team twice and
+	# skews the teams[0] pick exactly like cross-team overlap does.
+	duplicates = sorted({u for u in added if added.count(u) > 1 or u in previous})
+	if duplicates:
+		frappe.throw(_("{0} is listed more than once in this team").format(", ".join(duplicates)))
+
+	clashes = _other_team_memberships(added, exclude_team=doc.name)
+	if not clashes:
+		return
+
+	detail = ", ".join(f"{user} ({', '.join(teams)})" for user, teams in sorted(clashes.items()))
+	frappe.throw(
+		_(
+			"An agent can only belong to one team. Already in another team: {0}. "
+			"Remove them from that team first."
+		).format(detail)
+	)
 
 
 @frappe.whitelist()

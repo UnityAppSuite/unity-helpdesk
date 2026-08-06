@@ -43,6 +43,13 @@ doc_events = {
 	"Assignment Rule": {
 		"on_trash": "helpdesk.overrides.on_assignment_rule_trash",
 	},
+	# One agent, one team. On `validate` rather than inside the Unity endpoints
+	# so the desk HD Team form and data imports are covered too, and so it runs
+	# before any row is written (HDTeam.after_insert creates an Assignment Rule
+	# plus seven day rows, which a later failure would strand).
+	"HD Team": {
+		"validate": "helpdesk.api.unity_helpdesk.validate_single_team_membership",
+	},
 	# Keep the unity search index resilient to whatever override another app installs
 	# on HD Ticket / Communication / HD Ticket Comment. doc_events run alongside class
 	# methods, so even if an override skips super(), search stays fresh.

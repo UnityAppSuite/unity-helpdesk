@@ -94,17 +94,25 @@ class _TicketFixture(FrappeTestCase):
 
 
 class TestSyncRules(_TicketFixture):
-	def test_no_team_leaves_group_untouched(self):
-		"""The COMMON path — 52 of 61 agents. Must never blank the group."""
+	def test_no_team_clears_the_group(self):
+		"""The COMMON path, 45 of 61 agents.
+
+		This used to assert the opposite. Every ticket is born "Calling Team"
+		(edu_quality Property Setter default), so leaving the group alone meant
+		a ticket owned by a teamless agent still advertised itself as the
+		Calling Team's. The SPA shows the cleared value as "Unspecified".
+		"""
 		ticket = self._ticket(agent_group="Calling Team")
 		with patch(_TEAMS, return_value=[]):
-			self.assertIsNone(sync_agent_group_for_ticket(ticket, USER))
-		self.assertEqual(self._group(ticket), "Calling Team")
+			self.assertEqual(sync_agent_group_for_ticket(ticket, USER), "")
+		self.assertIn(self._group(ticket), (None, ""))
 
-	def test_no_team_does_not_blank_an_already_blank_group(self):
+	def test_no_team_writes_nothing_when_the_group_is_already_blank(self):
+		"""Idempotence: the ToDo hook fires 3-4 times per reassign, and this is
+		the path most of them take. No write, so no needless row churn."""
 		ticket = self._ticket(agent_group=None)
 		with patch(_TEAMS, return_value=[]):
-			sync_agent_group_for_ticket(ticket, USER)
+			self.assertIsNone(sync_agent_group_for_ticket(ticket, USER))
 		self.assertIn(self._group(ticket), (None, ""))
 
 	def test_current_group_already_the_users_team_is_a_noop(self):
@@ -146,10 +154,14 @@ class TestSyncRules(_TicketFixture):
 		self.assertEqual(self._group(ticket), "Tech")
 
 	def test_blank_team_names_are_ignored(self):
+		"""A membership row with an empty team name is garbage data, so it is
+		dropped and the user counts as teamless. That now means rule 1 applies
+		and the group is cleared, rather than the ticket keeping a "Calling
+		Team" default nobody chose."""
 		ticket = self._ticket(agent_group="Calling Team")
 		with patch(_TEAMS, return_value=[{"team": "  ", "ignore_restrictions": 0}]):
-			self.assertIsNone(sync_agent_group_for_ticket(ticket, USER))
-		self.assertEqual(self._group(ticket), "Calling Team")
+			self.assertEqual(sync_agent_group_for_ticket(ticket, USER), "")
+		self.assertIn(self._group(ticket), (None, ""))
 
 	def test_missing_args_are_noops(self):
 		with patch(_TEAMS, return_value=_teams("Tech")) as m:
