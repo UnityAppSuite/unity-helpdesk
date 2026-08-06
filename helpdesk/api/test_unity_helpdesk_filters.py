@@ -31,6 +31,7 @@ from helpdesk.api.unity_helpdesk import (
 	TICKET_DOCTYPE,
 	TICKET_FILTER_FIELD_MAP,
 	TICKET_FILTER_FIELDS,
+	UNSPECIFIED_AGENT_GROUP,
 	_build_filters,
 	_count,
 	_dashboard_cards_for_filters,
@@ -367,6 +368,39 @@ class TestBuildFiltersIntegration(FrappeTestCase):
 	def test_agent_group_primary_filter_executes(self):
 		built = _build_filters("all", {"agent_group": "Support"})
 		frappe.get_list(TICKET_DOCTYPE, fields=["name"], filters=built, page_length=1)
+		self.assertEqual(_dashboard_cards_for_filters(built).get("total"), _count(built))
+
+	def test_unspecified_agent_group_uses_the_indexable_operator(self):
+		"""The "Unspecified" choice, and the operator matters for speed.
+
+		`is not set` emits `(agent_group IS NULL OR agent_group = '')`, which
+		keeps agent_group_unity_idx usable. The obvious alternative, `in [""]`,
+		makes DatabaseQuery wrap the column as `ifnull(agent_group, '')`, and a
+		function on the column throws the index away: measured at 12.8s for one
+		page of 20 versus 2.5s here. Identical rows either way, so nothing but a
+		test defends the fast shape.
+		"""
+		built = _build_filters("all", {"agent_group": UNSPECIFIED_AGENT_GROUP})
+		self.assertIn([TICKET_DOCTYPE, "agent_group", "is", "not set"], built)
+		self.assertNotIn(
+			[TICKET_DOCTYPE, "agent_group", "in", [""]],
+			built,
+			"in [''] defeats agent_group_unity_idx; keep the `is not set` shape",
+		)
+		self.assertNotIn(
+			[TICKET_DOCTYPE, "agent_group", "=", UNSPECIFIED_AGENT_GROUP],
+			built,
+			"the sentinel must never reach the query as a literal team name",
+		)
+
+	def test_unspecified_agent_group_executes_and_counts_blank_rows(self):
+		"""Runs for real, and counts exactly the blank tickets, NULL or ''."""
+		built = _build_filters("all", {"agent_group": UNSPECIFIED_AGENT_GROUP})
+		frappe.get_list(TICKET_DOCTYPE, fields=["name"], filters=built, page_length=1)
+		expected = frappe.db.sql(
+			"SELECT COUNT(*) FROM `tabHD Ticket` WHERE agent_group IS NULL OR agent_group = ''"
+		)[0][0]
+		self.assertEqual(_count(built), expected)
 		self.assertEqual(_dashboard_cards_for_filters(built).get("total"), _count(built))
 
 	def test_created_by_key_still_honoured_for_old_links(self):

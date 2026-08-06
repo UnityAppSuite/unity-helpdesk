@@ -40,6 +40,7 @@ from helpdesk.api.unity_helpdesk import (
 	_agent_group_options,
 	_clean_team_users,
 	_normalize_hex_color,
+	_other_team_memberships,
 	_user_teams,
 	create_team,
 	list_teams,
@@ -51,7 +52,30 @@ _MODULE = "helpdesk.api.unity_helpdesk"
 
 
 def _a_team():
-	return frappe.db.get_value("HD Team", {}, "name")
+	"""A team whose members belong to no OTHER team.
+
+	One-agent-one-team is enforced on HD Team `validate`, so a team that shares
+	a member with another one cannot be saved at all until the overlap is
+	resolved. TestWrites saves its team and restores it in tearDown, so picking
+	such a team would fail for reasons that have nothing to do with what it is
+	testing. This is not hypothetical: on this bench ankit.p@walnutedu.in is in
+	both Accounts and Tech, which made Accounts (the plain first row) unusable
+	here.
+	"""
+	overlapping = {
+		row.parent
+		for row in frappe.db.sql(
+			"""SELECT DISTINCT a.parent
+			   FROM `tabHD Team Member` a
+			   JOIN `tabHD Team Member` b ON a.user = b.user AND a.parent != b.parent
+			   WHERE a.parenttype = 'HD Team' AND b.parenttype = 'HD Team'""",
+			as_dict=True,
+		)
+	}
+	for name in frappe.get_all("HD Team", pluck="name", order_by="name"):
+		if name not in overlapping:
+			return name
+	return None
 
 
 class TestColorNormalisation(FrappeTestCase):
@@ -169,10 +193,24 @@ class TestWrites(FrappeTestCase):
 		with self.assertRaises(frappe.DoesNotExistError):
 			update_team_members("__no_such_team__", [])
 
-	def test_members_are_replaced_not_appended(self):
-		user = self._members[0] if self._members else frappe.db.get_value("User", {"enabled": 1}, "name")
+	def _writable_user(self):
+		"""Someone this team is allowed to hold: its own member, or a teamless
+		user. One-agent-one-team is enforced now, so an arbitrary enabled user
+		would be rejected whenever they already belong to a different team."""
+		if self._members:
+			return self._members[0]
+		taken = set(
+			frappe.get_all("HD Team Member", filters={"parenttype": "HD Team"}, pluck="user")
+		)
+		user = frappe.db.get_value(
+			"User", {"enabled": 1, "name": ("not in", ["Guest", *sorted(taken)])}, "name"
+		)
 		if not user:
-			self.skipTest("no enabled users on this site")
+			self.skipTest("no enabled user outside a team on this site")
+		return user
+
+	def test_members_are_replaced_not_appended(self):
+		user = self._writable_user()
 		update_team_members(self.team, [user])
 		update_team_members(self.team, [user])  # idempotent
 		rows = frappe.get_all(
@@ -183,9 +221,7 @@ class TestWrites(FrappeTestCase):
 		self.assertEqual(rows, [user])
 
 	def test_duplicate_input_is_deduped(self):
-		user = self._members[0] if self._members else frappe.db.get_value("User", {"enabled": 1}, "name")
-		if not user:
-			self.skipTest("no enabled users on this site")
+		user = self._writable_user()
 		update_team_members(self.team, [user, user, user])
 		rows = frappe.get_all(
 			"HD Team Member",
@@ -202,9 +238,7 @@ class TestWrites(FrappeTestCase):
 
 	def test_membership_change_is_visible_to_user_teams(self):
 		"""The link that makes the agent_group sync pick a new member up."""
-		user = frappe.db.get_value("User", {"enabled": 1, "name": ("not in", ("Guest",))}, "name")
-		if not user:
-			self.skipTest("no enabled users on this site")
+		user = self._writable_user()
 		update_team_members(self.team, [user])
 		frappe.local._unity_request_cache = {}  # _user_teams memoises per request
 		self.assertIn(self.team, [r["team"] for r in _user_teams(user)])
@@ -214,9 +248,39 @@ class TestCleanTeamUsers(FrappeTestCase):
 	"""The helper create_team and update_team_members share. No inserts."""
 
 	def _a_user(self):
-		user = frappe.db.get_value("User", {"enabled": 1, "name": ("not in", ("Guest",))}, "name")
+		"""An enabled user who is in no team AND holds no open ticket.
+
+		Both conditions are load-bearing, and the second one was learned the hard
+		way. These tests put a real user into a throwaway "ZZ ..." team. If that
+		user has an open ToDo on a real ticket, ANY assignment activity for them
+		while the team exists makes unity_agent_group stamp the throwaway team
+		onto that live ticket, and the sync writes with update_modified=False so
+		it leaves no Version history to recover the old value from. That happened
+		here: ticket 106979 ended up tagged "ZZ Unity Test Team e91c9a".
+
+		Excluding people who already belong to a team is the milder reason: with
+		one-agent-one-team enforced, they would fail every create-with-members
+		test on any site where they happen to be in one.
+		"""
+		taken = set(
+			frappe.get_all("HD Team Member", filters={"parenttype": "HD Team"}, pluck="user")
+		)
+		busy = {
+			u
+			for u in frappe.get_all(
+				"ToDo",
+				filters={"reference_type": "HD Ticket", "status": "Open"},
+				pluck="allocated_to",
+			)
+			if u
+		}
+		user = frappe.db.get_value(
+			"User",
+			{"enabled": 1, "name": ("not in", ["Guest", *sorted(taken | busy)])},
+			"name",
+		)
 		if not user:
-			self.skipTest("no enabled users on this site")
+			self.skipTest("no enabled, teamless, ticket-free user on this site")
 		return user
 
 	def test_accepts_list_json_string_and_bare_string(self):
@@ -284,9 +348,39 @@ class TestCreateTeam(FrappeTestCase):
 		super().tearDown()
 
 	def _a_user(self):
-		user = frappe.db.get_value("User", {"enabled": 1, "name": ("not in", ("Guest",))}, "name")
+		"""An enabled user who is in no team AND holds no open ticket.
+
+		Both conditions are load-bearing, and the second one was learned the hard
+		way. These tests put a real user into a throwaway "ZZ ..." team. If that
+		user has an open ToDo on a real ticket, ANY assignment activity for them
+		while the team exists makes unity_agent_group stamp the throwaway team
+		onto that live ticket, and the sync writes with update_modified=False so
+		it leaves no Version history to recover the old value from. That happened
+		here: ticket 106979 ended up tagged "ZZ Unity Test Team e91c9a".
+
+		Excluding people who already belong to a team is the milder reason: with
+		one-agent-one-team enforced, they would fail every create-with-members
+		test on any site where they happen to be in one.
+		"""
+		taken = set(
+			frappe.get_all("HD Team Member", filters={"parenttype": "HD Team"}, pluck="user")
+		)
+		busy = {
+			u
+			for u in frappe.get_all(
+				"ToDo",
+				filters={"reference_type": "HD Ticket", "status": "Open"},
+				pluck="allocated_to",
+			)
+			if u
+		}
+		user = frappe.db.get_value(
+			"User",
+			{"enabled": 1, "name": ("not in", ["Guest", *sorted(taken | busy)])},
+			"name",
+		)
 		if not user:
-			self.skipTest("no enabled users on this site")
+			self.skipTest("no enabled, teamless, ticket-free user on this site")
 		return user
 
 	# --- happy path ---------------------------------------------------------
@@ -405,6 +499,286 @@ class TestCreateTeam(FrappeTestCase):
 		with self.assertRaises(frappe.exceptions.ValidationError):
 			create_team(name, color="red")
 		self.assertFalse(frappe.db.exists("HD Team", name))
+
+
+class TestSingleTeamMembership(FrappeTestCase):
+	"""One agent, one team, enforced by the HD Team `validate` hook.
+
+	The hook is registered in hooks.py, so these go through the real write paths
+	(create_team / update_team_members / doc.save) rather than calling the
+	validator directly. That is the point: a check that only lived in the Unity
+	endpoints would leave the desk HD Team form as a silent way around it.
+	"""
+
+	def setUp(self):
+		super().setUp()
+		self._created = []
+
+	def _mint(self):
+		name = f"ZZ Unity Test Team {frappe.generate_hash(length=6)}"
+		self._created.append(name)
+		return name
+
+	def tearDown(self):
+		for name in self._created:
+			if frappe.db.exists("HD Team", name):
+				frappe.delete_doc(
+					"HD Team", name, force=True, ignore_permissions=True, delete_permanently=True
+				)
+			for rule in frappe.get_all(
+				"Assignment Rule",
+				filters={"name": ("like", f"{name} - Support Rotation%")},
+				pluck="name",
+			):
+				frappe.delete_doc("Assignment Rule", rule, force=True, ignore_permissions=True)
+		frappe.db.commit()
+		super().tearDown()
+
+	def _a_user(self):
+		"""An enabled user who is in no team AND holds no open ticket.
+
+		Both conditions are load-bearing, and the second one was learned the hard
+		way. These tests put a real user into a throwaway "ZZ ..." team. If that
+		user has an open ToDo on a real ticket, ANY assignment activity for them
+		while the team exists makes unity_agent_group stamp the throwaway team
+		onto that live ticket, and the sync writes with update_modified=False so
+		it leaves no Version history to recover the old value from. That happened
+		here: ticket 106979 ended up tagged "ZZ Unity Test Team e91c9a".
+
+		Excluding people who already belong to a team is the milder reason: with
+		one-agent-one-team enforced, they would fail every create-with-members
+		test on any site where they happen to be in one.
+		"""
+		taken = set(
+			frappe.get_all("HD Team Member", filters={"parenttype": "HD Team"}, pluck="user")
+		)
+		busy = {
+			u
+			for u in frappe.get_all(
+				"ToDo",
+				filters={"reference_type": "HD Ticket", "status": "Open"},
+				pluck="allocated_to",
+			)
+			if u
+		}
+		user = frappe.db.get_value(
+			"User",
+			{"enabled": 1, "name": ("not in", ["Guest", *sorted(taken | busy)])},
+			"name",
+		)
+		if not user:
+			self.skipTest("no enabled, teamless, ticket-free user on this site")
+		return user
+
+	# --- the helper ---------------------------------------------------------
+
+	def test_helper_reports_the_other_team(self):
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+		self.assertEqual(_other_team_memberships([user]), {user: [first]})
+
+	def test_helper_excludes_the_team_being_written(self):
+		"""Without this, re-saving a team would fail on its own members."""
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+		self.assertEqual(_other_team_memberships([user], exclude_team=first), {})
+
+	def test_helper_is_empty_for_a_free_user(self):
+		user = self._a_user()
+		self.assertEqual(_other_team_memberships([user]), {})
+		self.assertEqual(_other_team_memberships([]), {})
+
+	# --- enforcement --------------------------------------------------------
+
+	def test_create_team_rejects_a_user_from_another_team(self):
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+
+		second = self._mint()
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			create_team(second, users=[user])
+		self.assertFalse(
+			frappe.db.exists("HD Team", second),
+			"validate runs before any row is written, so no team, rule or child rows survive",
+		)
+		# The first team keeps its member.
+		self.assertEqual(
+			frappe.get_all(
+				"HD Team Member", filters={"parent": first, "parenttype": "HD Team"}, pluck="user"
+			),
+			[user],
+		)
+
+	def test_update_team_members_rejects_a_user_from_another_team(self):
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+		second = self._mint()
+		create_team(second)
+
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			update_team_members(second, [user])
+		self.assertEqual(
+			frappe.get_all(
+				"HD Team Member", filters={"parent": second, "parenttype": "HD Team"}, pluck="user"
+			),
+			[],
+		)
+
+	def test_resaving_a_team_with_its_own_members_is_allowed(self):
+		"""The false positive that would make the whole feature unusable."""
+		user = self._a_user()
+		team = self._mint()
+		create_team(team, users=[user])
+		update_team_members(team, [user])  # must not raise
+		self.assertEqual(
+			frappe.get_all(
+				"HD Team Member", filters={"parent": team, "parenttype": "HD Team"}, pluck="user"
+			),
+			[user],
+		)
+
+	def test_moving_a_user_between_teams_works_in_two_steps(self):
+		"""The documented way out: remove from the old team, then add."""
+		user = self._a_user()
+		first = self._mint()
+		second = self._mint()
+		create_team(first, users=[user])
+		create_team(second)
+
+		update_team_members(first, [])  # release
+		update_team_members(second, [user])  # now allowed
+		self.assertEqual(_other_team_memberships([user], exclude_team=second), {})
+
+	def test_desk_form_path_is_covered_too(self):
+		"""Not just the Unity endpoints: a raw doc.save must be refused as well,
+		which is the whole reason this lives in a hook."""
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+
+		second = self._mint()
+		create_team(second)
+		doc = frappe.get_doc("HD Team", second)
+		doc.append("users", {"user": user})
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			doc.save(ignore_permissions=True)
+
+	def test_duplicate_row_in_one_team_is_rejected(self):
+		"""A repeated row skews the teams[0] pick the same way overlap does.
+		_clean_team_users dedupes the API payload, so this exercises the raw
+		doc path the desk form uses."""
+		user = self._a_user()
+		team = self._mint()
+		create_team(team, users=[user])
+		doc = frappe.get_doc("HD Team", team)
+		doc.append("users", {"user": user})
+		with self.assertRaises(frappe.exceptions.ValidationError):
+			doc.save(ignore_permissions=True)
+
+	def test_error_names_the_user_and_the_other_team(self):
+		"""The message has to be self-fixing: it is the only thing telling an
+		admin which team to remove the person from."""
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+		second = self._mint()
+		with self.assertRaises(frappe.exceptions.ValidationError) as ctx:
+			create_team(second, users=[user])
+		message = str(ctx.exception)
+		self.assertIn(user, message)
+		self.assertIn(first, message)
+
+	def test_deleting_a_team_with_overlap_is_not_blocked(self):
+		"""Regression: HDTeam.on_trash calls self.save(), so validating the whole
+		member list made a team holding an overlap impossible to delete, which is
+		the one action that resolves it. frappe sets flags.in_delete only AFTER
+		on_trash, so this is guarded by only policing newly added rows."""
+		user = self._a_user()
+		first = self._mint()
+		second = self._mint()
+		create_team(first, users=[user])
+		create_team(second)
+
+		# Manufacture the overlap the way a legacy site would already have it.
+		frappe.flags.in_migrate = True
+		try:
+			doc = frappe.get_doc("HD Team", second)
+			doc.append("users", {"user": user})
+			doc.save(ignore_permissions=True)
+		finally:
+			frappe.flags.in_migrate = False
+
+		# Deleting must still work, overlap and all.
+		frappe.delete_doc("HD Team", second, force=True, ignore_permissions=True)
+		self.assertFalse(frappe.db.exists("HD Team", second))
+
+	def test_unrelated_save_of_an_overlapping_team_is_allowed(self):
+		"""A colour edit, or any save that does not touch membership, must not be
+		refused because of overlap that was already in the data."""
+		user = self._a_user()
+		first = self._mint()
+		second = self._mint()
+		create_team(first, users=[user])
+		create_team(second)
+
+		frappe.flags.in_migrate = True
+		try:
+			doc = frappe.get_doc("HD Team", second)
+			doc.append("users", {"user": user})
+			doc.save(ignore_permissions=True)
+		finally:
+			frappe.flags.in_migrate = False
+
+		doc = frappe.get_doc("HD Team", second)
+		doc.ignore_restrictions = 1
+		doc.save(ignore_permissions=True)  # must not raise
+		self.assertEqual(frappe.db.get_value("HD Team", second, "ignore_restrictions"), 1)
+
+	def test_removing_the_overlapping_member_is_allowed(self):
+		"""The escape hatch. Shrinking the list adds nothing, so it always passes,
+		which is how an admin fixes a site that already has overlap."""
+		user = self._a_user()
+		first = self._mint()
+		second = self._mint()
+		create_team(first, users=[user])
+		create_team(second)
+
+		frappe.flags.in_migrate = True
+		try:
+			doc = frappe.get_doc("HD Team", second)
+			doc.append("users", {"user": user})
+			doc.save(ignore_permissions=True)
+		finally:
+			frappe.flags.in_migrate = False
+
+		update_team_members(second, [])  # must not raise
+		self.assertEqual(_other_team_memberships([user], exclude_team=first), {})
+
+	def test_skipped_during_migrate(self):
+		"""A data patch must never be blocked halfway through a deploy."""
+		user = self._a_user()
+		first = self._mint()
+		create_team(first, users=[user])
+		second = self._mint()
+		create_team(second)
+
+		doc = frappe.get_doc("HD Team", second)
+		doc.append("users", {"user": user})
+		frappe.flags.in_migrate = True
+		try:
+			doc.save(ignore_permissions=True)  # must not raise
+		finally:
+			frappe.flags.in_migrate = False
+		self.assertIn(
+			user,
+			frappe.get_all(
+				"HD Team Member", filters={"parent": second, "parenttype": "HD Team"}, pluck="user"
+			),
+		)
 
 
 class TestPermissions(FrappeTestCase):
