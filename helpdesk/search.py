@@ -9,7 +9,12 @@ import re
 import frappe
 from frappe.utils import cstr, update_progress_bar
 from redis.commands.search.field import TagField, TextField
-from redis.commands.search.indexDefinition import IndexDefinition
+
+try:
+	from redis.commands.search.index_definition import IndexDefinition
+except ImportError:  # redis-py < 6.0
+	from redis.commands.search.indexDefinition import IndexDefinition
+
 from redis.commands.search.query import Query
 from redis.exceptions import ResponseError
 
