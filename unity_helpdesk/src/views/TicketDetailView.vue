@@ -900,6 +900,10 @@ const STUDENT_CARD_FIELDS = [
     label: "Payment Plan",
     format: (student) => displayPaymentPlan(student),
   },
+  {
+    label: "Transport",
+    format: (student) => displayTransport(student),
+  },
 ];
 
 const structuredStudentCards = computed(() =>
@@ -1065,6 +1069,21 @@ function displayConfirmNextYear(student) {
   // Green for a confirmed "Yes", red otherwise.
   const color = value.toLowerCase() === "yes" ? "#16a34a" : "#dc2626";
   return `<strong style="color: ${color}">${value}</strong>`;
+}
+
+function displayTransport(student) {
+  const status = student?.transport_status;
+  // "unknown": no enrollment resolved, or the edu_quality fields aren't on this
+  // site. Never render this as "No" — an absent flag is not an unchecked box.
+  if (status !== "school_bus" && status !== "mamma_child") return "-";
+  // Whatever the permanent ID card prints for this student: the drop route number
+  // when they're on transport, "M<batch number>" when they're a Mamma Child.
+  const label = cleanText(String(student?.transport_display || ""));
+  if (label) return label;
+  // Known status, but the token couldn't be resolved (no drop route recorded, or
+  // no batch number on their student group). Name the side of the flag rather than
+  // "-", which would read as "we don't know whether they're on transport at all".
+  return status === "school_bus" ? "Yes" : "No";
 }
 
 function displayValue(value) {
