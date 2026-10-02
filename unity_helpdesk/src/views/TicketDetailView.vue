@@ -467,9 +467,101 @@
                 }}</span>
               </div>
               <div
+                v-if="
+                  threadRecipientsLine(item, 'recipients') ||
+                  threadRecipientsLine(item, 'cc')
+                "
+                class="chat-msg-recipients"
+              >
+                <div v-if="threadRecipientsLine(item, 'recipients')">
+                  <strong>To:</strong>
+                  {{ threadRecipientsLine(item, "recipients") }}
+                </div>
+                <div v-if="threadRecipientsLine(item, 'cc')">
+                  <strong>CC:</strong> {{ threadRecipientsLine(item, "cc") }}
+                </div>
+              </div>
+              <div
+                v-if="
+                  item._type === 'comment' && editingCommentName === item.name
+                "
+                class="note-edit stack"
+              >
+                <TinyMceEditor
+                  v-model="editingCommentHtml"
+                  :min-height="160"
+                  :ticket-name="props.ticketId"
+                  :enable-email-template="false"
+                  :enable-attach="false"
+                  placeholder="Edit internal note..."
+                />
+                <p
+                  v-if="noteError && noteErrorName === item.name"
+                  class="error"
+                >
+                  {{ noteError }}
+                </p>
+                <div class="note-actions">
+                  <button
+                    type="button"
+                    class="btn"
+                    :disabled="
+                      noteMutationPending ||
+                      !hasMeaningfulHtml(editingCommentHtml)
+                    "
+                    @click="saveEditedNote"
+                  >
+                    {{ noteSaving ? "Saving..." : "Save" }}
+                  </button>
+                  <button
+                    type="button"
+                    class="btn secondary"
+                    :disabled="noteSaving"
+                    @click="cancelEditNote"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <div
+                v-else
                 class="chat-msg-body safe-html"
                 v-html="sanitize(threadContent(item))"
               ></div>
+              <div
+                v-if="
+                  item._type === 'comment' &&
+                  editingCommentName !== item.name &&
+                  (item.can_edit || item.can_delete)
+                "
+                class="note-actions"
+              >
+                <button
+                  v-if="item.can_edit"
+                  type="button"
+                  class="link-btn"
+                  :disabled="noteMutationPending"
+                  @click="startEditNote(item)"
+                >
+                  Edit
+                </button>
+                <button
+                  v-if="item.can_delete"
+                  type="button"
+                  class="link-btn danger-link"
+                  :disabled="noteMutationPending"
+                  @click="deleteNote(item)"
+                >
+                  {{
+                    noteDeletingName === item.name ? "Deleting..." : "Delete"
+                  }}
+                </button>
+                <span
+                  v-if="noteError && noteErrorName === item.name"
+                  class="error"
+                  >{{ noteError }}</span
+                >
+              </div>
               <div
                 v-if="item.attachments?.length"
                 class="attachment-list attachment-list-thread"
@@ -516,6 +608,50 @@
           </div>
           <div class="detail-body stack">
             <p v-if="actionError" class="error">{{ actionError }}</p>
+            <p v-if="replyWarning" class="warning-banner">{{ replyWarning }}</p>
+            <div v-if="composeMode === 'reply'" class="recipient-fields">
+              <label class="recipient-field">
+                <span>To <span class="required-mark">*</span></span>
+                <textarea
+                  v-model="replyRecipients.recipients"
+                  rows="2"
+                  data-testid="reply-to"
+                  placeholder="name@example.com"
+                  @input="persistRecipients"
+                ></textarea>
+                <small class="muted"
+                  >Separate email addresses with commas, semicolons, or new
+                  lines</small
+                >
+              </label>
+              <label class="recipient-field">
+                <span>CC</span>
+                <textarea
+                  v-model="replyRecipients.cc"
+                  rows="2"
+                  data-testid="reply-cc"
+                  @input="persistRecipients"
+                ></textarea>
+                <small class="muted"
+                  >Separate email addresses with commas, semicolons, or new
+                  lines</small
+                >
+              </label>
+              <label class="recipient-field">
+                <span>BCC</span>
+                <textarea
+                  v-model="replyRecipients.bcc"
+                  rows="2"
+                  data-testid="reply-bcc"
+                  @input="persistRecipients"
+                ></textarea>
+                <small class="muted"
+                  >Separate email addresses with commas, semicolons, or new
+                  lines. BCC recipients are hidden from other email recipients.
+                  Configured audit copies are still applied.</small
+                >
+              </label>
+            </div>
             <TinyMceEditor
               ref="editorRef"
               v-model="composerHtml"
@@ -563,7 +699,9 @@
             <button
               v-if="composeMode === 'reply'"
               class="btn"
-              :disabled="saving || composerIsEmpty"
+              :disabled="
+                saving || composerIsEmpty || uploadingAttachment || !replyHasTo
+              "
               @click="sendReply"
             >
               {{ saving ? "Sending..." : "Send Reply" }}
@@ -795,6 +933,28 @@ const showAllPreviousTickets = ref(false);
 const previousTicketRows = ref([]);
 const repliedToSummary = ref("");
 let activeTicketRequestId = 0;
+
+// Reply recipients (To / CC / BCC) as editable multiline text, one draft per ticket.
+// Stored separately from the body drafts so an explicitly cleared CC/BCC (saved as "")
+// is distinguishable from "never edited" (key missing -> use server defaults).
+const replyRecipients = reactive({ recipients: "", cc: "", bcc: "" });
+const replyWarning = ref("");
+let recipientsInitializedFor = ""; // ticket id whose recipients are already seeded
+function recipientsKey(ticketId) {
+  return `unity:draft:${ticketId || "new"}:recipients`;
+}
+
+// Internal-note editing state: never shared with the reply / note-creation drafts.
+const editingCommentName = ref("");
+const editingCommentHtml = ref("");
+const noteSaving = ref(false);
+const noteDeletingName = ref("");
+const noteError = ref("");
+const noteErrorName = ref("");
+let noteMutationToken = 0; // bumped on ticket change: stale mutation results are ignored
+const noteMutationPending = computed(
+  () => noteSaving.value || !!noteDeletingName.value
+);
 const parsedDescription = ref({
   students: [],
   fees: [],
@@ -998,6 +1158,9 @@ const hasAdditionalDetails = computed(
     ticket.value.custom_previous_ticket_details
 );
 const composerIsEmpty = computed(() => !hasMeaningfulHtml(composerHtml.value));
+const replyHasTo = computed(
+  () => splitAddresses(replyRecipients.recipients).length > 0
+);
 
 watch(
   () => props.ticketId,
@@ -1007,6 +1170,9 @@ watch(
     previousTicketRows.value = [];
     repliedToSummary.value = "";
     restoreDrafts();
+    restoreRecipients();
+    resetNoteEditing();
+    replyWarning.value = "";
     await Promise.all([loadTicket(), loadLookups()]);
   },
   { immediate: true }
@@ -1365,10 +1531,20 @@ function composerCommentHtml() {
   return `${base}${p.outerHTML}${ul.outerHTML}`;
 }
 
-async function resetComposer() {
+// Clear one mode's draft for a specific ticket. Returns true when that ticket is
+// still the one on screen (so the caller may touch visible state); a stale
+// response only cleans its own stored draft.
+function clearComposerDraft(mode, ticketId) {
+  try {
+    sessionStorage.removeItem(`unity:draft:${ticketId}:${mode}`);
+  } catch {
+    /* sessionStorage unavailable */
+  }
+  if (ticketId !== props.ticketId) return false;
+  composerDrafts[mode] = "";
   composerAttachments.value = [];
-  composerHtml.value = ""; // clears the active mode's draft + its sessionStorage
-  editorRef.value?.clear?.();
+  if (composeMode.value === mode) editorRef.value?.clear?.();
+  return true;
 }
 
 // Load any cached drafts for this ticket (survives reload/navigation).
@@ -1380,6 +1556,84 @@ function restoreDrafts() {
     composerDrafts.reply = "";
     composerDrafts.comment = "";
   }
+}
+
+// Split a recipient text box on commas, semicolons and new lines.
+function splitAddresses(value) {
+  return String(value || "")
+    .split(/[,;\r\n]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function clearStoredRecipients(ticketId) {
+  try {
+    sessionStorage.removeItem(recipientsKey(ticketId));
+  } catch {
+    /* sessionStorage unavailable */
+  }
+}
+
+// Restore a saved recipient draft for the current ticket. A missing key means
+// "never edited" (seed from the server later); a saved "" means "cleared".
+function restoreRecipients() {
+  replyRecipients.recipients = "";
+  replyRecipients.cc = "";
+  replyRecipients.bcc = "";
+  recipientsInitializedFor = "";
+  try {
+    const raw = sessionStorage.getItem(recipientsKey(props.ticketId));
+    if (raw === null) return;
+    const saved = JSON.parse(raw);
+    if (!saved || typeof saved !== "object") return;
+    if (
+      typeof saved.recipients !== "string" ||
+      typeof saved.cc !== "string" ||
+      typeof saved.bcc !== "string"
+    ) {
+      return;
+    }
+    replyRecipients.recipients = saved.recipients;
+    replyRecipients.cc = saved.cc;
+    replyRecipients.bcc = saved.bcc;
+    recipientsInitializedFor = props.ticketId;
+  } catch {
+    /* invalid JSON / storage unavailable: fall back to server defaults */
+  }
+}
+
+// Seed To/CC/BCC from the detail's reply_recipients once per ticket; later silent
+// refreshes and Reply/Note switches never overwrite what the agent edited.
+function seedRecipientsFromDetail(detail) {
+  if (recipientsInitializedFor === props.ticketId) return;
+  const defaults = detail?.reply_recipients;
+  if (!defaults) return;
+  replyRecipients.recipients = defaults.recipients || "";
+  replyRecipients.cc = defaults.cc || "";
+  replyRecipients.bcc = defaults.bcc || "";
+  recipientsInitializedFor = props.ticketId;
+}
+
+function persistRecipients() {
+  recipientsInitializedFor = props.ticketId;
+  try {
+    sessionStorage.setItem(
+      recipientsKey(props.ticketId),
+      JSON.stringify({
+        recipients: replyRecipients.recipients,
+        cc: replyRecipients.cc,
+        bcc: replyRecipients.bcc,
+      })
+    );
+  } catch {
+    /* in-memory state still works */
+  }
+}
+
+// Outbound thread summary of the stored To / CC fields (BCC is never shown).
+function threadRecipientsLine(item, field) {
+  if (item?._type !== "comm" || item.sent_or_received !== "Sent") return "";
+  return splitAddresses(item[field]).join(", ");
 }
 
 function findNextTableIndex(nodes, start) {
@@ -1559,6 +1813,7 @@ async function loadTicket({ silent = false, skipHeavy = false } = {}) {
     ticket.value = detail;
     communications.value = ticket.value.communications || [];
     comments.value = ticket.value.comments || [];
+    seedRecipientsFromDetail(detail);
     // Parse the student / fee / previous-ticket blocks from the "Student
     // Information" intake comm when present (bulk-email tickets keep a clean
     // description, but that intake comm carries the full blocks). Normal tickets
@@ -1826,17 +2081,33 @@ async function markClosed() {
 }
 
 async function sendReply() {
+  // Capture the ticket: a late response must never touch another ticket's state.
+  const ticketId = props.ticketId;
   saving.value = true;
   actionError.value = "";
+  replyWarning.value = "";
   try {
     const res = await call("helpdesk.api.unity_helpdesk_ext.reply", {
-      name: props.ticketId,
+      name: ticketId,
       message: composerPayloadHtml(),
+      recipients: splitAddresses(replyRecipients.recipients),
+      cc: splitAddresses(replyRecipients.cc),
+      bcc: splitAddresses(replyRecipients.bcc),
       attachments: composerAttachments.value.map(
         (attachment) => attachment.name
       ),
     });
-    await resetComposer();
+    // Clear exactly the captured ticket's reply body + recipient drafts (never the
+    // other mode's draft, even if the agent switched tabs while sending).
+    const isCurrent = clearComposerDraft("reply", ticketId);
+    clearStoredRecipients(ticketId);
+    if (!isCurrent) return;
+    // Re-seed To/CC/BCC from the server defaults of the refreshed detail below.
+    recipientsInitializedFor = "";
+    if (res && res.warning) replyWarning.value = res.warning;
+    // Invalidate detail reads that started before this reply so they cannot
+    // restore pre-reply state.
+    activeTicketRequestId += 1;
     // Optimistically append the new communication so the thread updates
     // immediately. The spinner clears as soon as the reply call returns —
     // no blocking full ticket reload.
@@ -1862,26 +2133,35 @@ async function sendReply() {
       await loadTicket({ silent: true, skipHeavy: true });
     }
   } catch (err) {
-    actionError.value = err.message;
+    if (ticketId === props.ticketId) actionError.value = err.message;
   } finally {
-    saving.value = false;
+    if (ticketId === props.ticketId) saving.value = false;
   }
 }
 
 async function sendComment() {
+  const ticketId = props.ticketId;
   saving.value = true;
   actionError.value = "";
   try {
     const res = await call("helpdesk.api.unity_helpdesk_ext.add_comment", {
-      name: props.ticketId,
+      name: ticketId,
       content: composerCommentHtml(),
     });
-    await resetComposer();
+    // Only the note draft is cleared; reply recipients are untouched.
+    const isCurrent = clearComposerDraft("comment", ticketId);
+    if (!isCurrent) return;
+    activeTicketRequestId += 1;
     // Optimistically append the note so it shows immediately, then a silent
     // reconcile (no skeleton, no student-context re-run) fills in server truth.
     const c = res && res.comment;
     if (c) {
-      const item = { ...c, _type: "comment" };
+      const item = {
+        ...c,
+        _type: "comment",
+        sender: c.commented_by,
+        attachments: [],
+      };
       if (ticket.value && Array.isArray(ticket.value.thread)) {
         ticket.value.thread = [...ticket.value.thread, item];
       }
@@ -1891,9 +2171,128 @@ async function sendComment() {
       await loadTicket({ silent: true, skipHeavy: true });
     }
   } catch (err) {
-    actionError.value = err.message;
+    if (ticketId === props.ticketId) actionError.value = err.message;
   } finally {
-    saving.value = false;
+    if (ticketId === props.ticketId) saving.value = false;
+  }
+}
+
+function resetNoteEditing() {
+  noteMutationToken += 1;
+  editingCommentName.value = "";
+  editingCommentHtml.value = "";
+  noteSaving.value = false;
+  noteDeletingName.value = "";
+  noteError.value = "";
+  noteErrorName.value = "";
+}
+
+function startEditNote(item) {
+  if (noteMutationPending.value) return;
+  editingCommentName.value = item.name;
+  editingCommentHtml.value = item.content || "";
+  noteError.value = "";
+  noteErrorName.value = item.name;
+}
+
+function cancelEditNote() {
+  if (noteSaving.value) return;
+  editingCommentName.value = "";
+  editingCommentHtml.value = "";
+  noteError.value = "";
+  noteErrorName.value = "";
+}
+
+function applyNoteUpdate(comment) {
+  const swap = (row) =>
+    row.name === comment.name && row._type === "comment"
+      ? {
+          ...row,
+          ...comment,
+          _type: "comment",
+          sender: comment.commented_by,
+          attachments: row.attachments || [],
+        }
+      : row;
+  if (Array.isArray(ticket.value.thread)) {
+    ticket.value.thread = ticket.value.thread.map(swap);
+  }
+  comments.value = comments.value.map((row) =>
+    row.name === comment.name ? swap({ ...row, _type: "comment" }) : row
+  );
+}
+
+function applyNoteRemoval(name) {
+  if (Array.isArray(ticket.value.thread)) {
+    ticket.value.thread = ticket.value.thread.filter(
+      (row) => !(row._type === "comment" && row.name === name)
+    );
+  }
+  comments.value = comments.value.filter((row) => row.name !== name);
+}
+
+async function saveEditedNote() {
+  if (!editingCommentName.value || noteMutationPending.value) return;
+  const ticketId = props.ticketId;
+  const token = noteMutationToken;
+  const name = editingCommentName.value;
+  const stillCurrent = () =>
+    ticketId === props.ticketId && token === noteMutationToken;
+  if (!hasMeaningfulHtml(editingCommentHtml.value)) {
+    noteError.value = "Please enter a comment";
+    return;
+  }
+  noteSaving.value = true;
+  noteError.value = "";
+  noteErrorName.value = name;
+  try {
+    const res = await call("helpdesk.api.unity_helpdesk_ext.update_comment", {
+      name,
+      content: editingCommentHtml.value,
+    });
+    if (!stillCurrent()) return;
+    // Drop detail reads that started before the edit so they cannot restore old text.
+    activeTicketRequestId += 1;
+    if (res && res.comment) applyNoteUpdate(res.comment);
+    editingCommentName.value = "";
+    editingCommentHtml.value = "";
+    noteErrorName.value = "";
+    loadTicket({ silent: true, skipHeavy: true });
+  } catch (err) {
+    if (stillCurrent()) noteError.value = err.message;
+  } finally {
+    if (stillCurrent()) noteSaving.value = false;
+  }
+}
+
+async function deleteNote(item) {
+  if (noteMutationPending.value) return;
+  if (!window.confirm("Delete this internal note? This cannot be undone.")) {
+    return;
+  }
+  const ticketId = props.ticketId;
+  const token = noteMutationToken;
+  const name = item.name;
+  const stillCurrent = () =>
+    ticketId === props.ticketId && token === noteMutationToken;
+  noteDeletingName.value = name;
+  noteError.value = "";
+  noteErrorName.value = name;
+  try {
+    await call("helpdesk.api.unity_helpdesk_ext.delete_comment", { name });
+    if (!stillCurrent()) return;
+    activeTicketRequestId += 1;
+    applyNoteRemoval(name);
+    if (editingCommentName.value === name) {
+      editingCommentName.value = "";
+      editingCommentHtml.value = "";
+    }
+    noteErrorName.value = "";
+    loadTicket({ silent: true, skipHeavy: true });
+  } catch (err) {
+    if (stillCurrent()) noteError.value = err.message;
+  } finally {
+    if (stillCurrent()) noteDeletingName.value = "";
   }
 }
 

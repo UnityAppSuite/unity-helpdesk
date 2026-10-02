@@ -72,12 +72,10 @@ const options = computed(() =>
 );
 
 const togglePin = createResource({
-  url: "frappe.client.set_value",
+  url: "helpdesk.api.unity_helpdesk_ext.set_comment_pinned",
   makeParams: () => ({
-    doctype: "HD Ticket Comment",
     name: name.value,
-    fieldname: "is_pinned",
-    value: !isPinned.value,
+    is_pinned: !isPinned.value,
   }),
   onSuccess: () => emitter.emit("update:ticket"),
 });
