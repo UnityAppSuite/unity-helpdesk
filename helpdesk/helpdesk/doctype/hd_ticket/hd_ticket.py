@@ -74,13 +74,6 @@ def _match_ticket_type_by_keywords(text, keyword_map):
 	return best[1], best[2]
 
 
-class MissingReplySenderError(frappe.ValidationError):
-	"""Raised by HDTicket.reply_via_agent when no outgoing sender can be resolved.
-
-	Raised after the Communication row is written but before anything is passed to
-	frappe.sendmail, so callers may roll back and fall back without un-sending mail."""
-
-
 _ADDRESS_SEPARATORS = re.compile(r"[,;\r\n]+")
 
 
@@ -683,10 +676,10 @@ class HDTicket(Document):
 	def reply_via_agent(
 		self,
 		message: str,
-		cc: str = None,
-		bcc: str = None,
+		cc: str | list | None = None,
+		bcc: str | list | None = None,
 		attachments: List[str] = [],
-		recipients=None,
+		recipients: str | list | None = None,
 	):
 		skip_email_workflow = self.skip_email_workflow()
 		medium = "" if skip_email_workflow else "Email"
@@ -743,7 +736,7 @@ class HDTicket(Document):
 			return
 
 		if not sender_email:
-			frappe.throw(_("Can not send email. No sender email set up!"), exc=MissingReplySenderError)
+			frappe.throw(_("Can not send email. No sender email set up!"))
 
 		reply_to_email = sender_email.email_id
 		template = (

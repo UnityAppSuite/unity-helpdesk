@@ -15,7 +15,6 @@ from frappe.tests.utils import FrappeTestCase
 from helpdesk.api import unity_helpdesk_ext as ext
 from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import (
 	HDTicket,
-	MissingReplySenderError,
 	_resolve_reply_recipients,
 )
 
@@ -27,6 +26,8 @@ SENDER = frappe._dict(name=None, email_id="support-test@example.test")
 
 
 def _ensure_agent(email_id):
+	if frappe.db.exists("HD Agent", email_id):
+		frappe.delete_doc("HD Agent", email_id, force=True, ignore_permissions=True)
 	if frappe.db.exists("User", email_id):
 		frappe.delete_doc("User", email_id, force=True, ignore_permissions=True)
 	user = frappe.get_doc(
@@ -34,6 +35,11 @@ def _ensure_agent(email_id):
 	)
 	user.append("roles", {"role": "Agent"})
 	user.insert(ignore_permissions=True)
+	# HD Ticket's permission_query needs an HD Agent row for get_list; db_insert skips
+	# the controller's support-rotation side effects.
+	frappe.get_doc(
+		{"doctype": "HD Agent", "name": email_id, "user": email_id, "agent_name": email_id, "is_active": 1}
+	).db_insert()
 
 
 class _ReplyBase(FrappeTestCase):
@@ -50,6 +56,11 @@ class _ReplyBase(FrappeTestCase):
 		frappe.set_user("Administrator")
 		frappe.db.set_single_value("HD Settings", "instantly_send_email", 0)
 		frappe.db.set_single_value("HD Settings", "skip_email_workflow", 0)
+		# Assignment-rule notifications would mail through the muted site's dummy
+		# Email Account (no email_id) and crash; irrelevant here.
+		notify = patch("frappe.desk.form.assign_to.notify_assignment")
+		notify.start()
+		self.addCleanup(notify.stop)
 		self.ticket = frappe.get_doc(
 			{
 				"doctype": "HD Ticket",
@@ -208,8 +219,15 @@ class TestReplyEndpoint(_ReplyBase):
 			),
 		)
 		self.assertEqual(queue.status, "Not Sent")
-		self.assertEqual(msg["To"], "parent-new@example.test, guardian@example.test")
-		self.assertEqual(msg["CC"], "principal@example.test, viceprincipal@example.test")
+		# Frappe's queue builder de-duplicates through a set, so header order is not stable.
+		self.assertEqual(
+			sorted(a.strip() for a in msg["To"].split(",")),
+			["guardian@example.test", "parent-new@example.test"],
+		)
+		self.assertEqual(
+			sorted(a.strip() for a in msg["CC"].split(",")),
+			["principal@example.test", "viceprincipal@example.test"],
+		)
 		self.assertIsNone(msg["Bcc"])
 		for hidden in ("counsellor@example.test", "wellbeing@example.test", AUDIT):
 			self.assertNotIn(hidden, msg["To"] + msg["CC"])
@@ -307,11 +325,6 @@ class TestReplyEndpoint(_ReplyBase):
 		self.assertEqual(frappe.db.count("Email Queue"), before_queue)
 		file_doc.reload()
 		self.assertEqual(file_doc.attached_to_name, comm.name)
-
-	def test_missing_sender_error_type_is_what_triggers_fallback(self):
-		with patch.object(HDTicket, "sender_email", return_value=None):
-			with self.assertRaises(MissingReplySenderError):
-				self.ticket.reply_via_agent(message="<p>x</p>", recipients="a@example.test")
 
 	def test_other_send_failures_are_not_swallowed(self):
 		with patch("frappe.sendmail", side_effect=frappe.ValidationError("sendmail exploded")):

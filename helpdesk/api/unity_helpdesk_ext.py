@@ -436,35 +436,24 @@ def reply(name, message, cc=None, bcc=None, attachments=None, recipients=None):
     if not message:
         frappe.throw(_("Please enter a reply"))
     # Function-local: hd_ticket imports unity_helpdesk, which this module extends.
-    from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import (
-        MissingReplySenderError,
-        _resolve_reply_recipients,
-    )
+    from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import _resolve_reply_recipients
 
     ticket = frappe.get_doc(TICKET_DOCTYPE, name)
-    # Validate/resolve To/CC/BCC BEFORE the send try-block so an address error can
-    # never be mistaken for a missing-sender error, and nothing is written for bad input.
+    # Validate/resolve To/CC/BCC BEFORE anything is written so bad input leaves no
+    # Communication behind and an address error is never taken for a sender error.
     resolved = _resolve_reply_recipients(ticket, recipients=recipients, cc=cc, bcc=bcc)
     # Personalize template placeholders ({{first_name}} etc.) from the ticket's
     # customer (raised_by) student record. Plain text is returned unchanged.
     message = _safe_render(message, _merge_context_for_email(ticket.get("raised_by")))
     attachment_names = _parse_json(attachments, [])
     result = {"ok": True}
-    savepoint = "unity_reply_send"
-    frappe.db.savepoint(savepoint)
-    try:
-        ticket.reply_via_agent(
-            message=message,
-            cc=cc,
-            bcc=bcc,
-            attachments=attachment_names,
-            recipients=recipients,
-        )
-    except MissingReplySenderError:
-        # No outgoing email account: this raises before frappe.sendmail, so undo the
-        # Communication the core already wrote and save exactly one unsent record.
-        frappe.db.rollback(save_point=savepoint)
-        frappe.clear_last_message()  # the core's error toast must not reach the client
+    # reply_via_agent inserts its Communication BEFORE it discovers there is no sender,
+    # so calling it and cleaning up afterwards would leave (or need to undo) a row. A
+    # savepoint rollback is not an option: Communication's doc hooks (nextai
+    # email_trigger.update_contact) commit mid-insert, which releases the savepoint.
+    # Resolve the sender first and save exactly one unsent Communication instead.
+    # Only a genuinely missing sender takes this path; any other failure propagates.
+    if not ticket.skip_email_workflow() and not ticket.sender_email():
         _create_communication_direct(
             ticket,
             message,
@@ -478,7 +467,13 @@ def reply(name, message, cc=None, bcc=None, attachments=None, recipients=None):
             "Reply saved, but email was not sent because no outgoing email account is configured."
         )
     else:
-        frappe.db.release_savepoint(savepoint)
+        ticket.reply_via_agent(
+            message=message,
+            cc=cc,
+            bcc=bcc,
+            attachments=attachment_names,
+            recipients=recipients,
+        )
     # The Communication created by reply_via_agent (or the fallback) fires the
     # search-index doc hook, which refreshes the index ASYNCHRONOUSLY — we no longer
     # rebuild it inline here (that whole-thread rebuild was seconds of reply latency).

@@ -4,6 +4,7 @@
 ticket access, and the generic REST bypass. Real authorization, rollback-only."""
 
 import json
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -17,7 +18,9 @@ MANAGER = "notes-manager@example.test"  # Helpdesk Admin
 PLAIN = "notes-plain@example.test"  # no helpdesk role
 
 
-def _ensure_user(email, roles):
+def _ensure_user(email, roles, agent=False):
+	if frappe.db.exists("HD Agent", email):
+		frappe.delete_doc("HD Agent", email, force=True, ignore_permissions=True)
 	if frappe.db.exists("User", email):
 		frappe.delete_doc("User", email, force=True, ignore_permissions=True)
 	user = frappe.get_doc(
@@ -32,6 +35,12 @@ def _ensure_user(email, roles):
 	for role in roles:
 		user.append("roles", {"role": role})
 	user.insert(ignore_permissions=True)
+	if agent:
+		# Real agents have an HD Agent row, which HD Ticket's permission_query needs for
+		# get_list. db_insert skips the controller's support-rotation side effects.
+		frappe.get_doc(
+			{"doctype": "HD Agent", "name": email, "user": email, "agent_name": email, "is_active": 1}
+		).db_insert()
 	return user
 
 
@@ -39,15 +48,20 @@ class TestUnityNotes(FrappeTestCase):
 	@classmethod
 	def setUpClass(cls):
 		super().setUpClass()
-		_ensure_user(AUTHOR, ["Agent"])
-		_ensure_user(PEER, ["Agent"])
-		_ensure_user(OUTSIDER, ["Agent"])
+		_ensure_user(AUTHOR, ["Agent"], agent=True)
+		_ensure_user(PEER, ["Agent"], agent=True)
+		_ensure_user(OUTSIDER, ["Agent"], agent=True)
 		_ensure_user(MANAGER, ["Helpdesk Admin"])
 		_ensure_user(PLAIN, [])
 
 	def setUp(self):
 		self.addCleanup(frappe.set_user, frappe.session.user)
 		frappe.set_user("Administrator")
+		# Assignment-rule notifications would mail through the muted site's dummy
+		# Email Account (no email_id) and crash; they are irrelevant to these tests.
+		notify = patch("frappe.desk.form.assign_to.notify_assignment")
+		notify.start()
+		self.addCleanup(notify.stop)
 		self.ticket = self._make_ticket()
 		self.other_ticket = self._make_ticket()
 		self.note = self._make_note(self.ticket.name, "<p>Wrong room</p>")
