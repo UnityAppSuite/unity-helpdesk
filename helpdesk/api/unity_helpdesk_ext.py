@@ -150,6 +150,22 @@ def get_ticket_detail(name):
     thread_components = get_ticket_thread_components(name)
     decorated.communications = thread_components.communications
     decorated.comments = thread_components.comments
+    # thread entries share these dict objects, so the flags reach both collections.
+    _decorate_comment_permissions(name, decorated.comments, capabilities)
+    # What a reply would use by default (To = raiser, CC/BCC inherited from the last
+    # communication) so the composer can show and edit it. Configured audit copies are
+    # not listed: they are enforced server-side on send. Legacy branch = never raises on
+    # malformed historic address data.
+    from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import _resolve_reply_recipients
+
+    defaults = _resolve_reply_recipients(
+        frappe.get_doc(TICKET_DOCTYPE, name), include_audit=False
+    )
+    decorated.reply_recipients = {
+        "recipients": cstr(defaults.get("recipients")),
+        "cc": cstr(defaults.get("cc")),
+        "bcc": cstr(defaults.get("bcc")),
+    }
     decorated.thread = thread_components.thread
     # student_context used to be computed synchronously here, but its
     # ~10+ frappe.get_all calls against Education-app DocTypes pushed the
@@ -383,7 +399,7 @@ def update_ticket(
 # Reply
 # ---------------------------------------------------------------------------
 
-def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments=None):
+def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments=None, recipients=None):
     """Create a Communication record without sending email (fallback when no email account set up).
 
     Sets a synthetic message_id so that customer email replies can be threaded back to this
@@ -398,7 +414,8 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments
         "email_status": "Open",
         "subject": f"Re: {ticket.subject} (#{ticket.name})",
         "sender": frappe.session.user,
-        "recipients": ticket.raised_by,
+        # `recipients` is an already-resolved To string; None keeps the legacy raiser default.
+        "recipients": recipients if recipients is not None else ticket.raised_by,
         "content": message,
         "status": "Linked",
         "reference_doctype": TICKET_DOCTYPE,
@@ -413,39 +430,57 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments
 
 
 @frappe.whitelist()
-def reply(name, message, cc=None, bcc=None, attachments=None):
+def reply(name, message, cc=None, bcc=None, attachments=None, recipients=None):
     capabilities = _require_unity_access()
     _require_ticket_access(name, capabilities)
     if not message:
         frappe.throw(_("Please enter a reply"))
+    # Function-local: hd_ticket imports unity_helpdesk, which this module extends.
+    from helpdesk.helpdesk.doctype.hd_ticket.hd_ticket import _resolve_reply_recipients
+
     ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+    # Validate/resolve To/CC/BCC BEFORE anything is written so bad input leaves no
+    # Communication behind and an address error is never taken for a sender error.
+    resolved = _resolve_reply_recipients(ticket, recipients=recipients, cc=cc, bcc=bcc)
     # Personalize template placeholders ({{first_name}} etc.) from the ticket's
     # customer (raised_by) student record. Plain text is returned unchanged.
     message = _safe_render(message, _merge_context_for_email(ticket.get("raised_by")))
-    try:
+    attachment_names = _parse_json(attachments, [])
+    result = {"ok": True}
+    # reply_via_agent inserts its Communication BEFORE it discovers there is no sender,
+    # so calling it and cleaning up afterwards would leave (or need to undo) a row. A
+    # savepoint rollback is not an option: Communication's doc hooks (nextai
+    # email_trigger.update_contact) commit mid-insert, which releases the savepoint.
+    # Resolve the sender first and save exactly one unsent Communication instead.
+    # Only a genuinely missing sender takes this path; any other failure propagates.
+    if not ticket.skip_email_workflow() and not ticket.sender_email():
+        _create_communication_direct(
+            ticket,
+            message,
+            resolved["cc"],
+            resolved["bcc"],
+            attachment_names,
+            recipients=resolved["recipients"],
+        )
+        result["email_sent"] = False
+        result["warning"] = _(
+            "Reply saved, but email was not sent because no outgoing email account is configured."
+        )
+    else:
         ticket.reply_via_agent(
             message=message,
             cc=cc,
             bcc=bcc,
-            attachments=_parse_json(attachments, []),
+            attachments=attachment_names,
+            recipients=recipients,
         )
-    except frappe.ValidationError as exc:
-        if _is_missing_sender_error(exc):
-            # No outgoing email account configured — save communication record only
-            _create_communication_direct(ticket, message, cc, bcc, attachments)
-        else:
-            raise
-    except Exception as exc:
-        if _is_missing_sender_error(exc):
-            _create_communication_direct(ticket, message, cc, bcc, attachments)
-        else:
-            raise
     # The Communication created by reply_via_agent (or the fallback) fires the
     # search-index doc hook, which refreshes the index ASYNCHRONOUSLY — we no longer
     # rebuild it inline here (that whole-thread rebuild was seconds of reply latency).
     # Return the just-created Communication so the SPA can append it to the thread
     # optimistically, without a blocking full ticket reload.
-    return {"ok": True, "communication": _latest_communication_payload(name)}
+    result["communication"] = _latest_communication_payload(name)
+    return result
 
 
 def _latest_communication_payload(ticket_name):
@@ -503,6 +538,62 @@ def _latest_communication_payload(ticket_name):
 # Internal comment (note — not sent to customer)
 # ---------------------------------------------------------------------------
 
+def _comment_is_blank(content):
+    """True for empty / editor-empty HTML (`<p><br></p>`, `<p>&nbsp;</p>`)."""
+    html = cstr(content)
+    if "<img" in html.lower():
+        return False
+    text = frappe.utils.strip_html_tags(html)
+    text = text.replace("\xa0", " ").replace("&nbsp;", " ")
+    return not text.strip()
+
+
+def _comment_permission_helpers():
+    # Function-local: the controller imports this package's helpers at import time.
+    from helpdesk.helpdesk.doctype.hd_ticket_comment import hd_ticket_comment as controller
+
+    return controller
+
+
+def _require_comment_manager(comment):
+    if not _comment_permission_helpers()._can_manage_comment(comment):
+        frappe.throw(
+            _("You are not allowed to edit or delete this internal note"),
+            frappe.PermissionError,
+        )
+
+
+def _comment_payload(comment, capabilities):
+    can_manage = bool(_comment_permission_helpers()._can_manage_comment(comment))
+    return {
+        "name": comment.name,
+        "content": comment.content,
+        "commented_by": comment.commented_by,
+        "creation": str(comment.creation),
+        "is_pinned": comment.is_pinned,
+        "can_edit": can_manage,
+        "can_delete": can_manage,
+        "user": {
+            "name": comment.commented_by,
+            "full_name": frappe.utils.get_fullname(comment.commented_by),
+        },
+    }
+
+
+def _decorate_comment_permissions(ticket_name, comments, capabilities):
+    """Add server-derived can_edit/can_delete (UI hints only) to the dicts of one
+    ticket's comments. Ticket access is evaluated once for the whole collection."""
+    controller = _comment_permission_helpers()
+    user = frappe.session.user
+    has_ticket_access = controller._user_can_access_ticket(ticket_name, user)
+    for comment in comments:
+        allowed = has_ticket_access and controller._is_author_or_manager(
+            comment.get("commented_by"), user, capabilities
+        )
+        comment["can_edit"] = bool(allowed)
+        comment["can_delete"] = bool(allowed)
+
+
 @frappe.whitelist()
 def add_comment(name, content):
     capabilities = _require_unity_access()
@@ -519,20 +610,51 @@ def add_comment(name, content):
     # The comment insert fires the search-index doc hook, which refreshes the index
     # asynchronously — no inline rebuild (that was the "add note" latency).
     # Return the created comment so the SPA can append it optimistically (no reload).
-    return {
-        "ok": True,
-        "comment": {
-            "name": comment.name,
-            "content": comment.content,
-            "commented_by": comment.commented_by,
-            "creation": str(comment.creation),
-            "is_pinned": comment.is_pinned,
-            "user": {
-                "name": comment.commented_by,
-                "full_name": frappe.utils.get_fullname(comment.commented_by),
-            },
-        },
-    }
+    return {"ok": True, "comment": _comment_payload(comment, capabilities)}
+
+
+@frappe.whitelist()
+def update_comment(name, content):
+    capabilities = _require_unity_access()
+    comment = frappe.get_doc("HD Ticket Comment", name)
+    _require_ticket_access(comment.reference_ticket, capabilities)
+    _require_comment_manager(comment)
+    if _comment_is_blank(content):
+        frappe.throw(_("Please enter a comment"))
+    comment.content = content
+    comment.save(ignore_permissions=True)
+    return {"ok": True, "comment": _comment_payload(comment, capabilities)}
+
+
+@frappe.whitelist()
+def delete_comment(name):
+    capabilities = _require_unity_access()
+    comment = frappe.get_doc("HD Ticket Comment", name)
+    _require_ticket_access(comment.reference_ticket, capabilities)
+    _require_comment_manager(comment)
+    frappe.delete_doc("HD Ticket Comment", name, ignore_permissions=True)
+    return {"ok": True, "name": name}
+
+
+def _parse_pinned(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in ("0", "1", "true", "false"):
+        return value.strip().lower() in ("1", "true")
+    frappe.throw(_("is_pinned must be a boolean"), frappe.ValidationError)
+
+
+@frappe.whitelist()
+def set_comment_pinned(name, is_pinned):
+    capabilities = _require_unity_access()
+    pinned = _parse_pinned(is_pinned)
+    comment = frappe.get_doc("HD Ticket Comment", name)
+    _require_ticket_access(comment.reference_ticket, capabilities)
+    comment.is_pinned = 1 if pinned else 0
+    comment.save(ignore_permissions=True)
+    return {"ok": True, "name": comment.name, "is_pinned": comment.is_pinned}
 
 
 # ---------------------------------------------------------------------------

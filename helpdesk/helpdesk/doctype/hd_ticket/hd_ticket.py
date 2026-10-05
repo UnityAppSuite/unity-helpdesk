@@ -74,6 +74,151 @@ def _match_ticket_type_by_keywords(text, keyword_map):
 	return best[1], best[2]
 
 
+_ADDRESS_SEPARATORS = re.compile(r"[,;\r\n]+")
+
+
+def _parse_address_list(value, field, strict=True):
+	"""Parse a recipient field into a list of bare email addresses (input order, not deduped).
+
+	Accepts a list of strings, a JSON-encoded list, or a comma/semicolon/newline separated
+	string. Strict mode (explicit user input) throws on any malformed token; lenient mode
+	(inherited legacy data) drops tokens that do not validate. `None` -> []."""
+	if value is None:
+		return []
+
+	def bad(message):
+		frappe.throw(_("Invalid {0} recipients: {1}").format(field, message), frappe.ValidationError)
+
+	if isinstance(value, str):
+		text = value.strip()
+		if text.startswith("["):
+			try:
+				value = json.loads(text)
+			except ValueError:
+				if strict:
+					bad(_("malformed JSON list"))
+				value = [text]
+			if not isinstance(value, list):
+				bad(_("expected a list"))
+		else:
+			tokens = _ADDRESS_SEPARATORS.split(text)
+			return _validate_addresses(tokens, field, strict)
+	if not isinstance(value, (list, tuple)):
+		bad(_("expected a list or a comma-separated string"))
+
+	tokens = []
+	for item in value:
+		if not isinstance(item, str):
+			bad(_("every entry must be text"))
+		if "\r" in item or "\n" in item:
+			if strict:
+				bad(_("line breaks are not allowed inside an address"))
+			continue
+		tokens.extend(_ADDRESS_SEPARATORS.split(item))
+	return _validate_addresses(tokens, field, strict)
+
+
+def _validate_addresses(tokens, field, strict):
+	from frappe.utils import validate_email_address
+
+	out = []
+	for token in tokens:
+		token = token.strip()
+		if not token:
+			continue
+		try:
+			email = validate_email_address(token, throw=strict)
+		except frappe.InvalidEmailAddressError as exc:
+			frappe.clear_last_message()
+			frappe.throw(_("Invalid {0} recipient: {1}").format(field, exc), frappe.InvalidEmailAddressError)
+		if not email:
+			if strict:
+				frappe.throw(
+					_("Invalid {0} recipient: {1}").format(field, frappe.utils.escape_html(token)),
+					frappe.InvalidEmailAddressError,
+				)
+			continue
+		out.append(email)
+	return out
+
+
+def _dedupe_addresses(addresses, seen):
+	"""Stable, case-insensitive dedupe; `seen` (lowercase set) is shared across categories."""
+	out = []
+	for address in addresses:
+		key = address.lower()
+		if key in seen:
+			continue
+		seen.add(key)
+		out.append(address)
+	return out
+
+
+def _resolve_reply_recipients(ticket, recipients=None, cc=None, bcc=None, include_audit=True):
+	"""Resolve the effective To/CC/BCC of an agent reply as comma-space-separated strings.
+
+	`recipients is None` is the legacy contract (To = raised_by, falsey CC/BCC inherit the
+	last Communication). Otherwise the contract is explicit: To is required, `cc`/`bcc` of
+	None inherit the last Communication and [] / "" clear. Configured audit recipients
+	are always appended to BCC (unless `include_audit` is False) and each address receives
+	one copy only."""
+	last_communication = ticket.get_last_communication()
+
+	def audit_addresses():
+		if not include_audit:
+			return []
+		# Function-local: unity_helpdesk imports this module.
+		try:
+			from helpdesk.api.unity_helpdesk import _default_bulk_recipients
+
+			return _default_bulk_recipients() or []
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "Unity default audit-recipient BCC injection")
+			return []
+
+	if recipients is None:
+		to = ticket.raised_by
+		if to == "Administrator":
+			to = frappe.get_value("User", "Administrator", "email")
+		if last_communication:
+			cc = cc or last_communication.cc
+			bcc = bcc or last_communication.bcc
+		audit = audit_addresses()
+		if audit:
+			existing = [e.strip() for e in (bcc or "").replace(";", ",").split(",") if e.strip()]
+			seen = {e.lower() for e in existing}
+			for addr in audit:
+				if addr.lower() not in seen:
+					existing.append(addr)
+					seen.add(addr.lower())
+			bcc = ", ".join(existing)
+		return {"recipients": to, "cc": cc, "bcc": bcc}
+
+	to_list = _parse_address_list(recipients, _("To"))
+	if not to_list:
+		frappe.throw(_("Please enter at least one To recipient"), frappe.ValidationError)
+
+	def category(value, field, inherited):
+		if value is None:
+			return _parse_address_list(inherited if last_communication else None, field, strict=False)
+		return _parse_address_list(value, field)
+
+	cc_list = category(cc, _("CC"), last_communication.cc if last_communication else None)
+	bcc_list = category(bcc, _("BCC"), last_communication.bcc if last_communication else None)
+
+	seen = set()
+	to_list = _dedupe_addresses(to_list, seen)
+	cc_list = _dedupe_addresses(cc_list, seen)
+	bcc_list = _dedupe_addresses(bcc_list, seen)
+	bcc_list.extend(_dedupe_addresses(audit_addresses(), seen))
+
+	return {
+		"recipients": ", ".join(to_list),
+		"cc": ", ".join(cc_list),
+		"bcc": ", ".join(bcc_list),
+	}
+
+
 class HDTicket(Document):
 	@staticmethod
 	def get_list_select(query: Query):
@@ -529,42 +674,25 @@ class HDTicket(Document):
 
 	@frappe.whitelist()
 	def reply_via_agent(
-		self, message: str, cc: str = None, bcc: str = None, attachments: List[str] = []
+		self,
+		message: str,
+		cc: str | list | None = None,
+		bcc: str | list | None = None,
+		attachments: List[str] = [],
+		recipients: str | list | None = None,
 	):
 		skip_email_workflow = self.skip_email_workflow()
 		medium = "" if skip_email_workflow else "Email"
 		subject = f"Re: {self.subject} (#{self.name})"
 		sender = frappe.session.user
-		recipients = self.raised_by
 		sender_email = None if skip_email_workflow else self.sender_email()
-		last_communication = self.get_last_communication()
 
-		if last_communication:
-			cc = cc or last_communication.cc
-			bcc = bcc or last_communication.bcc
-
-		# Unity: copy the configured default/audit recipients (HD Settings) on every
-		# outgoing reply, so a monitoring mailbox always receives a copy. They are
-		# added to BCC so the customer never sees them. De-duplicated against any
-		# existing BCC. A missing setting must never break sending.
-		try:
-			from helpdesk.api.unity_helpdesk import _default_bulk_recipients
-
-			audit_recipients = _default_bulk_recipients()
-			if audit_recipients:
-				existing = [e.strip() for e in (bcc or "").replace(";", ",").split(",") if e.strip()]
-				seen = {e.lower() for e in existing}
-				for addr in audit_recipients:
-					if addr.lower() not in seen:
-						existing.append(addr)
-						seen.add(addr.lower())
-				bcc = ", ".join(existing)
-		except Exception:
-			frappe.log_error(frappe.get_traceback(), "Unity default audit-recipient BCC injection")
-
-		if recipients == "Administrator":
-			admin_email = frappe.get_value("User", "Administrator", "email")
-			recipients = admin_email
+		# To/CC/BCC (incl. last-communication inheritance and the configured audit
+		# copies) are resolved/validated once, before anything is persisted.
+		resolved = _resolve_reply_recipients(self, recipients=recipients, cc=cc, bcc=bcc)
+		recipients = resolved["recipients"]
+		cc = resolved["cc"]
+		bcc = resolved["bcc"]
 
 		communication = frappe.get_doc(
 			{

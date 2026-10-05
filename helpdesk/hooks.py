@@ -85,6 +85,7 @@ doc_events = {
 
 has_permission = {
 	"HD Ticket": "helpdesk.helpdesk.doctype.hd_ticket.hd_ticket.has_permission",
+	"HD Ticket Comment": "helpdesk.helpdesk.doctype.hd_ticket_comment.hd_ticket_comment.has_permission",
 }
 
 permission_query_conditions = {
