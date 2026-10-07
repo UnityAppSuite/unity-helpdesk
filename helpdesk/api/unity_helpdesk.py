@@ -1095,6 +1095,121 @@ def _docstatus_label(value):
 		return cstr(value)
 
 
+# Transport status for the Student Details card. edu_quality's
+# `Program Enrollment.transport_service_required` is the source of truth: it is what
+# syncs down to Student.bus_service_required (edu_quality/edu_quality/overrides/
+# program_enrollment.py:1004) and what the permanent ID card branches on
+# (edu_quality/templates/pdf/permanent_id_card.html:366 — bus route when checked,
+# "M" + batch number when not). Reading the ENROLLMENT rather than the Student
+# mirror is also what makes this per-academic-year, which is what the card needs.
+#
+# The flag is INVERTED for our purposes: unchecked means no school bus, i.e. a
+# parent does the pickup and drop — a "Mamma Child" in school parlance.
+TRANSPORT_STATUS_SCHOOL_BUS = "school_bus"
+TRANSPORT_STATUS_MAMMA_CHILD = "mamma_child"
+TRANSPORT_STATUS_UNKNOWN = "unknown"
+
+# Fetched together off the picked enrollment: the flag, the drop route the ID card
+# prints for transport students, and the student group that leads to the batch
+# number it prints for everyone else.
+TRANSPORT_ENROLLMENT_FIELDS = ("transport_service_required", "drop_bus", "student_group")
+
+
+def _transport_status(enrollment):
+	"""Tri-state, deliberately not a boolean.
+
+	No enrollment at all, or a site where the edu_quality Custom Field hasn't been
+	migrated in (the column is then omitted from the fetch, so the key is absent
+	from the row), is UNKNOWN. It must NEVER render as Mamma Child — absence of the
+	flag is not a negative flag, and the interesting state here is the falsy one, so
+	a nullable boolean would invite `if (!flag)` to quietly mislabel an unknown.
+	A NULL value lands here too, which is the safe direction.
+	"""
+	raw = (enrollment or {}).get("transport_service_required")
+	if raw is None:
+		return TRANSPORT_STATUS_UNKNOWN
+	return TRANSPORT_STATUS_SCHOOL_BUS if cint(raw) else TRANSPORT_STATUS_MAMMA_CHILD
+
+
+def _fetch_batch_numbers(enrollment_rows):
+	"""Map Student Group -> batch number, for the card's non-transport label.
+
+	Mirrors the permanent ID card's chain (edu_quality/api/print_id_card.py:78
+	`get_batch_number`): Program Enrollment.student_group -> Student Group.batch ->
+	Student Batch Name.custom_batch_number. Student Batch Name is the batch-timing
+	record (it carries start_time/end_time), matched by name off the student group.
+
+	Batched into two queries rather than the ID card's per-enrollment
+	`frappe.get_doc` loop — this runs on a request path with a 15 s budget and a
+	history of timeouts. Best-effort: {} if any link is unavailable, since
+	student_group and custom_batch_number are both edu_quality Custom Fields.
+	"""
+	if not (_has_doctype("Student Group") and _has_doctype("Student Batch Name")):
+		return {}
+	if not frappe.db.has_column("Student Batch Name", "custom_batch_number"):
+		return {}
+	group_ids = sorted(
+		{
+			cstr(row.get("student_group") or "").strip()
+			for row in (enrollment_rows or [])
+			if cstr(row.get("student_group") or "").strip()
+		}
+	)
+	if not group_ids:
+		return {}
+	try:
+		groups = frappe.get_all(
+			"Student Group",
+			fields=["name", "batch"],
+			filters={"name": ["in", group_ids]},
+			page_length=0,
+		)
+		batch_ids = sorted(
+			{cstr(row.get("batch") or "").strip() for row in groups if cstr(row.get("batch") or "").strip()}
+		)
+		if not batch_ids:
+			return {}
+		numbers = {
+			row.get("name"): cstr(row.get("custom_batch_number") or "").strip()
+			for row in frappe.get_all(
+				"Student Batch Name",
+				fields=["name", "custom_batch_number"],
+				filters={"name": ["in", batch_ids]},
+				page_length=0,
+			)
+		}
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "unity_helpdesk._fetch_batch_numbers")
+		return {}
+	return {
+		cstr(row.get("name")): numbers.get(cstr(row.get("batch") or "").strip(), "")
+		for row in groups
+	}
+
+
+def _transport_display(enrollment, status, batch_numbers):
+	"""The exact token the permanent ID card prints, reused on the student card so
+	an agent reads the same thing that's in the child's bag.
+
+	On transport -> the DROP route number (permanent_id_card.html:367 renders
+	`doc.drop_bus`, not pickup_bus). Off transport -> "M" + the batch number
+	(:369, `{{"M" if batch_num else ""}}{{batch_num or ""}}`) — the "M" is for Mamma.
+
+	Returns "" when the underlying value is missing or the status is unknown; the
+	SPA then names the side of the flag rather than rendering nothing. The drop
+	route stays gated on the status because unchecking the box does NOT clear
+	drop_bus — only the section's depends_on hides it — so an ex-transport student
+	keeps a stale route on the row.
+	"""
+	if status == TRANSPORT_STATUS_SCHOOL_BUS:
+		return cstr((enrollment or {}).get("drop_bus") or "").strip()
+	if status == TRANSPORT_STATUS_MAMMA_CHILD:
+		group = cstr((enrollment or {}).get("student_group") or "").strip()
+		number = cstr((batch_numbers or {}).get(group) or "").strip()
+		return f"M{number}" if number else ""
+	return ""
+
+
 def _student_context_dependencies_ready():
 	return all(
 		_has_doctype(doctype)
@@ -1493,6 +1608,20 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 		):
 			guardian_docs[row.name] = frappe._dict(row)
 
+	# The transport columns are edu_quality Custom Fields, so gate each the way
+	# search_contacts gates its optional Student columns. Note this does NOT make the
+	# endpoint edu_quality-optional — `custom_school` and `payment_plan` below are
+	# edu_quality customs too and are fetched unguarded. The case this actually covers
+	# is a site where edu_quality is installed but these columns haven't been migrated
+	# in yet (a restored/staging DB, or a bench mid-deploy): the Transport row degrades
+	# to "unknown" instead of the whole student panel erroring on an unknown fieldname.
+	# frappe.db.has_column (not the module-level _has_field) because that helper's
+	# lru_cache has no site in its key, which would leak the answer across sites.
+	transport_fields = [
+		field
+		for field in TRANSPORT_ENROLLMENT_FIELDS
+		if frappe.db.has_column("Program Enrollment", field)
+	]
 	enrollment_rows = frappe.get_all(
 		"Program Enrollment",
 		fields=[
@@ -1505,7 +1634,8 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			"workflow_state",
 			"docstatus",
 			"modified",
-		],
+		]
+		+ transport_fields,
 		# Fetch ALL of the student's enrolments (no academic-year filter). The picker
 		# prefers the current year for current students and falls back to the latest
 		# year for Alumni / Cancelled / not-yet-re-enrolled students.
@@ -1558,6 +1688,10 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 	# in the SPA's student-context sidebar. Best-effort: silently skips if the
 	# School doctype is unavailable (e.g. edu_quality not installed).
 	school_locations = _fetch_school_locations(students_by_id, enrollment_rows)
+	# Student Group -> batch number, for the "M<batch>" label a non-transport student
+	# gets on their ID card. Pre-fetched across ALL enrolments (like school_locations
+	# above) so the per-student loop stays query-free.
+	batch_numbers = _fetch_batch_numbers(enrollment_rows)
 
 	student_cards = []
 	for student_id in all_student_ids:
@@ -1629,6 +1763,10 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 			(selected_enrollment.get("custom_school") if selected_enrollment else None)
 			or student.get("school")
 		)
+		transport_status = _transport_status(selected_enrollment)
+		transport_display = _transport_display(
+			selected_enrollment, transport_status, batch_numbers
+		)
 		student_cards.append(
 			{
 				"student_id": student_id,
@@ -1658,6 +1796,13 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 				"academic_year": (
 					selected_enrollment.get("academic_year") if selected_enrollment else None
 				),
+				# Derived tri-state for the card's Transport row, off the SAME selected
+				# enrollment as academic_year above (i.e. the matching academic year), so
+				# it stays consistent with the Class / Payment Plan shown beside it.
+				"transport_status": transport_status,
+				# The permanent ID card's token: the drop route for a transport student,
+				# "M<batch number>" for a Mamma Child. "" when it can't be resolved.
+				"transport_display": transport_display,
 				"enrollment": (
 					{
 						"name": selected_enrollment.get("name"),
@@ -1665,6 +1810,14 @@ def get_student_context_for_ticket(ticket_name=None, raised_by=None):
 						"school": selected_enrollment.get("custom_school") or student.get("school"),
 						"academic_year": selected_enrollment.get("academic_year"),
 						"payment_plan": selected_enrollment.get("payment_plan"),
+						# Raw flag; None when this site doesn't have the Custom Field. The
+						# card reads the derived transport_status above — this keeps the
+						# sub-dict a faithful mirror of the picked row, as its other keys are.
+						"transport_service_required": (
+							None
+							if selected_enrollment.get("transport_service_required") is None
+							else bool(cint(selected_enrollment.get("transport_service_required")))
+						),
 						"workflow_state": selected_enrollment.get("workflow_state"),
 						"docstatus": int(selected_enrollment.get("docstatus") or 0),
 						"docstatus_label": _docstatus_label(selected_enrollment.get("docstatus")),
