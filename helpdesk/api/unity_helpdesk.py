@@ -3744,7 +3744,7 @@ def _build_filters(view="all", filters=None, assigned_agent=None):
 def _count(filters=None, or_filters=None):
 	row = frappe.get_list(
 		TICKET_DOCTYPE,
-		fields=["count(name) as total_count"],
+		fields=[{"COUNT": "name", "as": "total_count"}],
 		filters=filters or {},
 		or_filters=or_filters or [],
 		page_length=1,

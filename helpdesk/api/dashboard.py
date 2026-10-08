@@ -1,8 +1,19 @@
+from collections import Counter
 from datetime import datetime, timedelta
 
 import frappe
 from frappe.query_builder.functions import Count
 from frappe.utils.caching import redis_cache
+
+
+def _daily_counts(doctype, filters):
+	"""Per-day counts. v16 get_list cannot group by DATE(creation), so tally the
+	permission-filtered creation timestamps here instead."""
+	days = Counter(
+		row.creation.date()
+		for row in frappe.db.get_list(doctype, fields=["creation"], filters=filters, limit_page_length=0)
+	)
+	return [{"value": days[day], "name": day} for day in sorted(days)]
 
 
 @frappe.whitelist()
@@ -26,7 +37,7 @@ def ticket_statuses():
 
 	res = frappe.db.get_list(
 		"HD Ticket",
-		fields=["count(name) as value", "status as name"],
+		fields=[{"COUNT": "name", "as": "value"}, "status as name"],
 		filters=filters,
 		group_by="status",
 	)
@@ -77,7 +88,7 @@ def ticket_types():
 
 	res = frappe.db.get_list(
 		"HD Ticket",
-		fields=["count(name) as value", "ticket_type as name"],
+		fields=[{"COUNT": "name", "as": "value"}, "ticket_type as name"],
 		filters=filters,
 		group_by="ticket_type",
 	)
@@ -95,13 +106,7 @@ def new_tickets():
 	thirty_days_ago = datetime.now() - timedelta(days=30)
 	filters = {"creation": [">=", thirty_days_ago.strftime("%Y-%m-%d")]}
 
-	res = frappe.db.get_list(
-		"HD Ticket",
-		fields=["COUNT(name) as value", "DATE(creation) as name"],
-		filters=filters,
-		group_by="DATE(creation)",
-		order_by="DATE(creation)",
-	)
+	res = _daily_counts("HD Ticket", filters)
 
 	return {
 		"title": "New tickets",
@@ -151,13 +156,7 @@ def ticket_activity():
 	thirty_days_ago = datetime.now() - timedelta(days=30)
 	filters = {"creation": [">=", thirty_days_ago.strftime("%Y-%m-%d")]}
 
-	res = frappe.db.get_list(
-		"HD Ticket Activity",
-		fields=["COUNT(name) as value", "DATE(creation) as name"],
-		filters=filters,
-		group_by="DATE(creation)",
-		order_by="DATE(creation)",
-	)
+	res = _daily_counts("HD Ticket Activity", filters)
 
 	return {
 		"title": "Activity",
@@ -174,7 +173,7 @@ def ticket_priority():
 
 	res = frappe.db.get_list(
 		"HD Ticket",
-		fields=["count(name) as value", "priority as name"],
+		fields=[{"COUNT": "name", "as": "value"}, "priority as name"],
 		filters=filters,
 		group_by="priority",
 	)
