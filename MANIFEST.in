@@ -15,4 +15,4 @@ recursive-include helpdesk *.png
 recursive-include helpdesk *.py
 recursive-include helpdesk *.svg
 recursive-include helpdesk *.txt
-recursive-exclude helpdesk *.pyc
+recursive-exclude helpdesklll
