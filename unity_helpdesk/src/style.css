@@ -2704,6 +2704,26 @@ tbody tr.bulk-email-ticket:hover {
   color: #b45309;
 }
 
+/* "(edited)" marker on an internal note that has been rewritten by its author. */
+.chat-msg-edited {
+  font-size: 11px;
+  font-style: italic;
+  color: #b45309;
+}
+/* `.chat-msg-time` takes `margin-left: auto`, so anything after it must not
+   also push left — keep Edit pinned right next to the timestamp. */
+.chat-msg-edit-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 0;
+}
+.chat-msg-edit-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 10px;
+}
+
 .thread-layout-classic .chat-msg {
   max-width: 100%;
   border-radius: 14px;

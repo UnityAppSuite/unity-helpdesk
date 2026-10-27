@@ -9,6 +9,8 @@
   "reference_ticket",
   "commented_by",
   "is_pinned",
+  "is_edited",
+  "edited_at",
   "column_break_3",
   "content"
  ],
@@ -42,11 +44,24 @@
    "fieldname": "is_pinned",
    "fieldtype": "Check",
    "label": "Is pinned"
+  },
+  {
+   "default": "0",
+   "fieldname": "is_edited",
+   "fieldtype": "Check",
+   "label": "Is Edited",
+   "read_only": 1
+  },
+  {
+   "fieldname": "edited_at",
+   "fieldtype": "Datetime",
+   "label": "Edited At",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2023-12-17 13:06:01.197664",
+ "modified": "2026-10-27 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Helpdesk",
  "name": "HD Ticket Comment",
