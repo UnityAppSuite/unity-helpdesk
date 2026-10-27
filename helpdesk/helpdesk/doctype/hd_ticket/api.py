@@ -159,6 +159,8 @@ def get_comments(ticket: str):
 			QBComment.content,
 			QBComment.creation,
 			QBComment.is_pinned,
+			QBComment.is_edited,
+			QBComment.edited_at,
 			QBComment.name,
 		)
 		.where(QBComment.reference_ticket == ticket)

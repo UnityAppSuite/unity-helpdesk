@@ -465,8 +465,55 @@
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
+                <span
+                  v-if="item._type === 'comment' && item.is_edited"
+                  class="chat-msg-edited"
+                  title="Last edited"
+                  >{{
+                    item.edited_at
+                      ? `(edited ${formatDateTime(item.edited_at)})`
+                      : "(edited)"
+                  }}</span
+                >
+                <button
+                  v-if="canEditNote(item) && editingNoteId !== item.name"
+                  type="button"
+                  class="link-btn chat-msg-edit-btn"
+                  @click="startEditNote(item)"
+                >
+                  Edit
+                </button>
               </div>
+              <template v-if="editingNoteId === item.name">
+                <p v-if="noteEditError" class="error">{{ noteEditError }}</p>
+                <TinyMceEditor
+                  v-model="noteEditHtml"
+                  :min-height="200"
+                  :ticket-name="props.ticketId"
+                  :enable-email-template="false"
+                  :enable-attach="false"
+                  placeholder="Edit this internal note..."
+                />
+                <div class="chat-msg-edit-actions">
+                  <button
+                    class="btn"
+                    :disabled="savingNote || noteEditIsEmpty"
+                    @click="saveEditNote(item)"
+                  >
+                    {{ savingNote ? "Saving..." : "Save Note" }}
+                  </button>
+                  <button
+                    type="button"
+                    class="link-btn"
+                    :disabled="savingNote"
+                    @click="cancelEditNote"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </template>
               <div
+                v-else
                 class="chat-msg-body safe-html"
                 v-html="sanitize(threadContent(item))"
               ></div>
@@ -750,6 +797,8 @@ const props = defineProps({ ticketId: { type: String, required: true } });
 const emit = defineEmits(["title"]);
 const route = useRoute();
 const router = useRouter();
+// Current user — used to gate the "Edit" action on an internal note to its author.
+const unitySession = inject("unitySession", null);
 
 const ticket = ref({});
 const agents = ref([]);
@@ -998,6 +1047,75 @@ const hasAdditionalDetails = computed(
     ticket.value.custom_previous_ticket_details
 );
 const composerIsEmpty = computed(() => !hasMeaningfulHtml(composerHtml.value));
+
+// ---- Internal note editing ------------------------------------------------
+// Only the note's own author may edit it (the backend enforces this too —
+// update_comment rejects anyone else). One note is editable at a time; its
+// draft lives here rather than in composerDrafts so an in-progress edit can
+// never be confused with the "add note" composer.
+const editingNoteId = ref("");
+const noteEditHtml = ref("");
+const noteEditError = ref("");
+const savingNote = ref(false);
+const noteEditIsEmpty = computed(() => !hasMeaningfulHtml(noteEditHtml.value));
+
+function canEditNote(item) {
+  if (!item || item._type !== "comment") return false;
+  const me = unitySession?.name || unitySession?.email || "";
+  if (!me) return false;
+  return (item.commented_by || item.sender) === me;
+}
+
+function startEditNote(item) {
+  editingNoteId.value = item.name;
+  noteEditHtml.value = item.content || "";
+  noteEditError.value = "";
+}
+
+function cancelEditNote() {
+  editingNoteId.value = "";
+  noteEditHtml.value = "";
+  noteEditError.value = "";
+}
+
+// Patch the edited note in place in both the thread and the comments fallback
+// list, so the new body + the "(edited)" marker show immediately without
+// re-fetching (and without disturbing scroll position).
+function applyNoteUpdate(updated) {
+  if (!updated || !updated.name) return;
+  const merge = (row) =>
+    row.name === updated.name && row._type === "comment"
+      ? { ...row, ...updated, _type: "comment" }
+      : row;
+  if (ticket.value && Array.isArray(ticket.value.thread)) {
+    ticket.value.thread = ticket.value.thread.map(merge);
+  }
+  comments.value = comments.value.map((row) =>
+    row.name === updated.name ? { ...row, ...updated, _type: "comment" } : row
+  );
+}
+
+async function saveEditNote(item) {
+  if (noteEditIsEmpty.value) return;
+  savingNote.value = true;
+  noteEditError.value = "";
+  try {
+    const res = await call("helpdesk.api.unity_helpdesk_ext.update_comment", {
+      comment: item.name,
+      content: noteEditHtml.value,
+    });
+    applyNoteUpdate(res && res.comment);
+    cancelEditNote();
+    // Reconcile silently (no skeleton, no student-context re-run) so the row
+    // matches server truth even if the optimistic patch missed a field.
+    loadTicket({ silent: true, skipHeavy: true });
+  } catch (err) {
+    if (err instanceof AuthRedirectError) return;
+    noteEditError.value = err?.message || "Could not update the note";
+  } finally {
+    savingNote.value = false;
+  }
+}
 
 watch(
   () => props.ticketId,

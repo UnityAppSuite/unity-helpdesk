@@ -503,6 +503,28 @@ def _latest_communication_payload(ticket_name):
 # Internal comment (note — not sent to customer)
 # ---------------------------------------------------------------------------
 
+def _comment_payload(comment):
+    """Thread-ready dict for ONE internal note.
+
+    Shape matches what get_comments() puts in the thread (see
+    hd_ticket/api.py::get_comments) plus the edit markers, so the SPA can swap an
+    optimistic row for server truth without a reload.
+    """
+    return {
+        "name": comment.name,
+        "content": comment.content,
+        "commented_by": comment.commented_by,
+        "creation": str(comment.creation),
+        "is_pinned": comment.is_pinned,
+        "is_edited": int(comment.get("is_edited") or 0),
+        "edited_at": str(comment.get("edited_at")) if comment.get("edited_at") else None,
+        "user": {
+            "name": comment.commented_by,
+            "full_name": frappe.utils.get_fullname(comment.commented_by),
+        },
+    }
+
+
 @frappe.whitelist()
 def add_comment(name, content):
     capabilities = _require_unity_access()
@@ -519,20 +541,54 @@ def add_comment(name, content):
     # The comment insert fires the search-index doc hook, which refreshes the index
     # asynchronously — no inline rebuild (that was the "add note" latency).
     # Return the created comment so the SPA can append it optimistically (no reload).
-    return {
-        "ok": True,
-        "comment": {
-            "name": comment.name,
-            "content": comment.content,
-            "commented_by": comment.commented_by,
-            "creation": str(comment.creation),
-            "is_pinned": comment.is_pinned,
-            "user": {
-                "name": comment.commented_by,
-                "full_name": frappe.utils.get_fullname(comment.commented_by),
-            },
-        },
-    }
+    return {"ok": True, "comment": _comment_payload(comment)}
+
+
+@frappe.whitelist()
+def update_comment(comment, content):
+    """Edit the body of an existing internal note.
+
+    Author-only: a note is that agent's own words, so only the agent who wrote it
+    may rewrite it (ticket access alone is NOT enough — otherwise any agent on the
+    ticket could silently put words in a colleague's mouth). Every successful edit
+    stamps `is_edited` + `edited_at`, so the thread can mark the note as edited and
+    the audit trail never shows a changed note as pristine.
+    """
+    capabilities = _require_unity_access()
+    content = cstr(content or "").strip()
+    if not content:
+        frappe.throw(_("Please enter a comment"))
+
+    doc = frappe.db.get_value(
+        "HD Ticket Comment",
+        comment,
+        ["name", "commented_by", "reference_ticket"],
+        as_dict=True,
+    )
+    if not doc:
+        frappe.throw(_("Note not found"), frappe.DoesNotExistError)
+
+    # Ticket-level gate first (a user who can't see the ticket must not learn
+    # whether one of its notes exists), then the author gate.
+    _require_ticket_access(doc.reference_ticket, capabilities)
+    if doc.commented_by != frappe.session.user:
+        frappe.throw(
+            _("You can only edit your own notes"), frappe.PermissionError
+        )
+
+    note = frappe.get_doc("HD Ticket Comment", doc.name)
+    if cstr(note.content or "") == content:
+        # No-op edit (opened the editor, saved without changing anything): don't
+        # falsely stamp the note as edited.
+        return {"ok": True, "comment": _comment_payload(note)}
+
+    note.content = content
+    note.is_edited = 1
+    note.edited_at = frappe.utils.now()
+    # on_update refreshes the ticket's message search index, so an edited note stays
+    # findable by its NEW text.
+    note.save(ignore_permissions=True)
+    return {"ok": True, "comment": _comment_payload(note)}
 
 
 # ---------------------------------------------------------------------------
