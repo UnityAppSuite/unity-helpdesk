@@ -108,6 +108,7 @@ def get_ticket_thread_components(ticket: str):
 			QBCommunication.recipients,
 			QBCommunication.sent_or_received,
 			QBCommunication.sender,
+			QBCommunication.sender_full_name,
 			QBCommunication.subject,
 		)
 		.where(QBCommunication.reference_doctype == "HD Ticket")
@@ -127,6 +128,12 @@ def get_ticket_thread_components(ticket: str):
 		c.pop("text_content", None)
 		c.attachments = get_attachments("Communication", c.name)
 		c.user = get_user_info_for_avatar(c.sender)
+		# External senders (parents / customers) are not Users, so the avatar helper
+		# falls back to name == email. Prefer the display name parsed from the mail
+		# header so the UI can show "Kamini Chavan <kamini@...>" instead of the
+		# address twice.
+		if c.sender_full_name and c.user.get("name") == c.user.get("email"):
+			c.user["name"] = c.sender_full_name
 
 	comments = get_comments(ticket)
 	for c in comments:

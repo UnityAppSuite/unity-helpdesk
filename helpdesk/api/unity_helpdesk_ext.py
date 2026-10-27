@@ -383,7 +383,9 @@ def update_ticket(
 # Reply
 # ---------------------------------------------------------------------------
 
-def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments=None):
+def _create_communication_direct(
+    ticket, message, cc=None, bcc=None, attachments=None, recipients=None
+):
     """Create a Communication record without sending email (fallback when no email account set up).
 
     Sets a synthetic message_id so that customer email replies can be threaded back to this
@@ -398,7 +400,7 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments
         "email_status": "Open",
         "subject": f"Re: {ticket.subject} (#{ticket.name})",
         "sender": frappe.session.user,
-        "recipients": ticket.raised_by,
+        "recipients": recipients or ticket.raised_by,
         "content": message,
         "status": "Linked",
         "reference_doctype": TICKET_DOCTYPE,
@@ -412,34 +414,66 @@ def _create_communication_direct(ticket, message, cc=None, bcc=None, attachments
     return communication
 
 
+def _clean_reply_addresses(value, label):
+    """Normalise an agent-entered To/Cc list to 'a@x.com, b@y.com'.
+
+    Rejects the whole send if ANY entry is not a valid address — a silently dropped
+    typo would mean the customer never gets the reply while the thread shows it sent.
+    Returns None for an empty list so the caller can fall back to the default.
+    """
+    if value in (None, ""):
+        return None
+    emails, invalid = _split_email_list_with_counts(value)
+    if invalid:
+        frappe.throw(_("{0} contains an invalid email address").format(label))
+    return ", ".join(emails) if emails else None
+
+
 @frappe.whitelist()
-def reply(name, message, cc=None, bcc=None, attachments=None):
+def reply(name, message, cc=None, bcc=None, attachments=None, recipients=None):
     capabilities = _require_unity_access()
     _require_ticket_access(name, capabilities)
     if not message:
         frappe.throw(_("Please enter a reply"))
     ticket = frappe.get_doc(TICKET_DOCTYPE, name)
+    # Per-reply To / Cc chosen by the agent in the composer. Empty To falls back to
+    # raised_by inside reply_via_agent; the ticket's raised_by is never modified.
+    # The composer pre-fills Cc from the last message, so whatever arrives here IS
+    # the agent's final choice — inherit_cc=False stops reply_via_agent re-adding a
+    # Cc the agent deliberately removed.
+    recipients = _clean_reply_addresses(recipients, _("To"))
+    cc = _clean_reply_addresses(cc, _("Cc")) or ""
+    bcc = _clean_reply_addresses(bcc, _("Bcc")) or ""
     # Personalize template placeholders ({{first_name}} etc.) from the ticket's
     # customer (raised_by) student record. Plain text is returned unchanged.
     message = _safe_render(message, _merge_context_for_email(ticket.get("raised_by")))
+    comms_before = frappe.db.count(
+        "Communication", {"reference_doctype": TICKET_DOCTYPE, "reference_name": name}
+    )
     try:
         ticket.reply_via_agent(
             message=message,
             cc=cc,
             bcc=bcc,
             attachments=_parse_json(attachments, []),
+            recipients=recipients,
+            inherit_cc=False,
         )
-    except frappe.ValidationError as exc:
-        if _is_missing_sender_error(exc):
-            # No outgoing email account configured — save communication record only
-            _create_communication_direct(ticket, message, cc, bcc, attachments)
-        else:
-            raise
     except Exception as exc:
-        if _is_missing_sender_error(exc):
-            _create_communication_direct(ticket, message, cc, bcc, attachments)
-        else:
+        if not _is_missing_sender_error(exc):
             raise
+        # No outgoing email account configured — keep the Communication record so the
+        # thread still shows the reply. reply_via_agent inserts its Communication
+        # BEFORE it checks for a sender, so by the time it throws the record usually
+        # exists already; only create one if it genuinely didn't get that far.
+        comms_after = frappe.db.count(
+            "Communication", {"reference_doctype": TICKET_DOCTYPE, "reference_name": name}
+        )
+        if comms_after == comms_before:
+            _create_communication_direct(ticket, message, cc, bcc, attachments, recipients)
+        # frappe.throw() queued the "No sender email" text in message_log; without
+        # clearing it the SPA shows a red error for a reply that was in fact saved.
+        frappe.clear_last_message()
     # The Communication created by reply_via_agent (or the fallback) fires the
     # search-index doc hook, which refreshes the index ASYNCHRONOUSLY — we no longer
     # rebuild it inline here (that whole-thread rebuild was seconds of reply latency).
