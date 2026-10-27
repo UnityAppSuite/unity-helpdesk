@@ -2675,9 +2675,13 @@ tbody tr.bulk-email-ticket:hover {
   color: var(--light);
 }
 .chat-msg-recipients {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding: 0 0 6px;
   font-size: 11px;
   color: var(--muted);
-  padding: 2px 14px 4px;
+  word-break: break-all;
 }
 .chat-msg-to-label {
   font-weight: 600;
@@ -2787,6 +2791,52 @@ tbody tr.bulk-email-ticket:hover {
 .compose-tab-comment.active {
   color: #b45309;
   border-bottom-color: #f59e0b;
+}
+
+/* Reply composer To / Cc rows. Mail-client style: label on the left, address
+   input filling the row. Overrides the column layout `.stack label` applies. */
+.reply-recipients {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface, #fff);
+}
+.stack label.reply-recipient-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text);
+}
+.reply-recipient-row + .reply-recipient-row {
+  border-top: 1px solid var(--border);
+}
+.reply-recipient-label {
+  flex: 0 0 28px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.reply-recipient-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  font: inherit;
+  color: var(--text);
+  padding: 4px 0;
+  outline: none;
+}
+.reply-recipient-input::placeholder {
+  color: var(--light);
+}
+.reply-recipient-reset {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 0;
 }
 
 .editor-toolbar {

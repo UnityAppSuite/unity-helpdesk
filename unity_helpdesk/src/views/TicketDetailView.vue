@@ -462,6 +462,12 @@
                 <span v-if="threadAuthor(item)" class="chat-msg-author">{{
                   threadAuthor(item)
                 }}</span>
+                <span
+                  v-if="threadAuthorEmail(item)"
+                  class="chat-msg-sender"
+                  :title="threadAuthorEmail(item)"
+                  >&lt;{{ threadAuthorEmail(item) }}&gt;</span
+                >
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
@@ -483,6 +489,18 @@
                 >
                   Edit
                 </button>
+              </div>
+              <div
+                v-if="item._type === 'comm' && (item.recipients || item.cc)"
+                class="chat-msg-recipients"
+              >
+                <span v-if="item.recipients"
+                  ><span class="chat-msg-to-label">To:</span
+                  >{{ item.recipients }}</span
+                >
+                <span v-if="item.cc"
+                  ><span class="chat-msg-to-label">Cc:</span>{{ item.cc }}</span
+                >
               </div>
               <template v-if="editingNoteId === item.name">
                 <p v-if="noteEditError" class="error">{{ noteEditError }}</p>
@@ -563,6 +581,39 @@
           </div>
           <div class="detail-body stack">
             <p v-if="actionError" class="error">{{ actionError }}</p>
+            <div v-if="composeMode === 'reply'" class="reply-recipients">
+              <label class="reply-recipient-row">
+                <span class="reply-recipient-label">To</span>
+                <input
+                  v-model="replyTo"
+                  type="text"
+                  class="reply-recipient-input"
+                  placeholder="recipient@example.com (comma-separate for more)"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+                <button
+                  v-if="replyTo.trim() !== (ticket.raised_by || '').trim()"
+                  type="button"
+                  class="link-btn reply-recipient-reset"
+                  :title="`Reset to ${ticket.raised_by || 'ticket sender'}`"
+                  @click="replyTo = ticket.raised_by || ''"
+                >
+                  Reset
+                </button>
+              </label>
+              <label class="reply-recipient-row">
+                <span class="reply-recipient-label">Cc</span>
+                <input
+                  v-model="replyCc"
+                  type="text"
+                  class="reply-recipient-input"
+                  placeholder="Optional — comma-separate multiple addresses"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
+              </label>
+            </div>
             <TinyMceEditor
               ref="editorRef"
               v-model="composerHtml"
@@ -610,7 +661,8 @@
             <button
               v-if="composeMode === 'reply'"
               class="btn"
-              :disabled="saving || composerIsEmpty"
+              :disabled="saving || composerIsEmpty || !replyTo.trim()"
+              :title="!replyTo.trim() ? 'Enter a recipient email address' : ''"
               @click="sendReply"
             >
               {{ saving ? "Sending..." : "Send Reply" }}
@@ -835,6 +887,34 @@ const composerHtml = computed({
   },
 });
 const composerAttachments = ref([]);
+// ---- Reply recipients -------------------------------------------------------
+// Who THIS reply goes to. Pre-filled from the ticket (To = raised_by, Cc = the
+// Cc of the most recent message, so reply-all continuity is visible rather than
+// silent) and editable per reply. Changing To never rewrites ticket.raised_by;
+// the next reply pre-fills from the ticket again.
+const replyTo = ref("");
+const replyCc = ref("");
+// Only pre-fill on first load of a ticket. A silent reconcile after send must not
+// clobber an address the agent is mid-way through typing for the next reply.
+let recipientsPrefilledFor = "";
+
+function latestMessageCc() {
+  const comms = (ticket.value?.thread || communications.value || []).filter(
+    (item) => item._type === "comm" || item.sent_or_received
+  );
+  if (!comms.length) return "";
+  const last = [...comms].sort(
+    (a, b) => new Date(b.creation) - new Date(a.creation)
+  )[0];
+  return (last?.cc || "").trim();
+}
+
+function prefillReplyRecipients() {
+  if (recipientsPrefilledFor === props.ticketId) return;
+  recipientsPrefilledFor = props.ticketId;
+  replyTo.value = (ticket.value?.raised_by || "").trim();
+  replyCc.value = latestMessageCc();
+}
 const editorRef = ref(null);
 const attachmentInput = ref(null);
 const uploadingAttachment = ref(false);
@@ -1122,6 +1202,9 @@ watch(
   async () => {
     emit("title", "Ticket Detail", `#${props.ticketId}`);
     comments.value = [];
+    recipientsPrefilledFor = "";
+    replyTo.value = "";
+    replyCc.value = "";
     previousTicketRows.value = [];
     repliedToSummary.value = "";
     restoreDrafts();
@@ -1584,6 +1667,16 @@ function threadAuthor(item) {
   return u.full_name || u.name || item?.sender || "";
 }
 
+// Email of who sent the message. Shown beside the display name so an agent can
+// see exactly which address a parent / customer wrote from (and reply to it).
+// Omitted when it would only repeat the name (e.g. unknown sender: name == email).
+function threadAuthorEmail(item) {
+  const u = item?.user || {};
+  const email = (u.email || item?.sender || "").trim();
+  if (!email || !email.includes("@")) return "";
+  return email === threadAuthor(item) ? "" : email;
+}
+
 // HTML to parse the student / fee / previous-ticket side panels from. Bulk-email
 // tickets keep a clean description, so prefer the auto "Student Information" intake
 // communication's body (which carries the full blocks); fall back to the ticket
@@ -1683,6 +1776,7 @@ async function loadTicket({ silent = false, skipHeavy = false } = {}) {
     // fall back to the description (where the same content lives).
     parsedDescription.value = parseTicketDescription(studentInfoSourceHtml());
     applyForm();
+    prefillReplyRecipients();
     queueMicrotask(() => {
       if (requestId === activeTicketRequestId && !skipHeavy) {
         loadPreviousTicketDetails();
@@ -1950,11 +2044,16 @@ async function sendReply() {
     const res = await call("helpdesk.api.unity_helpdesk_ext.reply", {
       name: props.ticketId,
       message: composerPayloadHtml(),
+      recipients: replyTo.value.trim(),
+      cc: replyCc.value.trim(),
       attachments: composerAttachments.value.map(
         (attachment) => attachment.name
       ),
     });
     await resetComposer();
+    // Per-reply redirect only: the next reply goes back to the ticket's sender,
+    // with Cc carried over from what was just sent (reply-all continuity).
+    replyTo.value = (ticket.value?.raised_by || "").trim();
     // Optimistically append the new communication so the thread updates
     // immediately. The spinner clears as soon as the reply call returns —
     // no blocking full ticket reload.
