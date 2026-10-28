@@ -7,7 +7,10 @@
  "engine": "InnoDB",
  "field_order": [
   "ticket",
-  "action"
+  "action",
+  "comment",
+  "previous_content",
+  "new_content"
  ],
  "fields": [
   {
@@ -20,11 +23,32 @@
    "fieldname": "action",
    "fieldtype": "Data",
    "label": "Action"
+  },
+  {
+   "description": "Set when the activity concerns an internal note (e.g. an edit).",
+   "fieldname": "comment",
+   "fieldtype": "Link",
+   "label": "Comment",
+   "options": "HD Ticket Comment"
+  },
+  {
+   "description": "Snapshot of the note BEFORE this edit, so the history shows what changed even after further edits.",
+   "fieldname": "previous_content",
+   "fieldtype": "Text Editor",
+   "label": "Previous Content",
+   "read_only": 1
+  },
+  {
+   "description": "Snapshot of the note AFTER this edit.",
+   "fieldname": "new_content",
+   "fieldtype": "Text Editor",
+   "label": "New Content",
+   "read_only": 1
   }
  ],
  "index_web_pages_for_search": 1,
  "links": [],
- "modified": "2023-04-03 03:54:42.803335",
+ "modified": "2026-10-28 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Helpdesk",
  "name": "HD Ticket Activity",

@@ -35,6 +35,9 @@ from helpdesk.api.unity_helpdesk import (
 )
 from helpdesk.api.ticket import assign_ticket_to_agent
 from helpdesk.helpdesk.doctype.hd_ticket.api import get_ticket_thread_components
+from helpdesk.helpdesk.doctype.hd_ticket_activity.hd_ticket_activity import (
+    log_ticket_activity,
+)
 
 
 def _user_map(usernames):
@@ -136,12 +139,13 @@ def get_ticket_detail(name):
 
     decorated = _decorate_ticket(rows[0])
 
-    # Activity / history
+    # Activity / history — newest first (the latest action is what an agent
+    # opens the panel to see). Note-edit entries carry before/after snapshots.
     history = frappe.get_all(
         "HD Ticket Activity",
-        fields=["name", "action", "owner", "creation"],
+        fields=["name", "action", "owner", "creation", "comment", "previous_content", "new_content"],
         filters={"ticket": name},
-        order_by="creation asc",
+        order_by="creation desc, name desc",
         page_length=100,
     )
     decorated.history = history
@@ -175,6 +179,8 @@ def create_ticket(
     ticket_type=None,
     assignee=None,
     attachments=None,
+    cc=None,
+    bcc=None,
 ):
     _require_unity_access()
     if not subject:
@@ -185,6 +191,10 @@ def create_ticket(
         frappe.throw(_("Please enter customer email"))
     if not message:
         frappe.throw(_("Please enter email message"))
+    # Validate BEFORE the ticket is created: a bad Cc must not leave an orphan
+    # ticket behind with no email sent.
+    cc = _clean_reply_addresses(cc, _("Cc")) or ""
+    bcc = _clean_reply_addresses(bcc, _("Bcc")) or ""
 
     # Personalize template placeholders ({{first_name}} etc.) from the customer's
     # student record. Plain (non-template) text is returned unchanged; an external
@@ -241,12 +251,22 @@ def create_ticket(
     try:
         doc.reply_via_agent(
             message=message,
+            cc=cc,
+            bcc=bcc,
             attachments=_parse_json(attachments, []),
+            inherit_cc=False,
         )
         email_sent = True
     except Exception as exc:
         if _is_missing_sender_error(exc):
-            _create_communication_direct(doc, message, attachments=attachments)
+            # reply_via_agent inserts its Communication before the sender check,
+            # so only create one here if it genuinely didn't get that far.
+            if not frappe.db.exists(
+                "Communication",
+                {"reference_doctype": TICKET_DOCTYPE, "reference_name": doc.name, "sent_or_received": "Sent"},
+            ):
+                _create_communication_direct(doc, message, cc, bcc, attachments)
+            frappe.clear_last_message()
             warning = _("Ticket created and reply saved, but no outgoing email account is configured.")
         else:
             warning = _("Ticket created, but the email could not be sent: {0}").format(exc)
@@ -483,54 +503,17 @@ def reply(name, message, cc=None, bcc=None, attachments=None, recipients=None):
 
 
 def _latest_communication_payload(ticket_name):
-    """Fetch the most recent Communication for a ticket as a thread-ready dict.
-
-    Shape matches what the Unity thread renderer expects (see
-    TicketDetailView.vue communications handling): name, content, sender,
-    sent_or_received, creation, communication_date.
-    """
-    rows = frappe.get_all(
-        "Communication",
-        filters={
-            "reference_doctype": TICKET_DOCTYPE,
-            "reference_name": ticket_name,
-        },
-        fields=[
-            "name",
-            "subject",
-            "content",
-            "sender",
-            "recipients",
-            "cc",
-            "bcc",
-            "sent_or_received",
-            "creation",
-            "communication_date",
-            "has_attachment",
-            "delivery_status",
-        ],
-        order_by="creation desc",
-        limit=1,
-    )
-    if not rows:
+    """The most recent Communication for a ticket, in EXACTLY the shape the
+    thread renders (user, attachments, bcc_visible, …), so the SPA can append it
+    optimistically and a later reconcile changes nothing visible."""
+    comms = get_ticket_thread_components(ticket_name).communications
+    if not comms:
         return None
-    row = rows[0]
-    return {
-        "name": row.get("name"),
-        "subject": row.get("subject"),
-        "content": row.get("content"),
-        "sender": row.get("sender"),
-        "recipients": row.get("recipients"),
-        "cc": row.get("cc"),
-        "bcc": row.get("bcc"),
-        "sent_or_received": row.get("sent_or_received"),
-        "creation": str(row.get("creation")) if row.get("creation") else None,
-        "communication_date": str(row.get("communication_date"))
-        if row.get("communication_date")
-        else None,
-        "has_attachment": row.get("has_attachment"),
-        "delivery_status": row.get("delivery_status"),
-    }
+    row = dict(max(comms, key=lambda c: (c.creation, c.name)))
+    for key in ("creation", "communication_date"):
+        if row.get(key) is not None:
+            row[key] = str(row[key])
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -616,12 +599,23 @@ def update_comment(comment, content):
         # falsely stamp the note as edited.
         return {"ok": True, "comment": _comment_payload(note)}
 
+    previous_content = cstr(note.content or "")
     note.content = content
     note.is_edited = 1
     note.edited_at = frappe.utils.now()
     # on_update refreshes the ticket's message search index, so an edited note stays
     # findable by its NEW text.
     note.save(ignore_permissions=True)
+    # Surface the edit in the ticket's Issue History with a before/after snapshot.
+    # Snapshots (not a live join) so each edit entry keeps showing ITS change even
+    # after the note is edited again.
+    log_ticket_activity(
+        note.reference_ticket,
+        "edited an internal note",
+        comment=note.name,
+        previous_content=previous_content,
+        new_content=content,
+    )
     return {"ok": True, "comment": _comment_payload(note)}
 
 
@@ -1048,11 +1042,25 @@ def bulk_send_email(
     # One optional CC/BCC list. It is NO LONGER attached to every per-student mail
     # (that flooded the CC address with one copy per student and exposed it to every
     # family — BUG-6). The job sends the CC list ONE hidden copy of the broadcast.
+    #
+    # `bcc` is overloaded for backward compatibility: with no `groups` it is the
+    # LEGACY flat recipient list (one student mail per address); with `groups` it is
+    # the agent's Bcc for the broadcast copy. Bcc goes on the copy as a TRUE bcc so
+    # the Cc and Bcc parties never see each other.
     cc_list, invalid_cc_count = _split_email_list_with_counts(cc)
+    bcc_list = []
+    legacy_bcc = bcc
+    if _parse_json(groups, []):
+        bcc_list, invalid_bcc_count = _split_email_list_with_counts(bcc)
+        if invalid_bcc_count:
+            frappe.throw(_("Bcc contains an invalid email address"))
+        seen_cc = {e.lower() for e in cc_list}
+        bcc_list = [e for e in bcc_list if e.lower() not in seen_cc]
+        legacy_bcc = None
 
     # Per-student (and per-free-email) groups: one ticket + one email each.
     normalized_groups, invalid_count, total_recipients = _normalize_bulk_email_groups(
-        groups, recipients=recipients, bcc=bcc, merge_data=merge_data
+        groups, recipients=recipients, bcc=legacy_bcc, merge_data=merge_data
     )
     if not normalized_groups:
         frappe.throw(_("Add at least one recipient (student) before sending"))
@@ -1069,10 +1077,10 @@ def bulk_send_email(
                 student_count, STUDENT_HARD_CAP
             )
         )
-    if total_recipients + len(cc_list) > TOTAL_ADDRESS_HARD_CAP:
+    if total_recipients + len(cc_list) + len(bcc_list) > TOTAL_ADDRESS_HARD_CAP:
         frappe.throw(
             _("This send has {0} total addresses (students + guardians + cc), over the {1} limit. Reduce the recipients or turn off guardians.").format(
-                total_recipients + len(cc_list), TOTAL_ADDRESS_HARD_CAP
+                total_recipients + len(cc_list) + len(bcc_list), TOTAL_ADDRESS_HARD_CAP
             )
         )
 
@@ -1142,6 +1150,7 @@ def bulk_send_email(
             message=message,
             groups=normalized_groups,
             cc_list=cc_list,
+            bcc_list=bcc_list,
             sender=frappe.session.user,
             file_names=file_names,
             ticket_type=ticket_type,
@@ -1190,7 +1199,7 @@ def bulk_send_email(
             "ticket_type": ticket_type,
             "mode": cstr(mode or "").strip() or None,
             "fingerprint": fingerprint,
-            "cc_recipients": ", ".join(cc_list) if cc_list else None,
+            "cc_recipients": ", ".join(cc_list + bcc_list) if (cc_list or bcc_list) else None,
             "total_count": len(normalized_groups),
             "processed_count": 0,
             "sent_count": 0,
@@ -1210,6 +1219,7 @@ def bulk_send_email(
         message=message,
         groups=normalized_groups,
         cc_list=cc_list,
+        bcc_list=bcc_list,
         sender=frappe.session.user,
         file_names=file_names,
         ticket_type=ticket_type,
@@ -1278,6 +1288,7 @@ def _bulk_send_email_job(
     message,
     groups,
     cc_list=None,
+    bcc_list=None,
     sender=None,
     file_names=None,
     ticket_type=None,
@@ -1310,6 +1321,7 @@ def _bulk_send_email_job(
 
     groups = groups or []
     cc_list = cc_list or []
+    bcc_list = bcc_list or []
     file_names = file_names or []
 
     # Load prior progress from the batch record so a resumed run continues, not restarts.
@@ -1502,14 +1514,15 @@ def _bulk_send_email_job(
 
         # ONE hidden copy of the broadcast to the CC/BCC list — sent once, never per
         # student, and never exposed to the families (BUG-6).
-        if cc_list:
+        if cc_list or bcc_list:
             try:
                 note = (
                     f"<p style='color:#888;font-size:12px'>Copy of a bulk message sent to "
                     f"{counts['sent']} recipient(s).</p>"
                 )
                 frappe.sendmail(
-                    recipients=cc_list,
+                    recipients=cc_list or None,
+                    bcc=bcc_list or None,
                     subject="[Broadcast copy] " + sanitize_html(cstr(subject or "")),
                     message=note + sanitize_html(cstr(message or "")),
                     attachments=sendmail_attachments,
