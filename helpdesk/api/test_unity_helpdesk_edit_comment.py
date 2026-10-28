@@ -6,7 +6,7 @@ author-only permission, the `is_edited` / `edited_at` stamp, and the no-op guard
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from helpdesk.api.unity_helpdesk_ext import add_comment, update_comment
+from helpdesk.api.unity_helpdesk_ext import add_comment, get_ticket_detail, update_comment
 from helpdesk.helpdesk.doctype.hd_ticket.api import get_comments
 
 
@@ -42,6 +42,34 @@ class TestUpdateComment(FrappeTestCase):
 		self.assertEqual(row.content, "<p>changed note</p>")
 		self.assertEqual(row.is_edited, 1)
 		self.assertTrue(row.edited_at)
+
+	def test_edit_is_logged_in_issue_history_once_with_note_text_on_top(self):
+		def actions():
+			return frappe.get_all("HD Ticket Activity", {"ticket": self.ticket.name}, pluck="action")
+
+		self.assertNotIn("edited an internal note", actions())
+		update_comment(self.note["name"], "<p>changed</p>")
+		# A no-op save (same content) must not log a second entry.
+		update_comment(self.note["name"], "<p>changed</p>")
+		self.assertEqual(actions().count("edited an internal note"), 1)
+
+		# The detail payload lists newest first, and each edit entry carries a
+		# before/after snapshot of THAT edit.
+		history = get_ticket_detail(self.ticket.name).history
+		self.assertEqual(history[0].action, "edited an internal note")
+		self.assertEqual(history[0].comment, self.note["name"])
+		self.assertEqual(history[0].previous_content, "<p>original note</p>")
+		self.assertEqual(history[0].new_content, "<p>changed</p>")
+		self.assertTrue(all(not h.new_content for h in history[1:]))
+
+		# A second edit gets its own entry on top; the first entry's snapshot
+		# must NOT shift to the newer text.
+		update_comment(self.note["name"], "<p>changed again</p>")
+		history = get_ticket_detail(self.ticket.name).history
+		self.assertEqual(
+			[(h.previous_content, h.new_content) for h in history[:2]],
+			[("<p>changed</p>", "<p>changed again</p>"), ("<p>original note</p>", "<p>changed</p>")],
+		)
 
 	def test_unchanged_content_does_not_stamp_edited(self):
 		res = update_comment(self.note["name"], "<p>original note</p>")["comment"]

@@ -491,7 +491,10 @@
                 </button>
               </div>
               <div
-                v-if="item._type === 'comm' && (item.recipients || item.cc)"
+                v-if="
+                  item._type === 'comm' &&
+                  (item.recipients || item.cc || item.bcc_visible)
+                "
                 class="chat-msg-recipients"
               >
                 <span v-if="item.recipients"
@@ -500,6 +503,10 @@
                 >
                 <span v-if="item.cc"
                   ><span class="chat-msg-to-label">Cc:</span>{{ item.cc }}</span
+                >
+                <span v-if="item.bcc_visible"
+                  ><span class="chat-msg-to-label">Bcc:</span
+                  >{{ item.bcc_visible }}</span
                 >
               </div>
               <template v-if="editingNoteId === item.name">
@@ -582,37 +589,52 @@
           <div class="detail-body stack">
             <p v-if="actionError" class="error">{{ actionError }}</p>
             <div v-if="composeMode === 'reply'" class="reply-recipients">
-              <label class="reply-recipient-row">
+              <div class="reply-recipient-row">
                 <span class="reply-recipient-label">To</span>
-                <input
+                <EmailChipInput
+                  ref="replyToRef"
                   v-model="replyTo"
-                  type="text"
-                  class="reply-recipient-input"
-                  placeholder="recipient@example.com (comma-separate for more)"
-                  autocomplete="off"
-                  spellcheck="false"
+                  compact
+                  placeholder="recipient@example.com"
                 />
-                <button
-                  v-if="replyTo.trim() !== (ticket.raised_by || '').trim()"
-                  type="button"
-                  class="link-btn reply-recipient-reset"
-                  :title="`Reset to ${ticket.raised_by || 'ticket sender'}`"
-                  @click="replyTo = ticket.raised_by || ''"
-                >
-                  Reset
-                </button>
-              </label>
-              <label class="reply-recipient-row">
+                <div class="reply-recipient-actions">
+                  <button
+                    v-if="!isDefaultTo"
+                    type="button"
+                    class="link-btn reply-recipient-reset"
+                    :title="`Reset to ${ticket.raised_by || 'ticket sender'}`"
+                    @click="resetReplyTo"
+                  >
+                    Reset
+                  </button>
+                  <button
+                    v-if="!showBcc"
+                    type="button"
+                    class="link-btn reply-recipient-reset"
+                    @click="revealBcc"
+                  >
+                    Bcc
+                  </button>
+                </div>
+              </div>
+              <div class="reply-recipient-row">
                 <span class="reply-recipient-label">Cc</span>
-                <input
+                <EmailChipInput
+                  ref="replyCcRef"
                   v-model="replyCc"
-                  type="text"
-                  class="reply-recipient-input"
-                  placeholder="Optional — comma-separate multiple addresses"
-                  autocomplete="off"
-                  spellcheck="false"
+                  compact
+                  placeholder="Optional — add one or more addresses"
                 />
-              </label>
+              </div>
+              <div v-if="showBcc" class="reply-recipient-row">
+                <span class="reply-recipient-label">Bcc</span>
+                <EmailChipInput
+                  ref="replyBccRef"
+                  v-model="replyBcc"
+                  compact
+                  placeholder="Blind copy — recipients won't see each other"
+                />
+              </div>
             </div>
             <TinyMceEditor
               ref="editorRef"
@@ -661,8 +683,8 @@
             <button
               v-if="composeMode === 'reply'"
               class="btn"
-              :disabled="saving || composerIsEmpty || !replyTo.trim()"
-              :title="!replyTo.trim() ? 'Enter a recipient email address' : ''"
+              :disabled="saving || composerIsEmpty || !!recipientsProblem"
+              :title="recipientsProblem"
               @click="sendReply"
             >
               {{ saving ? "Sending..." : "Send Reply" }}
@@ -815,7 +837,27 @@
             <p v-if="!history.length" class="muted">No history yet.</p>
             <div v-for="item in history" :key="item.name" class="history-item">
               <strong>{{ item.action }}</strong>
-              <br />
+              <div
+                v-if="item.previous_content || item.new_content"
+                class="history-diff"
+              >
+                <blockquote
+                  v-if="item.previous_content"
+                  class="history-note history-note--before"
+                  :title="stripHtml(item.previous_content)"
+                >
+                  <span class="history-note-label">Before</span>
+                  <s>{{ historyNoteSnippet(item.previous_content) }}</s>
+                </blockquote>
+                <blockquote
+                  v-if="item.new_content"
+                  class="history-note history-note--after"
+                  :title="stripHtml(item.new_content)"
+                >
+                  <span class="history-note-label">After</span>
+                  {{ historyNoteSnippet(item.new_content) }}
+                </blockquote>
+              </div>
               <small class="muted">
                 {{ item.owner }} · {{ formatDateTime(item.creation) }}
               </small>
@@ -828,9 +870,10 @@
 </template>
 
 <script setup>
-import { computed, inject, reactive, ref, watch } from "vue";
+import { computed, inject, nextTick, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
+import EmailChipInput from "../components/EmailChipInput.vue";
 import {
   AuthRedirectError,
   call,
@@ -841,8 +884,21 @@ import {
   getTicketTypes,
   openDeskPath,
   sanitize,
+  stripHtml,
   uploadAttachment,
 } from "../api";
+
+// Plain-text preview of a note for the Issue History panel. Full text is in
+// the title attribute (hover) and in the thread itself.
+const HISTORY_NOTE_SNIPPET = 140;
+function historyNoteSnippet(html) {
+  const text = stripHtml(html || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > HISTORY_NOTE_SNIPPET
+    ? `${text.slice(0, HISTORY_NOTE_SNIPPET).trimEnd()}…`
+    : text;
+}
 
 const TICKET_NOTICE_KEY = "unity_helpdesk_ticket_notice";
 const props = defineProps({ ticketId: { type: String, required: true } });
@@ -888,32 +944,82 @@ const composerHtml = computed({
 });
 const composerAttachments = ref([]);
 // ---- Reply recipients -------------------------------------------------------
-// Who THIS reply goes to. Pre-filled from the ticket (To = raised_by, Cc = the
-// Cc of the most recent message, so reply-all continuity is visible rather than
-// silent) and editable per reply. Changing To never rewrites ticket.raised_by;
-// the next reply pre-fills from the ticket again.
-const replyTo = ref("");
-const replyCc = ref("");
+// Who THIS reply goes to. Each is an array of addresses rendered as chips.
+// Pre-filled from the ticket (To = raised_by, Cc = the Cc of the most recent
+// message, so reply-all continuity is visible rather than silent) and editable
+// per reply. Changing To never rewrites ticket.raised_by; the next reply
+// pre-fills from the ticket again. Bcc is never pre-filled (a blind copy is a
+// deliberate per-reply choice) and the row stays hidden until the agent asks.
+const replyTo = ref([]);
+const replyCc = ref([]);
+const replyBcc = ref([]);
+const showBcc = ref(false);
+const replyToRef = ref(null);
+const replyCcRef = ref(null);
+const replyBccRef = ref(null);
 // Only pre-fill on first load of a ticket. A silent reconcile after send must not
 // clobber an address the agent is mid-way through typing for the next reply.
 let recipientsPrefilledFor = "";
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function splitAddressList(value) {
+  return String(value || "")
+    .split(/[,;]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
 
 function latestMessageCc() {
   const comms = (ticket.value?.thread || communications.value || []).filter(
     (item) => item._type === "comm" || item.sent_or_received
   );
-  if (!comms.length) return "";
+  if (!comms.length) return [];
   const last = [...comms].sort(
     (a, b) => new Date(b.creation) - new Date(a.creation)
   )[0];
-  return (last?.cc || "").trim();
+  return splitAddressList(last?.cc);
 }
+
+function defaultReplyTo() {
+  return splitAddressList(ticket.value?.raised_by);
+}
+
+const isDefaultTo = computed(() => {
+  const def = defaultReplyTo();
+  return (
+    replyTo.value.length === def.length &&
+    replyTo.value.every((e, i) => e === def[i])
+  );
+});
+
+// Why the Send button is disabled, or "" when recipients are good. Invalid
+// chips are kept visible (highlighted) rather than dropped; this blocks the
+// send until they're fixed so a typo never silently loses a recipient.
+const recipientsProblem = computed(() => {
+  if (!replyTo.value.length) return "Enter a recipient email address";
+  const bad = [...replyTo.value, ...replyCc.value, ...replyBcc.value].find(
+    (e) => !EMAIL_RE.test(e)
+  );
+  return bad ? `"${bad}" is not a valid email address` : "";
+});
 
 function prefillReplyRecipients() {
   if (recipientsPrefilledFor === props.ticketId) return;
   recipientsPrefilledFor = props.ticketId;
-  replyTo.value = (ticket.value?.raised_by || "").trim();
+  replyTo.value = defaultReplyTo();
   replyCc.value = latestMessageCc();
+  replyBcc.value = [];
+  showBcc.value = false;
+}
+
+function resetReplyTo() {
+  replyTo.value = defaultReplyTo();
+}
+
+async function revealBcc() {
+  showBcc.value = true;
+  await nextTick();
+  replyBccRef.value?.focus();
 }
 const editorRef = ref(null);
 const attachmentInput = ref(null);
@@ -1203,8 +1309,10 @@ watch(
     emit("title", "Ticket Detail", `#${props.ticketId}`);
     comments.value = [];
     recipientsPrefilledFor = "";
-    replyTo.value = "";
-    replyCc.value = "";
+    replyTo.value = [];
+    replyCc.value = [];
+    replyBcc.value = [];
+    showBcc.value = false;
     previousTicketRows.value = [];
     repliedToSummary.value = "";
     restoreDrafts();
@@ -2040,20 +2148,33 @@ async function markClosed() {
 async function sendReply() {
   saving.value = true;
   actionError.value = "";
+  // Commit any address still sitting un-chipped in an input so it isn't lost.
+  replyToRef.value?.commit?.();
+  replyCcRef.value?.commit?.();
+  replyBccRef.value?.commit?.();
+  if (recipientsProblem.value) {
+    actionError.value = recipientsProblem.value;
+    saving.value = false;
+    return;
+  }
   try {
     const res = await call("helpdesk.api.unity_helpdesk_ext.reply", {
       name: props.ticketId,
       message: composerPayloadHtml(),
-      recipients: replyTo.value.trim(),
-      cc: replyCc.value.trim(),
+      recipients: replyTo.value.join(", "),
+      cc: replyCc.value.join(", "),
+      bcc: replyBcc.value.join(", "),
       attachments: composerAttachments.value.map(
         (attachment) => attachment.name
       ),
     });
     await resetComposer();
     // Per-reply redirect only: the next reply goes back to the ticket's sender,
-    // with Cc carried over from what was just sent (reply-all continuity).
-    replyTo.value = (ticket.value?.raised_by || "").trim();
+    // with Cc carried over from what was just sent (reply-all continuity). Bcc
+    // is a one-off choice and is cleared.
+    replyTo.value = defaultReplyTo();
+    replyBcc.value = [];
+    showBcc.value = false;
     // Optimistically append the new communication so the thread updates
     // immediately. The spinner clears as soon as the reply call returns —
     // no blocking full ticket reload.

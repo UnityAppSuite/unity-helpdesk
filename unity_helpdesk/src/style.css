@@ -2553,6 +2553,22 @@ tbody tr.bulk-email-ticket:hover {
 }
 .composer-field-label {
   cursor: default;
+  /* Same caption typography as `.stack label`, so a <span> caption (used when
+     the field must NOT be a <label>) looks identical to its siblings. */
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+/* "CC (optional)  Add Bcc" — the reveal link sits on the label's right edge. */
+.composer-cc-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.composer-bcc-link {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0;
 }
 
 .stack label:has(input[type="checkbox"]) {
@@ -2585,6 +2601,42 @@ tbody tr.bulk-email-ticket:hover {
   display: block;
   margin-top: 4px;
   font-size: 12px;
+}
+
+/* Before / After text under an "edited an internal note" history entry. Before
+   is struck through on a neutral background; After uses the thread's note amber
+   so it reads as "this is what the note says now". */
+.history-item .history-diff {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.history-item .history-note {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 3px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 0 6px 6px 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #78350f;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.history-item .history-note--before {
+  border-left-color: #cbd5e1;
+  background: #f8fafc;
+  color: #64748b;
+}
+.history-note-label {
+  display: inline-block;
+  margin-right: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.75;
 }
 
 .history-item-assignment {
@@ -2793,8 +2845,8 @@ tbody tr.bulk-email-ticket:hover {
   border-bottom-color: #f59e0b;
 }
 
-/* Reply composer To / Cc rows. Mail-client style: label on the left, address
-   input filling the row. Overrides the column layout `.stack label` applies. */
+/* Reply composer To / Cc / Bcc rows. Mail-client style: label on the left, a
+   borderless chip input filling the row, actions (Reset / Bcc) on the right. */
 .reply-recipients {
   display: flex;
   flex-direction: column;
@@ -2802,13 +2854,12 @@ tbody tr.bulk-email-ticket:hover {
   border-radius: 10px;
   background: var(--surface, #fff);
 }
-.stack label.reply-recipient-row {
-  flex-direction: row;
-  align-items: center;
+.reply-recipient-row {
+  display: flex;
+  align-items: flex-start;
   gap: 10px;
-  padding: 6px 12px;
+  padding: 4px 12px;
   font-size: 13px;
-  font-weight: 400;
   color: var(--text);
 }
 .reply-recipient-row + .reply-recipient-row {
@@ -2816,27 +2867,39 @@ tbody tr.bulk-email-ticket:hover {
 }
 .reply-recipient-label {
   flex: 0 0 28px;
+  padding-top: 9px;
   font-size: 12px;
   font-weight: 600;
   color: var(--muted);
 }
-.reply-recipient-input {
-  flex: 1 1 auto;
-  min-width: 0;
-  border: none;
-  background: transparent;
-  font: inherit;
-  color: var(--text);
-  padding: 4px 0;
-  outline: none;
-}
-.reply-recipient-input::placeholder {
-  color: var(--light);
+.reply-recipient-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 12px;
+  padding-top: 9px;
 }
 .reply-recipient-reset {
-  flex: 0 0 auto;
   font-size: 12px;
   padding: 0;
+}
+/* Chip input embedded in a recipient row: the row already draws the border,
+   so the input itself is flat and tight. */
+.email-chip-input--compact {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 34px;
+  padding: 3px 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.email-chip-input--compact:focus-within {
+  box-shadow: none;
+  background: transparent;
+}
+.email-chip-input--compact .recipient-input {
+  padding: 4px 0;
+  font-size: 13px;
 }
 
 .editor-toolbar {
