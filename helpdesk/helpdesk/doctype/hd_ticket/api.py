@@ -94,7 +94,19 @@ def get_communications(ticket: str):
 	return get_ticket_thread_components(ticket)["communications"]
 
 
+def _audit_bcc_addresses():
+	"""Lowercased set of the HD Settings monitoring addresses that reply_via_agent
+	silently BCCs on every outgoing reply. Never shown to agents."""
+	try:
+		from helpdesk.api.unity_helpdesk import _default_bulk_recipients
+
+		return {e.lower() for e in _default_bulk_recipients()}
+	except Exception:
+		return set()
+
+
 def get_ticket_thread_components(ticket: str):
+	audit_bcc = _audit_bcc_addresses()
 	QBCommunication = frappe.qb.DocType("Communication")
 	communications = (
 		frappe.qb.from_(QBCommunication)
@@ -108,6 +120,7 @@ def get_ticket_thread_components(ticket: str):
 			QBCommunication.recipients,
 			QBCommunication.sent_or_received,
 			QBCommunication.sender,
+			QBCommunication.sender_full_name,
 			QBCommunication.subject,
 		)
 		.where(QBCommunication.reference_doctype == "HD Ticket")
@@ -127,6 +140,23 @@ def get_ticket_thread_components(ticket: str):
 		c.pop("text_content", None)
 		c.attachments = get_attachments("Communication", c.name)
 		c.user = get_user_info_for_avatar(c.sender)
+		# External senders (parents / customers) are not Users, so the avatar helper
+		# falls back to name == email. Prefer the display name parsed from the mail
+		# header so the UI can show "Kamini Chavan <kamini@...>" instead of the
+		# address twice.
+		if c.sender_full_name and c.user.get("name") == c.user.get("email"):
+			c.user["name"] = c.sender_full_name
+		# Bcc the AGENT chose on a sent reply. The HD Settings audit/monitoring
+		# addresses are merged into the stored bcc server-side and must stay
+		# invisible, so strip them before the thread shows a "Bcc:" line.
+		c.bcc_visible = ""
+		if c.sent_or_received == "Sent" and c.bcc:
+			agent_bcc = [
+				e.strip()
+				for e in (c.bcc or "").replace(";", ",").split(",")
+				if e.strip() and e.strip().lower() not in audit_bcc
+			]
+			c.bcc_visible = ", ".join(agent_bcc)
 
 	comments = get_comments(ticket)
 	for c in comments:
@@ -159,6 +189,8 @@ def get_comments(ticket: str):
 			QBComment.content,
 			QBComment.creation,
 			QBComment.is_pinned,
+			QBComment.is_edited,
+			QBComment.edited_at,
 			QBComment.name,
 		)
 		.where(QBComment.reference_ticket == ticket)

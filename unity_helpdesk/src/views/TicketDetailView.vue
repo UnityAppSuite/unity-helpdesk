@@ -462,11 +462,83 @@
                 <span v-if="threadAuthor(item)" class="chat-msg-author">{{
                   threadAuthor(item)
                 }}</span>
+                <span
+                  v-if="threadAuthorEmail(item)"
+                  class="chat-msg-sender"
+                  :title="threadAuthorEmail(item)"
+                  >&lt;{{ threadAuthorEmail(item) }}&gt;</span
+                >
                 <span class="chat-msg-time">{{
                   formatDateTime(item.creation)
                 }}</span>
+                <span
+                  v-if="item._type === 'comment' && item.is_edited"
+                  class="chat-msg-edited"
+                  title="Last edited"
+                  >{{
+                    item.edited_at
+                      ? `(edited ${formatDateTime(item.edited_at)})`
+                      : "(edited)"
+                  }}</span
+                >
+                <button
+                  v-if="canEditNote(item) && editingNoteId !== item.name"
+                  type="button"
+                  class="link-btn chat-msg-edit-btn"
+                  @click="startEditNote(item)"
+                >
+                  Edit
+                </button>
               </div>
               <div
+                v-if="
+                  item._type === 'comm' &&
+                  (item.recipients || item.cc || item.bcc_visible)
+                "
+                class="chat-msg-recipients"
+              >
+                <span v-if="item.recipients"
+                  ><span class="chat-msg-to-label">To:</span
+                  >{{ item.recipients }}</span
+                >
+                <span v-if="item.cc"
+                  ><span class="chat-msg-to-label">Cc:</span>{{ item.cc }}</span
+                >
+                <span v-if="item.bcc_visible"
+                  ><span class="chat-msg-to-label">Bcc:</span
+                  >{{ item.bcc_visible }}</span
+                >
+              </div>
+              <template v-if="editingNoteId === item.name">
+                <p v-if="noteEditError" class="error">{{ noteEditError }}</p>
+                <TinyMceEditor
+                  v-model="noteEditHtml"
+                  :min-height="200"
+                  :ticket-name="props.ticketId"
+                  :enable-email-template="false"
+                  :enable-attach="false"
+                  placeholder="Edit this internal note..."
+                />
+                <div class="chat-msg-edit-actions">
+                  <button
+                    class="btn"
+                    :disabled="savingNote || noteEditIsEmpty"
+                    @click="saveEditNote(item)"
+                  >
+                    {{ savingNote ? "Saving..." : "Save Note" }}
+                  </button>
+                  <button
+                    type="button"
+                    class="link-btn"
+                    :disabled="savingNote"
+                    @click="cancelEditNote"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </template>
+              <div
+                v-else
                 class="chat-msg-body safe-html"
                 v-html="sanitize(threadContent(item))"
               ></div>
@@ -516,6 +588,54 @@
           </div>
           <div class="detail-body stack">
             <p v-if="actionError" class="error">{{ actionError }}</p>
+            <div v-if="composeMode === 'reply'" class="reply-recipients">
+              <div class="reply-recipient-row">
+                <span class="reply-recipient-label">To</span>
+                <EmailChipInput
+                  ref="replyToRef"
+                  v-model="replyTo"
+                  compact
+                  placeholder="recipient@example.com"
+                />
+                <div class="reply-recipient-actions">
+                  <button
+                    v-if="!isDefaultTo"
+                    type="button"
+                    class="link-btn reply-recipient-reset"
+                    :title="`Reset to ${ticket.raised_by || 'ticket sender'}`"
+                    @click="resetReplyTo"
+                  >
+                    Reset
+                  </button>
+                  <button
+                    v-if="!showBcc"
+                    type="button"
+                    class="link-btn reply-recipient-reset"
+                    @click="revealBcc"
+                  >
+                    Bcc
+                  </button>
+                </div>
+              </div>
+              <div class="reply-recipient-row">
+                <span class="reply-recipient-label">Cc</span>
+                <EmailChipInput
+                  ref="replyCcRef"
+                  v-model="replyCc"
+                  compact
+                  placeholder="Optional — add one or more addresses"
+                />
+              </div>
+              <div v-if="showBcc" class="reply-recipient-row">
+                <span class="reply-recipient-label">Bcc</span>
+                <EmailChipInput
+                  ref="replyBccRef"
+                  v-model="replyBcc"
+                  compact
+                  placeholder="Blind copy — recipients won't see each other"
+                />
+              </div>
+            </div>
             <TinyMceEditor
               ref="editorRef"
               v-model="composerHtml"
@@ -563,7 +683,8 @@
             <button
               v-if="composeMode === 'reply'"
               class="btn"
-              :disabled="saving || composerIsEmpty"
+              :disabled="saving || composerIsEmpty || !!recipientsProblem"
+              :title="recipientsProblem"
               @click="sendReply"
             >
               {{ saving ? "Sending..." : "Send Reply" }}
@@ -716,7 +837,27 @@
             <p v-if="!history.length" class="muted">No history yet.</p>
             <div v-for="item in history" :key="item.name" class="history-item">
               <strong>{{ item.action }}</strong>
-              <br />
+              <div
+                v-if="item.previous_content || item.new_content"
+                class="history-diff"
+              >
+                <blockquote
+                  v-if="item.previous_content"
+                  class="history-note history-note--before"
+                  :title="stripHtml(item.previous_content)"
+                >
+                  <span class="history-note-label">Before</span>
+                  <s>{{ historyNoteSnippet(item.previous_content) }}</s>
+                </blockquote>
+                <blockquote
+                  v-if="item.new_content"
+                  class="history-note history-note--after"
+                  :title="stripHtml(item.new_content)"
+                >
+                  <span class="history-note-label">After</span>
+                  {{ historyNoteSnippet(item.new_content) }}
+                </blockquote>
+              </div>
               <small class="muted">
                 {{ item.owner }} · {{ formatDateTime(item.creation) }}
               </small>
@@ -729,9 +870,10 @@
 </template>
 
 <script setup>
-import { computed, inject, reactive, ref, watch } from "vue";
+import { computed, inject, nextTick, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
+import EmailChipInput from "../components/EmailChipInput.vue";
 import {
   AuthRedirectError,
   call,
@@ -742,14 +884,29 @@ import {
   getTicketTypes,
   openDeskPath,
   sanitize,
+  stripHtml,
   uploadAttachment,
 } from "../api";
+
+// Plain-text preview of a note for the Issue History panel. Full text is in
+// the title attribute (hover) and in the thread itself.
+const HISTORY_NOTE_SNIPPET = 140;
+function historyNoteSnippet(html) {
+  const text = stripHtml(html || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > HISTORY_NOTE_SNIPPET
+    ? `${text.slice(0, HISTORY_NOTE_SNIPPET).trimEnd()}…`
+    : text;
+}
 
 const TICKET_NOTICE_KEY = "unity_helpdesk_ticket_notice";
 const props = defineProps({ ticketId: { type: String, required: true } });
 const emit = defineEmits(["title"]);
 const route = useRoute();
 const router = useRouter();
+// Current user — used to gate the "Edit" action on an internal note to its author.
+const unitySession = inject("unitySession", null);
 
 const ticket = ref({});
 const agents = ref([]);
@@ -786,6 +943,84 @@ const composerHtml = computed({
   },
 });
 const composerAttachments = ref([]);
+// ---- Reply recipients -------------------------------------------------------
+// Who THIS reply goes to. Each is an array of addresses rendered as chips.
+// Pre-filled from the ticket (To = raised_by, Cc = the Cc of the most recent
+// message, so reply-all continuity is visible rather than silent) and editable
+// per reply. Changing To never rewrites ticket.raised_by; the next reply
+// pre-fills from the ticket again. Bcc is never pre-filled (a blind copy is a
+// deliberate per-reply choice) and the row stays hidden until the agent asks.
+const replyTo = ref([]);
+const replyCc = ref([]);
+const replyBcc = ref([]);
+const showBcc = ref(false);
+const replyToRef = ref(null);
+const replyCcRef = ref(null);
+const replyBccRef = ref(null);
+// Only pre-fill on first load of a ticket. A silent reconcile after send must not
+// clobber an address the agent is mid-way through typing for the next reply.
+let recipientsPrefilledFor = "";
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+function splitAddressList(value) {
+  return String(value || "")
+    .split(/[,;]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function latestMessageCc() {
+  const comms = (ticket.value?.thread || communications.value || []).filter(
+    (item) => item._type === "comm" || item.sent_or_received
+  );
+  if (!comms.length) return [];
+  const last = [...comms].sort(
+    (a, b) => new Date(b.creation) - new Date(a.creation)
+  )[0];
+  return splitAddressList(last?.cc);
+}
+
+function defaultReplyTo() {
+  return splitAddressList(ticket.value?.raised_by);
+}
+
+const isDefaultTo = computed(() => {
+  const def = defaultReplyTo();
+  return (
+    replyTo.value.length === def.length &&
+    replyTo.value.every((e, i) => e === def[i])
+  );
+});
+
+// Why the Send button is disabled, or "" when recipients are good. Invalid
+// chips are kept visible (highlighted) rather than dropped; this blocks the
+// send until they're fixed so a typo never silently loses a recipient.
+const recipientsProblem = computed(() => {
+  if (!replyTo.value.length) return "Enter a recipient email address";
+  const bad = [...replyTo.value, ...replyCc.value, ...replyBcc.value].find(
+    (e) => !EMAIL_RE.test(e)
+  );
+  return bad ? `"${bad}" is not a valid email address` : "";
+});
+
+function prefillReplyRecipients() {
+  if (recipientsPrefilledFor === props.ticketId) return;
+  recipientsPrefilledFor = props.ticketId;
+  replyTo.value = defaultReplyTo();
+  replyCc.value = latestMessageCc();
+  replyBcc.value = [];
+  showBcc.value = false;
+}
+
+function resetReplyTo() {
+  replyTo.value = defaultReplyTo();
+}
+
+async function revealBcc() {
+  showBcc.value = true;
+  await nextTick();
+  replyBccRef.value?.focus();
+}
 const editorRef = ref(null);
 const attachmentInput = ref(null);
 const uploadingAttachment = ref(false);
@@ -999,11 +1234,85 @@ const hasAdditionalDetails = computed(
 );
 const composerIsEmpty = computed(() => !hasMeaningfulHtml(composerHtml.value));
 
+// ---- Internal note editing ------------------------------------------------
+// Only the note's own author may edit it (the backend enforces this too —
+// update_comment rejects anyone else). One note is editable at a time; its
+// draft lives here rather than in composerDrafts so an in-progress edit can
+// never be confused with the "add note" composer.
+const editingNoteId = ref("");
+const noteEditHtml = ref("");
+const noteEditError = ref("");
+const savingNote = ref(false);
+const noteEditIsEmpty = computed(() => !hasMeaningfulHtml(noteEditHtml.value));
+
+function canEditNote(item) {
+  if (!item || item._type !== "comment") return false;
+  const me = unitySession?.name || unitySession?.email || "";
+  if (!me) return false;
+  return (item.commented_by || item.sender) === me;
+}
+
+function startEditNote(item) {
+  editingNoteId.value = item.name;
+  noteEditHtml.value = item.content || "";
+  noteEditError.value = "";
+}
+
+function cancelEditNote() {
+  editingNoteId.value = "";
+  noteEditHtml.value = "";
+  noteEditError.value = "";
+}
+
+// Patch the edited note in place in both the thread and the comments fallback
+// list, so the new body + the "(edited)" marker show immediately without
+// re-fetching (and without disturbing scroll position).
+function applyNoteUpdate(updated) {
+  if (!updated || !updated.name) return;
+  const merge = (row) =>
+    row.name === updated.name && row._type === "comment"
+      ? { ...row, ...updated, _type: "comment" }
+      : row;
+  if (ticket.value && Array.isArray(ticket.value.thread)) {
+    ticket.value.thread = ticket.value.thread.map(merge);
+  }
+  comments.value = comments.value.map((row) =>
+    row.name === updated.name ? { ...row, ...updated, _type: "comment" } : row
+  );
+}
+
+async function saveEditNote(item) {
+  if (noteEditIsEmpty.value) return;
+  savingNote.value = true;
+  noteEditError.value = "";
+  try {
+    const res = await call("helpdesk.api.unity_helpdesk_ext.update_comment", {
+      comment: item.name,
+      content: noteEditHtml.value,
+    });
+    applyNoteUpdate(res && res.comment);
+    cancelEditNote();
+    // Reconcile silently (no skeleton, no student-context re-run) so the row
+    // matches server truth even if the optimistic patch missed a field.
+    loadTicket({ silent: true, skipHeavy: true });
+  } catch (err) {
+    if (err instanceof AuthRedirectError) return;
+    noteEditError.value = err?.message || "Could not update the note";
+  } finally {
+    savingNote.value = false;
+  }
+}
+
 watch(
   () => props.ticketId,
   async () => {
     emit("title", "Ticket Detail", `#${props.ticketId}`);
     comments.value = [];
+    recipientsPrefilledFor = "";
+    replyTo.value = [];
+    replyCc.value = [];
+    replyBcc.value = [];
+    showBcc.value = false;
     previousTicketRows.value = [];
     repliedToSummary.value = "";
     restoreDrafts();
@@ -1466,6 +1775,16 @@ function threadAuthor(item) {
   return u.full_name || u.name || item?.sender || "";
 }
 
+// Email of who sent the message. Shown beside the display name so an agent can
+// see exactly which address a parent / customer wrote from (and reply to it).
+// Omitted when it would only repeat the name (e.g. unknown sender: name == email).
+function threadAuthorEmail(item) {
+  const u = item?.user || {};
+  const email = (u.email || item?.sender || "").trim();
+  if (!email || !email.includes("@")) return "";
+  return email === threadAuthor(item) ? "" : email;
+}
+
 // HTML to parse the student / fee / previous-ticket side panels from. Bulk-email
 // tickets keep a clean description, so prefer the auto "Student Information" intake
 // communication's body (which carries the full blocks); fall back to the ticket
@@ -1565,6 +1884,7 @@ async function loadTicket({ silent = false, skipHeavy = false } = {}) {
     // fall back to the description (where the same content lives).
     parsedDescription.value = parseTicketDescription(studentInfoSourceHtml());
     applyForm();
+    prefillReplyRecipients();
     queueMicrotask(() => {
       if (requestId === activeTicketRequestId && !skipHeavy) {
         loadPreviousTicketDetails();
@@ -1828,15 +2148,33 @@ async function markClosed() {
 async function sendReply() {
   saving.value = true;
   actionError.value = "";
+  // Commit any address still sitting un-chipped in an input so it isn't lost.
+  replyToRef.value?.commit?.();
+  replyCcRef.value?.commit?.();
+  replyBccRef.value?.commit?.();
+  if (recipientsProblem.value) {
+    actionError.value = recipientsProblem.value;
+    saving.value = false;
+    return;
+  }
   try {
     const res = await call("helpdesk.api.unity_helpdesk_ext.reply", {
       name: props.ticketId,
       message: composerPayloadHtml(),
+      recipients: replyTo.value.join(", "),
+      cc: replyCc.value.join(", "),
+      bcc: replyBcc.value.join(", "),
       attachments: composerAttachments.value.map(
         (attachment) => attachment.name
       ),
     });
     await resetComposer();
+    // Per-reply redirect only: the next reply goes back to the ticket's sender,
+    // with Cc carried over from what was just sent (reply-all continuity). Bcc
+    // is a one-off choice and is cleared.
+    replyTo.value = defaultReplyTo();
+    replyBcc.value = [];
+    showBcc.value = false;
     // Optimistically append the new communication so the thread updates
     // immediately. The spinner clears as soon as the reply call returns —
     // no blocking full ticket reload.

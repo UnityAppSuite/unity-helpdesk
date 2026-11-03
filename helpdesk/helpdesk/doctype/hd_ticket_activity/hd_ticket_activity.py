@@ -9,7 +9,14 @@ class HDTicketActivity(Document):
 	pass
 
 
-def log_ticket_activity(ticket, action):
+def log_ticket_activity(ticket, action, comment=None, previous_content=None, new_content=None):
 	return frappe.get_doc(
-		{"doctype": "HD Ticket Activity", "ticket": ticket, "action": action}
+		{
+			"doctype": "HD Ticket Activity",
+			"ticket": ticket,
+			"action": action,
+			"comment": comment,
+			"previous_content": previous_content,
+			"new_content": new_content,
+		}
 	).insert(ignore_permissions=True)

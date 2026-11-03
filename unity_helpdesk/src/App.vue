@@ -211,6 +211,31 @@
               </option>
             </select>
           </label>
+          <div class="composer-field">
+            <span class="composer-field-label composer-cc-label">
+              CC (optional)
+              <button
+                v-if="!composerShowBcc"
+                type="button"
+                class="link-btn composer-bcc-link"
+                @click="revealComposerBcc"
+              >
+                Add Bcc
+              </button>
+            </span>
+            <EmailChipInput
+              v-model="composer.cc"
+              placeholder="cc1@example.com, cc2@example.com"
+            />
+          </div>
+          <div v-if="composerShowBcc" class="composer-field">
+            <span class="composer-field-label">BCC (optional)</span>
+            <EmailChipInput
+              ref="composerBccRef"
+              v-model="composer.bcc"
+              placeholder="Blind copy — recipients won't see each other"
+            />
+          </div>
           <label>
             Priority
             <select v-model="composer.priority">
@@ -666,39 +691,35 @@
               </option>
             </select>
           </label>
-          <label>
-            CC (optional)
-            <div class="recipient-multiselect" @click="focusCcInput">
-              <span
-                v-for="c in bulkEmail.cc"
-                :key="c.email"
-                class="recipient-chip"
+          <div class="composer-field">
+            <span class="composer-field-label composer-cc-label">
+              CC (optional)
+              <button
+                v-if="!bulkShowBcc"
+                type="button"
+                class="link-btn composer-bcc-link"
+                @click="revealBulkBcc"
               >
-                <span class="recipient-chip-label" :title="c.email">{{
-                  c.email
-                }}</span>
-                <button
-                  type="button"
-                  class="recipient-chip-remove"
-                  @click.stop="removeCc(c.email)"
-                >
-                  ×
-                </button>
-              </span>
-              <div class="recipient-input-wrap">
-                <input
-                  ref="ccInputRef"
-                  v-model="ccInputQuery"
-                  type="text"
-                  class="recipient-input"
-                  placeholder="cc1@example.com"
-                  autocomplete="off"
-                  @keydown.enter.prevent="addCcFromInput"
-                  @keydown="onCcKeydown"
-                />
-              </div>
-            </div>
-          </label>
+                Add Bcc
+              </button>
+            </span>
+            <EmailChipInput
+              v-model="bulkEmail.cc"
+              placeholder="cc1@example.com, cc2@example.com"
+            />
+            <small class="muted">
+              Cc/Bcc addresses receive ONE copy of the broadcast, not one mail
+              per student.
+            </small>
+          </div>
+          <div v-if="bulkShowBcc" class="composer-field">
+            <span class="composer-field-label">BCC (optional)</span>
+            <EmailChipInput
+              ref="bulkBccRef"
+              v-model="bulkEmail.bcc"
+              placeholder="Blind copy — recipients won't see each other"
+            />
+          </div>
           <label>
             Message
             <TinyMceEditor
@@ -1071,6 +1092,7 @@
 <script setup>
 import {
   computed,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   provide,
@@ -1080,6 +1102,7 @@ import {
 } from "vue";
 import { RouterLink, useRoute, useRouter } from "vue-router";
 import TinyMceEditor from "@desk/components/TinyMceEditor.vue";
+import EmailChipInput from "./components/EmailChipInput.vue";
 import {
   AuthRedirectError,
   call,
@@ -1140,6 +1163,9 @@ const composer = reactive({
   ticket_type: "",
   assignee: "",
   attachments: [],
+  // Copied on the single outgoing mail. Arrays of addresses (chip inputs).
+  cc: [],
+  bcc: [],
   // Optional "send a test copy first" step (manual preview → verify → unlock send).
   // testRecipients: [{ email, name }] verifiers shown as chips.
   testEnabled: false,
@@ -1153,6 +1179,21 @@ const composerTestSuggestions = ref([]);
 const composerTestQuery = ref("");
 const composerTestInputRef = ref(null);
 let composerTestSuggestTimeout = null;
+// Bcc row (create composer) is hidden until asked for — a blind copy is a
+// deliberate choice, not a default.
+const composerShowBcc = ref(false);
+const composerBccRef = ref(null);
+async function revealComposerBcc() {
+  composerShowBcc.value = true;
+  await nextTick();
+  composerBccRef.value?.focus();
+}
+// First invalid address across a set of chip lists, or "" when all are valid.
+// Chips keep invalid entries visible (highlighted) rather than dropping them, so
+// the send has to be blocked here until the agent fixes the typo.
+function firstInvalidAddress(...lists) {
+  return lists.flat().find((e) => !EMAIL_REGEX.test(e)) || "";
+}
 // Searchable "Assign To" combobox (create composer). agents already arrive A–Z from
 // the backend; we re-sort defensively and filter by the typed query.
 const assigneeQuery = ref("");
@@ -1213,6 +1254,7 @@ const bulkEmail = reactive({
   ticket_type: "",
   message: "",
   cc: [],
+  bcc: [],
   // Reference-mode raw inputs (reference numbers / student names / emails).
   tokens: [],
   // Resolved recipients — one per student (or free email). Each becomes ONE
@@ -1241,8 +1283,14 @@ const excludeStudent = ref(false);
 // All Student doctype fields, fetched once when the bulk modal opens — used to
 // show the full merge-field list and to flag {{tokens}} that won't auto-fill.
 const studentMergeFields = ref([]);
-const ccInputRef = ref(null);
-const ccInputQuery = ref("");
+// Bulk Bcc row is hidden until asked for, like the create composer.
+const bulkShowBcc = ref(false);
+const bulkBccRef = ref(null);
+async function revealBulkBcc() {
+  bulkShowBcc.value = true;
+  await nextTick();
+  bulkBccRef.value?.focus();
+}
 const bccInputRef = ref(null);
 const bccSearchQuery = ref("");
 const bccResults = ref([]);
@@ -1431,6 +1479,9 @@ function closeComposer() {
   assigneeQuery.value = "";
   assigneeOpen.value = false;
   composer.attachments = [];
+  composer.cc = [];
+  composer.bcc = [];
+  composerShowBcc.value = false;
   composer.testEnabled = false;
   composer.testRecipients = [];
   composer.testSent = false;
@@ -1720,6 +1771,11 @@ async function createTicket() {
     composerFail("Ticket Type is required.");
     return;
   }
+  const badAddress = firstInvalidAddress(composer.cc, composer.bcc);
+  if (badAddress) {
+    composerFail(`"${badAddress}" is not a valid email address.`);
+    return;
+  }
   // Verification gate: if "Send a test copy first" is on, a test must be sent before
   // the real send. Explain rather than silently doing nothing.
   if (composer.testEnabled && !composer.testSent) {
@@ -1740,6 +1796,8 @@ async function createTicket() {
     ticket_type: composer.ticket_type,
     assignee: composer.assignee,
     attachments: composer.attachments.map((attachment) => attachment.name),
+    cc: composer.cc.join(", "),
+    bcc: composer.bcc.join(", "),
   };
   closeComposer();
   showGlobalNotice(
@@ -1918,38 +1976,6 @@ function chipTitle(s) {
     parts.push(`guardians: ${s.guardian_emails.join(", ")}`);
   }
   return parts.join(" · ");
-}
-
-function focusCcInput() {
-  ccInputRef.value?.focus();
-}
-
-function addCcFromInput() {
-  const val = ccInputQuery.value.trim().toLowerCase();
-  if (!EMAIL_REGEX.test(val)) return;
-  if (bulkEmail.cc.find((c) => c.email === val)) {
-    ccInputQuery.value = "";
-    return;
-  }
-  bulkEmail.cc.push({ email: val });
-  ccInputQuery.value = "";
-}
-
-function removeCc(email) {
-  bulkEmail.cc = bulkEmail.cc.filter((c) => c.email !== email);
-}
-
-function onCcKeydown(e) {
-  if (e.key === ",") {
-    e.preventDefault();
-    addCcFromInput();
-  } else if (
-    e.key === "Backspace" &&
-    !ccInputQuery.value &&
-    bulkEmail.cc.length
-  ) {
-    bulkEmail.cc.pop();
-  }
 }
 
 function focusBccInput() {
@@ -2198,6 +2224,8 @@ function resetBulkEmail() {
   bulkEmail.ticket_type = "";
   bulkEmail.message = "";
   bulkEmail.cc = [];
+  bulkEmail.bcc = [];
+  bulkShowBcc.value = false;
   bulkEmail.tokens = [];
   bulkEmail.students = [];
   bulkEmail.attachments = [];
@@ -2209,7 +2237,6 @@ function resetBulkEmail() {
   bulkTestQuery.value = "";
   bulkTestSuggestions.value = [];
   bulkTestSending.value = false;
-  ccInputQuery.value = "";
   bccSearchQuery.value = "";
   bccResults.value = [];
   includeGuardians.value = false;
@@ -2337,9 +2364,11 @@ async function sendBulkEmail() {
   if (bulkSubmitting.value) return;
   bulkEmailError.value = "";
   bulkEmailWarning.value = "";
-  // Fold in a CC address that was typed but not yet committed with a comma/Enter, so it
-  // isn't silently dropped on Send (same as the test-recipient box does).
-  if (ccInputQuery.value.trim()) addCcFromInput();
+  const badBulkAddress = firstInvalidAddress(bulkEmail.cc, bulkEmail.bcc);
+  if (badBulkAddress) {
+    bulkFail(`"${badBulkAddress}" is not a valid email address.`);
+    return;
+  }
   // One group per student (or free email): the student and/or their guardians,
   // per the recipient toggles.
   const groups = bulkEmailGroups.value;
@@ -2384,14 +2413,14 @@ async function sendBulkEmail() {
     return;
   }
   // Build the payload BEFORE closing the composer (closeBulkEmail resets the form).
-  const ccEmails = bulkEmail.cc.map((c) => c.email);
   const payload = {
     subject: bulkEmail.subject,
     message: bulkEmail.message,
     ticket_type: bulkEmail.ticket_type,
     mode: bulkEmail.mode,
     groups: JSON.stringify(groups),
-    cc: ccEmails.length ? JSON.stringify(ccEmails) : null,
+    cc: bulkEmail.cc.length ? JSON.stringify(bulkEmail.cc) : null,
+    bcc: bulkEmail.bcc.length ? JSON.stringify(bulkEmail.bcc) : null,
     attachments: JSON.stringify(
       bulkEmail.attachments.map((attachment) => attachment.name)
     ),

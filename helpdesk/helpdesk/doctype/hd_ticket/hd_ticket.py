@@ -529,17 +529,28 @@ class HDTicket(Document):
 
 	@frappe.whitelist()
 	def reply_via_agent(
-		self, message: str, cc: str = None, bcc: str = None, attachments: List[str] = []
+		self,
+		message: str,
+		cc: str = None,
+		bcc: str = None,
+		attachments: List[str] = [],
+		recipients: str = None,
+		inherit_cc: bool = True,
 	):
 		skip_email_workflow = self.skip_email_workflow()
 		medium = "" if skip_email_workflow else "Email"
 		subject = f"Re: {self.subject} (#{self.name})"
 		sender = frappe.session.user
-		recipients = self.raised_by
+		# `recipients` is PER-REPLY: an agent may redirect one reply to a different or
+		# additional address without re-homing the ticket — raised_by is never touched.
+		recipients = (recipients or "").strip() or self.raised_by
 		sender_email = None if skip_email_workflow else self.sender_email()
 		last_communication = self.get_last_communication()
 
-		if last_communication:
+		# Reply-all continuity: an empty Cc/Bcc inherits the last message's. Callers
+		# whose UI shows the Cc field (Unity) pass inherit_cc=False so that an agent
+		# who clears the field really sends with no Cc.
+		if last_communication and inherit_cc:
 			cc = cc or last_communication.cc
 			bcc = bcc or last_communication.bcc
 
